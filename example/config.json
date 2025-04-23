@@ -1,0 +1,124 @@
+{
+  "inbounds": [
+    {
+      "port": 1080,
+      "listen": "0.0.0.0",
+      "protocol": "http",
+      "tag": "http",
+      "streamSettings": {
+        "sockopt": {
+          "tcpNoDelay": true
+        }
+      },
+      "settings": {
+        "allowTransparent": false
+      }
+    },
+    {
+      "port": 1081,
+      "listen": "0.0.0.0",
+      "protocol": "socks",
+      "tag": "s5",
+      "settings": {
+        "auth": "noauth",
+        "udp": true,
+        "ip": "127.0.0.1"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "trojan",
+      "tag": "cctj",
+      "streamSettings": {
+        "network": "grpc",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "example.com",
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ],
+          "allowInsecure": true
+        },
+        "sockopt": {
+          "tcpNoDelay": true,
+          "tcpCongestion": "bbr"
+        },
+        "grpcSettings": {
+          "multiMode": true,
+          "user_agent": "chrome",
+          "conn_number": 3,
+          "serviceName": "gapi"
+        }
+      },
+      "settings": {
+        "servers": [
+          {
+            "address": "example.com",
+            "port": 443,
+            "password": "password"
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "vless",
+      "tag": "vl",
+      "streamSettings": {
+        "network": "grpc",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "example.com",
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ],
+          "fingerprint": "chrome"
+        },
+        "sockops": {
+          "tcpNoDelay": true,
+          "tcpCongestion": "bbr"
+        },
+        "grpcSettings": {
+          "multiMode": true,
+          "idle_timeout": 20,
+          "serviceName": "g2api"
+        }
+      },
+      "settings": {
+        "vnext": [
+          {
+            "address": "example.com",
+            "port": 443,
+            "users": [
+              {
+                "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tag": "free",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "blocked",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "domain": [
+          "geosite:cn"
+        ],
+        "outboundTag": "free"
+      }
+    ]
+  }
+}

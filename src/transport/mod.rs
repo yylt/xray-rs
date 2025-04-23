@@ -1,25 +1,36 @@
-use std::fmt;
-use serde_json::{self,Value};
 use serde::{Serialize, Deserialize};
+use crate::common::common;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use std::fmt::{Debug, Display};
+use std::net::SocketAddr;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, ToSocketAddrs};
 
 pub mod grpc;
 pub mod http;
 pub mod tcp;
 pub mod websocket;
 pub mod tls;
+mod sock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamSettings {
+    #[serde(rename = "network", default)]
+    network: common::Network,
     
-    network: String,
+    #[serde(rename = "security", default)]
+    security: common::Security,
 
-    security: Option<String>,
+    #[serde(rename = "sockopt", default)]
+    socket_options: sock::SocketOpt,
 
     #[serde(rename = "tlsSettings")]
     tls_settings: Option<tls::TlsSettings>,
 
     #[serde(rename = "tcpSettings")]
-    tcp_settings: Option<tcp::tcpSettings>,
+    tcp_settings: Option<tcp::TcpSettings>,
 
     #[serde(rename = "wsSettings")]
     ws_settings: Option<websocket::WsSettings>,
@@ -29,33 +40,43 @@ pub struct StreamSettings {
 
     #[serde(rename = "httpSettings")]
     http_settings: Option<http::HttpSettings>,
-
-    #[serde(rename = "sockopt")]
-    socket_options: Option<SocketOpt>,
 }
 
+/// Specify a transport layer, like GRPC, TLS
+#[async_trait]
+pub trait Transport: Debug + Send + Sync {
+    type Acceptor: Send + Sync;
+    type RawStream: Send + Sync;
+    type Stream: 'static + AsyncRead + AsyncWrite + Unpin + Send + Sync + Debug;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SocketOpt {
+    fn new(config: &StreamSettings) -> Result<Self>
+    where
+        Self: Sized;
 
-    #[serde(rename = "mark")]
-    mark: Option<i16>,
+    /// Provide the transport with socket options
+    fn hint(conn: &Self::Stream, opts: sock::SocketOpt);
 
-    #[serde(rename = "tcpFastOpen")]
-    tcp_fast_open: Option<bool>,
+    async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor>;
+    async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
+    async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream>;
+}
 
-    #[serde(rename = "tcpKeepAliveInterval")]
-    tcp_keepalive_interval: Option<i16>,
+#[cfg(test)]
+mod test {
+    use serde_json;
+    use super::*;
+    use crate::common::common;
+    #[test]
+    fn test_stream(){
+        let data = r#"
+            {
+                "security": "tls"
+            }"#;
 
-    #[serde(rename = "tcpKeepAliveIdle")]
-    tcp_keepalive_idle: Option<bool>,
-
-    #[serde(rename = "tcpNoDelay")]
-    tcp_nodelay: Option<bool>,
-
-    #[serde(rename = "tcpcongestion")]
-    tcp_congestion: Option<String>,
-
-    #[serde(rename = "interface")]
-    interface: Option<String>,
+        // Parse the string of data into serde_json::Value.
+        let v: StreamSettings = serde_json::from_str(data).unwrap();
+        println!("streamsettings: {:?}", serde_json::to_string(&v));
+        assert!(matches!(v.network, common::Network::Tcp));
+        assert!(matches!(v.security, common::Security::Tls));
+    }
 }

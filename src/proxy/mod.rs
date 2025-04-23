@@ -1,5 +1,3 @@
-use std::fmt;
-use serde_json::{self,Value};
 use serde::{Serialize, Deserialize};
 
 pub mod http;
@@ -9,46 +7,48 @@ pub mod socks;
 pub mod trojan;
 pub mod dokodemo;
 
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "protocol", content = "settings")]
-pub enum Settings {
+pub enum InboundSettings {
     #[serde(rename = "http")]
-    Http(http::Settings),
-
-    #[serde(rename = "black")]
-    Black(black::Settings),
-
-    #[serde(rename = "free")]
-    Free(free::Settings),
+    Http(http::InSetting),
 
     #[serde(rename = "socks")]
-    Socks(socks::Settings),
+    Socks(socks::InSetting),
 
     #[serde(rename = "trojan")]
-    Trojan(trojan::Settings),
-
+    Trojan(trojan::InSetting),
 }
 
-impl fmt::Display for Settings {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Settings::Http(ref x) => write!(f, "Http: {:?}", x),
-            Settings::Black(ref x) => write!(f, "Black: {:?}", x),
-            Settings::Free(ref x) => write!(f, "Free: {:?}", x),
-            Settings::Socks(ref x) => write!(f, "Socks: {:?}", x),
-            Settings::Trojan(ref x) => write!(f, "Trojan: {:?}", x),
-        }
-    }
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "protocol", content = "settings")]
+pub enum OutboundSettings {
+    #[serde(rename = "http")]
+    Http(http::OutSetting),
+
+    #[serde(rename = "black")]
+    Black(black::OutSetting),
+
+    #[serde(rename = "free")]
+    Free(free::OutSetting),
+
+    #[serde(rename = "socks")]
+    Socks(socks::OutSetting),
+
+    #[serde(rename = "trojan")]
+    Trojan(trojan::OutSetting),
 }
+
+
+
 
 #[cfg(test)]
 mod test {
-    use serde_json::{self, Value};
+    use serde_json;
     use super::*;
 
     #[test]
-    fn parse_trojan(){
+    fn test_parse_trojan(){
         let trojan = r#"
             {
                 "protocol": "trojan",
@@ -60,7 +60,7 @@ mod test {
             }"#;
 
         // Parse the string of data into serde_json::Value.
-        let v: Settings = serde_json::from_str(trojan).unwrap();
-        assert!(matches!(v, Settings::Trojan(_)), "not trojan Struct");
+        let v: InboundSettings = serde_json::from_str(trojan).unwrap();
+        assert!(matches!(v, InboundSettings::Trojan(_)), "not trojan Struct");
     }
 }
