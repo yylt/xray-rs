@@ -1,2 +1,6 @@
 # xray-rs
-rust implement v2ray
+
+- forward proxy
+- reverse proxy
+- multi protocol single port
+- mesh network
