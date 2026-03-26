@@ -1,6 +1,5 @@
-use std::io;
 use clap;
-
+use std::io;
 
 #[derive(Debug, clap::Args)]
 pub struct Version;

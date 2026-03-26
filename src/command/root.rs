@@ -1,6 +1,6 @@
-use super::{version,run};
-use std::io;
+use super::{run, version};
 use clap::Parser;
+use std::io;
 
 #[derive(Debug, Parser)]
 #[command(name = "xray")]
@@ -13,12 +13,7 @@ enum Root {
 #[allow(dead_code)]
 pub fn execute() -> io::Result<()> {
     match Root::parse() {
-        Root::Version(x) => {
-            x.run()
-        },
-        Root::Run(x) => {
-            x.run()
-        }
-        _ => Err(io::ErrorKind::NotFound.into())
+        Root::Version(x) => x.run(),
+        Root::Run(x) => x.run(),
     }
 }

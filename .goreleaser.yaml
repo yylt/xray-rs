@@ -1,0 +1,30 @@
+builds:
+  - goos:
+      - linux
+      - windows
+      - android
+    goarch:
+      - amd64
+      - arm64
+    binary: xray-rs
+    ignore:
+      - goos: windows
+        goarch: arm64
+      - goos: android
+        goarch: amd64
+    main: goreleaser.go
+    hooks:
+      post:
+        - ./.goreleaser_hook.sh "{{ .Arch }}" "{{ .Os }}" "{{ .ProjectName }}"
+checksum:
+  name_template: "checksums.txt"
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^tests:"
+release:
+  replace_existing_artifacts: true
+  prerelease: auto

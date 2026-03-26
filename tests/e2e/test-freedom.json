@@ -1,0 +1,19 @@
+{
+  "inbounds": [
+    {
+      "port": 3080,
+      "listen": "127.0.0.1",
+      "protocol": "http",
+      "tag": "http-in",
+      "settings": {
+        "allowTransparent": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}

@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package rsray.grpc;
+
+// Tunnel service provides bidirectional data streaming for proxy connections.
+// Supports both single-stream and multi-stream modes for efficient data transfer.
+service Tunnel {
+  // Tun establishes a bidirectional stream for tunneling data between client and server.
+  // Each Hunk message carries a chunk of data in either direction.
+  rpc Tun (stream Hunk) returns (stream Hunk);
+
+  // TunMulti establishes a bidirectional stream with support for multiplexing multiple
+  // data streams within a single gRPC connection. Each MultiHunk can carry data for
+  // multiple logical streams.
+  rpc TunMulti (stream MultiHunk) returns (stream MultiHunk);
+}
+
+// Management service provides control plane operations for tunnel configuration
+// and health monitoring.
+service Management {
+  // Keepalive maintains a bidirectional heartbeat stream to detect connection health.
+  // Clients send Ping messages with timestamps, server responds with Pong messages.
+  // Used to detect network failures and maintain connection liveness.
+  rpc Keepalive(stream Ping) returns (stream Pong);
+
+  // Configure applies tunnel configuration to the server.
+  // Returns success status and error message if configuration fails.
+  rpc Configure(TunnelConfig) returns (ConfigResponse);
+}
+
+// Hunk represents a single chunk of data in a tunnel stream.
+message Hunk {
+  // data contains the raw bytes being tunneled.
+  bytes data = 1;
+}
+
+// MultiHunk represents multiple data chunks in a multiplexed tunnel stream.
+// Allows batching multiple logical streams' data in a single message.
+message MultiHunk {
+  // data contains multiple byte arrays, each representing a separate logical stream's chunk.
+  repeated bytes data = 1;
+}
+
+// Ping message sent by client to server for keepalive heartbeat.
+message Ping {
+  // timestamp in milliseconds since Unix epoch (1970-01-01 00:00:00 UTC).
+  // Used to measure round-trip time and detect clock skew.
+  int64 timestamp = 1;
+}
+
+// Pong message sent by server in response to Ping.
+message Pong {
+  // timestamp in milliseconds since Unix epoch (1970-01-01 00:00:00 UTC).
+  // Should echo the timestamp from the corresponding Ping message.
+  int64 timestamp = 1;
+}
+
+// TunnelConfig specifies the configuration for a reverse proxy tunnel.
+message TunnelConfig {
+  // listen_port is the port number on which the tunnel should listen for incoming connections.
+  uint32 listen_port = 1;
+
+  // mode specifies the tunnel direction:
+  // - "l2r" (local-to-remote): Forward connections from local listener to remote destination
+  // - "r2l" (remote-to-local): Forward connections from remote listener to local destination
+  string mode = 2;
+
+  // password for tunnel authentication.
+  // SECURITY: This field transmits credentials and MUST only be used over TLS-secured
+  // gRPC connections. Using this field over unencrypted connections exposes the password
+  // to network eavesdropping.
+  string password = 3;
+}
+
+// ConfigResponse indicates the result of a Configure RPC call.
+message ConfigResponse {
+  // success is true if configuration was applied successfully, false otherwise.
+  bool success = 1;
+
+  // error contains a human-readable error message describing why configuration failed.
+  // Contract: When success is true, this field MUST be an empty string.
+  // When success is false, this field SHOULD contain a descriptive error message.
+  string error = 2;
+}

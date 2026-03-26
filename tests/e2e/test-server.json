@@ -1,0 +1,26 @@
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10443,
+      "protocol": "trojan",
+      "settings": {
+        "passwords": ["test-password-123"]
+      },
+      "tag": "trojan-in",
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpNoDelay": true
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ]
+}
