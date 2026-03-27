@@ -1,0 +1,19 @@
+inbounds:
+  - listen: 127.0.0.1
+    port: 10443
+    protocol: trojan
+    tag: trojan-ws-in
+    settings:
+      password: test-password-123
+    streamSettings:
+      network: ws
+      security: none
+      wsSettings:
+        path: /ws
+        headers: {}
+      sockopt:
+        tcpNoDelay: true
+
+outbounds:
+  - tag: direct
+    protocol: freedom

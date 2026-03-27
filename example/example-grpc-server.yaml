@@ -1,0 +1,20 @@
+inbounds:
+  - listen: 127.0.0.1
+    port: 10443
+    protocol: trojan
+    tag: trojan-grpc-in
+    settings:
+      password: test-password-123
+    streamSettings:
+      network: grpc
+      security: none
+      grpcSettings:
+        serviceName: grpc
+        multiMode: false
+        authority: 127.0.0.1
+      sockopt:
+        tcpNoDelay: true
+
+outbounds:
+  - tag: direct
+    protocol: freedom

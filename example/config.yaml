@@ -1,0 +1,84 @@
+inbounds:
+  - listen: 0.0.0.0
+    port: 1080
+    protocol: http
+    tag: http
+    settings:
+      allowTransparent: false
+    streamSettings:
+      sockopt:
+        tcpNoDelay: true
+
+  - listen: 0.0.0.0
+    port: 1081
+    protocol: socks
+    tag: s5
+    settings:
+      udp: true
+      ip: 127.0.0.1
+
+outbounds:
+  - tag: trojan-grpc-tls
+    protocol: trojan
+    settings:
+      address: example.com
+      port: 443
+      password: password
+    streamSettings:
+      network: grpc
+      security: tls
+      tlsSettings:
+        serverName: example.com
+        alpn:
+          - h2
+          - http/1.1
+        allowInsecure: true
+      sockopt:
+        tcpNoDelay: true
+        tcpCongestion: bbr
+      grpcSettings:
+        multiMode: true
+        userAgent: chrome
+        concurrentLimit: 3
+        serviceName: gapi
+
+  - tag: vless-grpc-tls
+    protocol: vless
+    settings:
+      servers:
+        - address: example.com
+          port: 443
+          id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+    streamSettings:
+      network: grpc
+      security: tls
+      tlsSettings:
+        serverName: example.com
+        alpn:
+          - h2
+          - http/1.1
+        allowInsecure: true
+      sockopt:
+        tcpNoDelay: true
+        tcpCongestion: bbr
+      grpcSettings:
+        multiMode: true
+        serviceName: g2api
+
+  - tag: free
+    protocol: freedom
+
+  - tag: blocked
+    protocol: blackhole
+
+routing:
+  domainStrategy: AsIs
+  rules:
+    - domain:
+        - baidu.com
+        - qq.com
+        - taobao.com
+      outboundTag: free
+  fallback:
+    tags:
+      - trojan-grpc-tls

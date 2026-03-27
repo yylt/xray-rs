@@ -1,0 +1,90 @@
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 2080,
+      "protocol": "http",
+      "tag": "http-in",
+      "settings": {
+        "allowTransparent": false
+      }
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 2081,
+      "protocol": "socks",
+      "tag": "socks-in",
+      "settings": {
+        "udp": true,
+        "ip": "127.0.0.1"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "trojan",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 10443,
+        "password": "test-password-123"
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "none",
+        "grpcSettings": {
+          "serviceName": "grpc",
+          "multiMode": false,
+          "authority": "127.0.0.1"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "blocked",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "domain": [
+          "google.com",
+          "www.google.com"
+        ],
+        "outboundTag": "proxy"
+      },
+      {
+        "domain": [
+          "file:tests/e2e/testdata/ads.txt"
+        ],
+        "outboundTag": "blocked"
+      },
+      {
+        "domain": [
+          "file:tests/e2e/testdata/cn.txt"
+        ],
+        "outboundTag": "direct"
+      }
+    ],
+    "fallback": {
+      "tags": [
+        "direct"
+      ]
+    }
+  },
+  "dns": {
+    "disableCache": false,
+    "hosts": [
+      "localhost:127.0.0.1"
+    ],
+    "servers": [
+      "1.1.1.1:53",
+      "tcp://8.8.8.8:53"
+    ]
+  }
+}

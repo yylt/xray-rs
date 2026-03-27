@@ -1,0 +1,4 @@
+# Ad domains
+ads.example.com
+tracker.example.com
+analytics.example.com

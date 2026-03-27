@@ -14,7 +14,7 @@ use crate::{
 
 #[derive(Debug, clap::Args)]
 pub struct Run {
-    #[arg(short, long, value_name = "config filepath", default_value = "config.json")]
+    #[arg(short, long, value_name = "config filepath", default_value = "config.yaml")]
     config: String,
 }
 

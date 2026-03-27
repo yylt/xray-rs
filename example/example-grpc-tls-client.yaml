@@ -1,0 +1,30 @@
+inbounds:
+  - listen: 127.0.0.1
+    port: 2082
+    protocol: http
+    tag: http-in
+    settings:
+      allowTransparent: false
+
+outbounds:
+  - tag: proxy
+    protocol: trojan
+    settings:
+      address: 127.0.0.1
+      port: 10444
+      password: test-password-123
+    streamSettings:
+      network: grpc
+      security: tls
+      tlsSettings:
+        serverName: localhost
+        allowInsecure: true
+        alpn:
+          - h2
+          - http/1.1
+      grpcSettings:
+        serviceName: grpc
+        multiMode: false
+        authority: localhost
+      sockopt:
+        tcpNoDelay: true
