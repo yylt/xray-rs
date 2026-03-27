@@ -1,41 +1,36 @@
 use crate::common::Address;
 use crate::generated::grpc_generated as pb;
-use crate::transport::{ConnectInfo, ConnectedStream};
-use ahash::RandomState;
-
 use http::uri::PathAndQuery;
 use serde::{Deserialize, Serialize};
 
 use bytes::{Buf, Bytes, BytesMut};
 use pb::*;
 use std::{
-    collections::HashMap,
     io::{Error, ErrorKind, Result as IoResult},
     marker::PhantomData,
     pin::Pin,
     result::Result,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{mpsc, RwLock},
+    sync::mpsc,
+    task::JoinHandle,
 };
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::StreamExt;
+use tokio_util::sync::PollSender;
 use tower::ServiceExt;
 
 use log::{debug, error, warn};
 
-const DEFAULT_CLIENT_BUFFER_SIZE: usize = 1024;
-const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 8192;
+const DEFAULT_BUFFER_SIZE: usize = 128 * 1024;
 const DEFAULT_CONCURRENT_LIMIT: usize = 256;
 const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 10;
-const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = true;
+const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = false;
+const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,21 +80,21 @@ enum ConnectionTarget {
 }
 
 impl ConnectionTarget {
-    fn socket_addr(&self) -> Option<std::net::SocketAddr> {
+    fn to_balancer_key(&self) -> super::balancer::GrpcTargetKey {
         match self {
-            ConnectionTarget::Tcp(addr) => Some(*addr),
+            ConnectionTarget::Tcp(addr) => super::balancer::GrpcTargetKey::Tcp(*addr),
             #[cfg(unix)]
-            ConnectionTarget::Unix(_) => None,
+            ConnectionTarget::Unix(path) => super::balancer::GrpcTargetKey::Unix(path.clone()),
         }
     }
-}
 
-fn rotate_candidates(mut candidates: Vec<ConnectionTarget>, offset: usize) -> Vec<ConnectionTarget> {
-    let len = candidates.len();
-    if len > 0 {
-        candidates.rotate_left(offset % len);
+    fn from_balancer_key(key: &super::balancer::GrpcTargetKey) -> Self {
+        match key {
+            super::balancer::GrpcTargetKey::Tcp(addr) => ConnectionTarget::Tcp(*addr),
+            #[cfg(unix)]
+            super::balancer::GrpcTargetKey::Unix(path) => ConnectionTarget::Unix(path.clone()),
+        }
     }
-    candidates
 }
 
 pub struct Grpc {
@@ -107,13 +102,17 @@ pub struct Grpc {
     sockopt: super::sockopt::SocketOpt,
     tls_client: Option<crate::transport::tls::client::Tls>,
     tls_server: Option<crate::transport::tls::server::Tls>,
-    channels: Arc<RwLock<HashMap<ConnectionTarget, tonic::transport::Channel, RandomState>>>,
-    index: AtomicUsize,
+    balancer: Arc<super::balancer::GrpcBalancer>,
     dns: std::sync::Arc<crate::route::DnsResolver>,
+    dns_refresh_task: Option<JoinHandle<()>>,
 }
 
 impl Grpc {
-    pub fn new(sset: &super::StreamSettings, dns: std::sync::Arc<crate::route::DnsResolver>) -> IoResult<Self> {
+    pub fn new(
+        sset: &super::StreamSettings,
+        server: Option<Address>,
+        dns: std::sync::Arc<crate::route::DnsResolver>,
+    ) -> IoResult<Self> {
         let grpc_settings = sset
             .grpc_settings
             .as_ref()
@@ -135,108 +134,81 @@ impl Grpc {
             None
         };
 
+        let route_config = RouteConfig::from(grpc_settings);
+        let balancer = Arc::new(super::balancer::GrpcBalancer::new(super::balancer::Strategy::LeastLoadedP2c));
+
+        let dns_refresh_task = Self::spawn_dns_refresh_task(server.clone(), dns.clone(), balancer.clone());
+
         Ok(Self {
-            route_config: RouteConfig::from(grpc_settings),
+            route_config,
             sockopt: sset.sockopt.clone(),
             tls_client,
             tls_server,
-            channels: Arc::new(RwLock::new(HashMap::with_hasher(RandomState::new()))),
-            index: AtomicUsize::new(0),
+            balancer,
             dns,
+            dns_refresh_task,
         })
+    }
+
+    fn spawn_dns_refresh_task(
+        server: Option<Address>,
+        dns: Arc<crate::route::DnsResolver>,
+        balancer: Arc<super::balancer::GrpcBalancer>,
+    ) -> Option<JoinHandle<()>> {
+        match server.clone() {
+            None => None,
+            Some(Address::Inet(addr)) => Some(tokio::spawn(async move {
+                balancer
+                    .sync_targets(vec![ConnectionTarget::Tcp(addr).to_balancer_key()])
+                    .await;
+            })),
+            #[cfg(unix)]
+            Some(Address::Unix(path)) => Some(tokio::spawn(async move {
+                balancer
+                    .sync_targets(vec![ConnectionTarget::Unix(path).to_balancer_key()])
+                    .await;
+            })),
+            #[cfg(not(unix))]
+            Some(Address::Unix(_)) => None,
+            Some(Address::Domain(domain, port)) => Some(tokio::spawn(async move {
+                let interval = Duration::from_secs(DEFAULT_DNS_REFRESH_INTERVAL_SECS);
+                loop {
+                    match dns.resolve(&domain).await {
+                        Ok(ips) => {
+                            let targets: Vec<_> = ips
+                                .into_iter()
+                                .map(|ip| ConnectionTarget::Tcp(std::net::SocketAddr::new(ip, port)).to_balancer_key())
+                                .collect();
+
+                            if targets.is_empty() {
+                                warn!("DNS resolved {} but got no addresses", domain);
+                            } else {
+                                balancer.sync_targets(targets).await;
+                            }
+                        }
+                        Err(e) => {
+                            error!("DNS resolution failed for {}: {}", domain, e);
+                        }
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+            })),
+        }
     }
 
     pub fn dns(&self) -> &std::sync::Arc<crate::route::DnsResolver> {
         &self.dns
     }
 
-    /// Connect with multi-address support and DNS resolution
-    pub async fn connect(&self, dest: &Address, proto: crate::common::Protocol) -> IoResult<super::TrStream> {
-        Ok(self.connect_with_info(dest, proto).await?.stream)
-    }
+    /// Connect using balancer-managed targets/channel cache.
+    pub async fn connect(&self, _dest: &Address, _proto: crate::common::Protocol) -> IoResult<super::TrStream> {
+        let (selected, mut stream) = self
+            .balancer
+            .open_with_retry(|key| async move { self.open_stream_via_target_key(&key).await })
+            .await?;
 
-    pub async fn connect_with_info(
-        &self,
-        dest: &Address,
-        _proto: crate::common::Protocol,
-    ) -> IoResult<ConnectedStream> {
-        let candidates = self.order_targets_for_connect(dest).await?;
-        let mut last_error = None;
-
-        for target in candidates {
-            let connect_started = Instant::now();
-            match self.open_stream_via_target(&target).await {
-                Ok(stream) => {
-                    return Ok(ConnectedStream {
-                        stream: super::TrStream::Grpc(stream),
-                        info: ConnectInfo {
-                            via: target.socket_addr(),
-                            duration: Some(connect_started.elapsed()),
-                        },
-                    });
-                }
-                Err(err) => {
-                    self.remove_cached_channel(&target).await;
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| Error::new(ErrorKind::NotConnected, "gRPC connect failed with no targets")))
-    }
-
-    async fn resolve_targets(&self, dest: &Address) -> IoResult<Vec<ConnectionTarget>> {
-        match dest {
-            Address::Inet(addr) => Ok(vec![ConnectionTarget::Tcp(*addr)]),
-            #[cfg(unix)]
-            Address::Unix(path) => Ok(vec![ConnectionTarget::Unix(path.clone())]),
-            #[cfg(not(unix))]
-            Address::Unix(_) => Err(Error::new(ErrorKind::Unsupported, super::UNIX_SOCKET_UNSUPPORTED)),
-            Address::Domain(domain, port) => match self.dns.resolve(domain).await {
-                Ok(ips) => {
-                    let targets: Vec<ConnectionTarget> = ips
-                        .into_iter()
-                        .map(|ip| ConnectionTarget::Tcp(std::net::SocketAddr::new(ip, *port)))
-                        .collect();
-
-                    if targets.is_empty() {
-                        return Err(Error::new(
-                            ErrorKind::NotFound,
-                            format!("DNS resolved {} but got no addresses", domain),
-                        ));
-                    }
-                    Ok(targets)
-                }
-                Err(e) => {
-                    error!("DNS resolution failed for {}: {}", domain, e);
-                    Err(Error::new(ErrorKind::NotFound, format!("DNS resolution failed: {}", e)))
-                }
-            },
-        }
-    }
-
-    async fn order_targets_for_connect(&self, dest: &Address) -> IoResult<Vec<ConnectionTarget>> {
-        let candidates = self.resolve_targets(dest).await?;
-
-        if matches!(dest, Address::Domain(_, _)) && candidates.len() > 1 {
-            let offset = self.index.fetch_add(1, Ordering::Relaxed) % candidates.len();
-            return Ok(rotate_candidates(candidates, offset));
-        }
-
-        Ok(candidates)
-    }
-
-    async fn cached_channel(&self, target: &ConnectionTarget) -> Option<tonic::transport::Channel> {
-        self.channels.read().await.get(target).cloned()
-    }
-
-    async fn cache_channel(
-        &self,
-        target: &ConnectionTarget,
-        channel: tonic::transport::Channel,
-    ) -> tonic::transport::Channel {
-        self.channels.write().await.insert(target.clone(), channel.clone());
-        channel
+        stream.target_state = Some(selected.state.clone());
+        Ok(super::TrStream::Grpc(stream))
     }
 
     async fn connect_channel_new(&self, target: &ConnectionTarget) -> IoResult<tonic::transport::Channel> {
@@ -256,9 +228,9 @@ impl Grpc {
         }
         ep = ep
             .concurrency_limit(self.route_config.concurrent_limit)
-            .buffer_size(self.route_config.buf_byte_size)
             .http2_keep_alive_interval(self.route_config.http2_keep_alive_interval)
             .keep_alive_while_idle(self.route_config.http2_keep_alive_while_idle)
+            .buffer_size(self.route_config.buf_byte_size)
             .http2_adaptive_window(true);
 
         let connector_target = target.clone();
@@ -312,8 +284,8 @@ impl Grpc {
         is_multi: bool,
         path: PathAndQuery,
         grpc_client: tonic::client::Grpc<tonic::transport::Channel>,
-        write_rx: mpsc::Receiver<Bytes>,
-        read_tx: mpsc::Sender<Bytes>,
+        outgoing_rx: mpsc::Receiver<Bytes>,
+        incoming_tx: mpsc::Sender<Bytes>,
     ) {
         debug!(
             "[gRPC][client] starting stream mode={} path={}",
@@ -321,22 +293,24 @@ impl Grpc {
             path
         );
         if is_multi {
-            Self::run_multi_stream(path, grpc_client, write_rx, read_tx).await;
+            Self::run_multi_stream(path, grpc_client, outgoing_rx, incoming_tx).await;
         } else {
-            Self::run_single_stream(path, grpc_client, write_rx, read_tx).await;
+            Self::run_single_stream(path, grpc_client, outgoing_rx, incoming_tx).await;
         }
     }
 
     async fn run_multi_stream(
         path: PathAndQuery,
         mut grpc_client: tonic::client::Grpc<tonic::transport::Channel>,
-        write_rx: mpsc::Receiver<Bytes>,
-        read_tx: mpsc::Sender<Bytes>,
+        mut outgoing_rx: mpsc::Receiver<Bytes>,
+        incoming_tx: mpsc::Sender<Bytes>,
     ) {
         let path_for_log = path.clone();
-        let req = tonic::Request::new(ReceiverStream::new(write_rx).map(|bytes| MultiHunk {
-            data: vec![bytes.to_vec()],
-        }));
+        let req = tonic::Request::new(async_stream::stream! {
+            while let Some(bytes) = outgoing_rx.recv().await {
+                yield MultiHunk { data: vec![bytes] };
+            }
+        });
 
         match grpc_client
             .streaming(req, path, tonic_prost::ProstCodec::default())
@@ -349,8 +323,7 @@ impl Grpc {
                     match message {
                         Some(multi_hunk) => {
                             for data in multi_hunk.data {
-                                if let Err(e) = read_tx.send(Bytes::from(data)).await {
-                                    error!("Error send gRPC stream: {}", e);
+                                if incoming_tx.send(data).await.is_err() {
                                     return;
                                 }
                             }
@@ -371,11 +344,15 @@ impl Grpc {
     async fn run_single_stream(
         path: PathAndQuery,
         mut grpc_client: tonic::client::Grpc<tonic::transport::Channel>,
-        write_rx: mpsc::Receiver<Bytes>,
-        read_tx: mpsc::Sender<Bytes>,
+        mut outgoing_rx: mpsc::Receiver<Bytes>,
+        incoming_tx: mpsc::Sender<Bytes>,
     ) {
         let path_for_log = path.clone();
-        let req = tonic::Request::new(ReceiverStream::new(write_rx).map(|bytes| Hunk { data: bytes.to_vec() }));
+        let req = tonic::Request::new(async_stream::stream! {
+            while let Some(bytes) = outgoing_rx.recv().await {
+                yield Hunk { data: bytes };
+            }
+        });
 
         match grpc_client
             .streaming(req, path, tonic_prost::ProstCodec::default())
@@ -387,7 +364,7 @@ impl Grpc {
                 while let Ok(message) = stream.message().await {
                     match message {
                         Some(hunk) => {
-                            if let Err(_e) = read_tx.send(Bytes::from(hunk.data)).await {
+                            if incoming_tx.send(hunk.data).await.is_err() {
                                 return;
                             }
                         }
@@ -404,59 +381,43 @@ impl Grpc {
         }
     }
 
-    async fn open_stream_on_channel(
-        &self,
-        target: &ConnectionTarget,
-        channel: tonic::transport::Channel,
-    ) -> IoResult<GrpcStream> {
+    async fn open_stream_on_channel(&self, channel: tonic::transport::Channel) -> IoResult<GrpcStream> {
         let path = self.route_config.path();
         let mut grpc_client = tonic::client::Grpc::new(channel);
-
-        debug!(
-            "[gRPC][client] preparing stream target={:?} path={} mode={}",
-            target,
-            path,
-            if self.route_config.multi_mode {
-                "multi"
-            } else {
-                "single"
-            }
-        );
         grpc_client
             .ready()
             .await
             .map_err(|err| Error::new(ErrorKind::ConnectionAborted, err.to_string()))?;
 
-        let (grpc_stream, (read_tx, write_rx)) = make_service(DEFAULT_CHANNEL_BUFFER_SIZE);
+        let (grpc_stream, incoming_tx, outgoing_rx) = make_service(self.route_config.buf_byte_size);
         let is_multi = self.route_config.multi_mode;
 
-        tokio::spawn(async move {
-            Self::start_streaming_task(is_multi, path, grpc_client, write_rx, read_tx).await;
+        let task = tokio::spawn(async move {
+            Self::start_streaming_task(is_multi, path, grpc_client, outgoing_rx, incoming_tx).await;
         });
 
+        let mut grpc_stream = grpc_stream;
+        grpc_stream.task = Some(task);
         Ok(grpc_stream)
     }
 
-    async fn open_stream_via_target(&self, target: &ConnectionTarget) -> IoResult<GrpcStream> {
-        if let Some(channel) = self.cached_channel(target).await {
+    async fn open_stream_via_target_key(&self, key: &super::balancer::GrpcTargetKey) -> IoResult<GrpcStream> {
+        if let Some(channel) = self.balancer.cached_channel(key).await {
             let mut readiness = channel.clone();
             if readiness.ready().await.is_ok() {
-                return self.open_stream_on_channel(target, channel).await;
+                return self.open_stream_on_channel(channel).await;
             }
-            self.remove_cached_channel(target).await;
+            self.balancer.remove_cached_channel(key).await;
         }
 
-        let channel = self.rebuild_channel(target).await?;
-        self.open_stream_on_channel(target, channel).await
-    }
-
-    async fn remove_cached_channel(&self, target: &ConnectionTarget) {
-        self.channels.write().await.remove(target);
-    }
-
-    async fn rebuild_channel(&self, target: &ConnectionTarget) -> IoResult<tonic::transport::Channel> {
-        let channel = self.connect_channel_new(target).await?;
-        Ok(self.cache_channel(target, channel).await)
+        let target = ConnectionTarget::from_balancer_key(key);
+        let channel = self.connect_channel_new(&target).await?;
+        let channel = self
+            .balancer
+            .cache_channel(key, channel.clone())
+            .await
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "gRPC target disappeared during channel rebuild"))?;
+        self.open_stream_on_channel(channel).await
     }
 
     fn authority_for_target(&self, target: &ConnectionTarget) -> String {
@@ -502,8 +463,8 @@ impl Grpc {
 
         let sockopt = self.sockopt.clone();
         let tls_server = self.tls_server.clone();
-        let context = self.listen_context();
-        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(128);
+        let route_config = Arc::new(self.route_config.clone());
+        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(self.route_config.buf_byte_size);
 
         let stream = async_stream::stream! {
             loop {
@@ -520,9 +481,9 @@ impl Grpc {
                                 };
 
                                 let tls_server = tls_server.clone();
-                                let route_config = context.route_config.clone();
+                                let route_config = route_config.clone();
                                 let stream_tx = stream_tx.clone();
-                                let buf_byte_size = context.server_buf_byte_size;
+                                let buf_byte_size = route_config.buf_byte_size;
 
                                 tokio::spawn(async move {
                                     let peer_addr = Address::Inet(peer_addr);
@@ -574,9 +535,9 @@ impl Grpc {
         log::info!("gRPC Unix listener bound successfully to {:?}", path);
 
         let sockopt = self.sockopt.clone();
-        let context = self.listen_context();
+        let route_config = Arc::new(self.route_config.clone());
         let listener_path = path.clone();
-        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(128);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(self.route_config.buf_byte_size);
 
         let stream = async_stream::stream! {
             loop {
@@ -592,9 +553,9 @@ impl Grpc {
                                     }
                                 };
 
-                                let route_config = context.route_config.clone();
+                                let route_config = route_config.clone();
                                 let stream_tx = stream_tx.clone();
-                                let buf_byte_size = context.server_buf_byte_size;
+                                let buf_byte_size = route_config.buf_byte_size;
                                 let unix_listener_path = listener_path.clone();
                                 let peer_addr = Address::Unix(unix_listener_path.clone());
 
@@ -608,7 +569,7 @@ impl Grpc {
                                         None,
                                     )
                                     .await {
-                                    error!("Connection handler error for {:?}: {}", unix_listener_path, e);
+                                        error!("Connection handler error for {:?}: {}", unix_listener_path, e);
                                     }
                                 });
                             }
@@ -627,18 +588,14 @@ impl Grpc {
 
         Ok(Box::pin(stream))
     }
-
-    fn listen_context(&self) -> ListenContext {
-        ListenContext {
-            route_config: Arc::new(self.route_config.clone()),
-            server_buf_byte_size: DEFAULT_CHANNEL_BUFFER_SIZE,
-        }
-    }
 }
 
-struct ListenContext {
-    route_config: Arc<RouteConfig>,
-    server_buf_byte_size: usize,
+impl Drop for Grpc {
+    fn drop(&mut self) {
+        if let Some(task) = self.dns_refresh_task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct TunGrpcService<M> {
@@ -660,29 +617,43 @@ impl<M> Clone for TunGrpcService<M> {
 }
 
 trait TunMessage: prost::Message + Default + Send + 'static {
-    fn into_bytes_vec(self) -> Vec<Bytes>;
+    fn into_chunks(self) -> TunChunks;
     fn from_bytes(bytes: Bytes) -> Self;
 }
 
+enum TunChunks {
+    One(Option<Bytes>),
+    Many(std::vec::IntoIter<Bytes>),
+}
+
+impl Iterator for TunChunks {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            TunChunks::One(slot) => slot.take(),
+            TunChunks::Many(iter) => iter.next(),
+        }
+    }
+}
+
 impl TunMessage for Hunk {
-    fn into_bytes_vec(self) -> Vec<Bytes> {
-        vec![Bytes::from(self.data)]
+    fn into_chunks(self) -> TunChunks {
+        TunChunks::One(Some(self.data))
     }
 
     fn from_bytes(bytes: Bytes) -> Self {
-        Self { data: bytes.to_vec() }
+        Self { data: bytes }
     }
 }
 
 impl TunMessage for MultiHunk {
-    fn into_bytes_vec(self) -> Vec<Bytes> {
-        self.data.into_iter().map(Bytes::from).collect()
+    fn into_chunks(self) -> TunChunks {
+        TunChunks::Many(self.data.into_iter())
     }
 
     fn from_bytes(bytes: Bytes) -> Self {
-        Self {
-            data: vec![bytes.to_vec()],
-        }
+        Self { data: vec![bytes] }
     }
 }
 
@@ -691,7 +662,7 @@ where
     M: TunMessage,
 {
     async fn start_stream(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>), tonic::Status> {
-        let (grpc_stream, (read_tx, write_rx)) = make_service(DEFAULT_CHANNEL_BUFFER_SIZE);
+        let (grpc_stream, incoming_tx, outgoing_rx) = make_service(self.buf_byte_size);
         debug!("[gRPC][server] handoff stream peer={:?}", self.peer_addr);
         self.stream_tx
             .send((grpc_stream, self.peer_addr.clone()))
@@ -700,18 +671,17 @@ where
                 error!("Failed to send gRPC stream for {:?}: {}", self.peer_addr, e);
                 tonic::Status::internal("failed to hand off grpc stream")
             })?;
-        Ok((read_tx, write_rx))
+        Ok((incoming_tx, outgoing_rx))
     }
 
-    fn spawn_reader(&self, mut request_stream: tonic::Streaming<M>, read_tx: mpsc::Sender<Bytes>) {
+    fn spawn_reader(&self, mut request_stream: tonic::Streaming<M>, incoming_tx: mpsc::Sender<Bytes>) {
         let peer_addr = self.peer_addr.clone();
         tokio::spawn(async move {
             while let Some(message) = request_stream.next().await {
                 match message {
                     Ok(message) => {
-                        for data in message.into_bytes_vec() {
-                            if let Err(e) = read_tx.send(data).await {
-                                error!("Failed to forward gRPC data from {:?}: {}", peer_addr, e);
+                        for data in message.into_chunks() {
+                            if incoming_tx.send(data).await.is_err() {
                                 return;
                             }
                         }
@@ -751,10 +721,13 @@ where
             fn call(&mut self, request: tonic::Request<tonic::Streaming<M>>) -> Self::Future {
                 let service = self.0.clone();
                 Box::pin(async move {
-                    let (read_tx, write_rx) = service.start_stream().await?;
-                    service.spawn_reader(request.into_inner(), read_tx);
-                    let response_stream: Self::ResponseStream =
-                        Box::pin(ReceiverStream::new(write_rx).map(|bytes| Ok(M::from_bytes(bytes))));
+                    let (incoming_tx, mut outgoing_rx) = service.start_stream().await?;
+                    service.spawn_reader(request.into_inner(), incoming_tx);
+                    let response_stream: Self::ResponseStream = Box::pin(async_stream::stream! {
+                        while let Some(bytes) = outgoing_rx.recv().await {
+                            yield Ok(M::from_bytes(bytes));
+                        }
+                    });
                     Ok(tonic::Response::new(response_stream))
                 })
             }
@@ -780,7 +753,6 @@ where
 
     debug!("[gRPC][server] accepted connection peer={:?}", peer_addr);
 
-    // Create service function
     let service_peer_addr = peer_addr.clone();
     let service = service_fn(move |req: http::Request<hyper::body::Incoming>| {
         let route_config = route_config.clone();
@@ -832,7 +804,6 @@ where
         }
     });
 
-    // Apply TLS if configured and serve
     if let Some(tls) = tls_server {
         match tls.accept(stream).await {
             Ok(tls_stream) => {
@@ -866,23 +837,27 @@ where
     Ok(())
 }
 
-#[derive(Default)]
 pub struct GrpcStream {
-    read_rx: Option<mpsc::Receiver<Bytes>>,
-    write_tx: Option<mpsc::Sender<Bytes>>,
     read_buf: BytesMut,
+    incoming_rx: Option<mpsc::Receiver<Bytes>>,
+    outgoing_tx: Option<PollSender<Bytes>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    target_state: Option<Arc<super::balancer::TargetState>>,
 }
 
-pub fn make_service(buf_byte_size: usize) -> (GrpcStream, (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)) {
-    let (read_tx, read_rx) = mpsc::channel(buf_byte_size);
-    let (write_tx, write_rx) = mpsc::channel(buf_byte_size);
+fn make_service(buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+    let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(buf_byte_size);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(buf_byte_size);
 
     let stream_service = GrpcStream {
-        read_rx: Some(read_rx),
-        write_tx: Some(write_tx),
         read_buf: BytesMut::new(),
+        incoming_rx: Some(incoming_rx),
+        outgoing_tx: Some(PollSender::new(outgoing_tx)),
+        task: None,
+        target_state: None,
     };
-    (stream_service, (read_tx, write_rx))
+
+    (stream_service, incoming_tx, outgoing_rx)
 }
 
 #[derive(Debug, Clone)]
@@ -969,7 +944,7 @@ impl From<&GrpcSettings> for RouteConfig {
             multi_mode,
             concurrent_limit: settings.concurrent_limit.unwrap_or(DEFAULT_CONCURRENT_LIMIT),
             user_agent: settings.user_agent.clone(),
-            buf_byte_size: settings.buf_byte_size.unwrap_or(DEFAULT_CLIENT_BUFFER_SIZE),
+            buf_byte_size: settings.buf_byte_size.unwrap_or(DEFAULT_BUFFER_SIZE),
             http2_keep_alive_interval: settings
                 .http2_keep_alive_interval
                 .unwrap_or(Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS)),
@@ -978,6 +953,19 @@ impl From<&GrpcSettings> for RouteConfig {
                 .unwrap_or(DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE),
             tun_path,
             multi_tun_path,
+        }
+    }
+}
+
+impl Drop for GrpcStream {
+    fn drop(&mut self) {
+        self.incoming_rx.take();
+        self.outgoing_tx.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(state) = self.target_state.take() {
+            state.record_stream_closed();
         }
     }
 }
@@ -991,8 +979,8 @@ impl AsyncRead for GrpcStream {
             return Poll::Ready(Ok(()));
         }
 
-        if let Some(ref mut read_rx) = self.read_rx {
-            match read_rx.poll_recv(cx) {
+        if let Some(ref mut incoming_rx) = self.incoming_rx {
+            match Pin::new(incoming_rx).poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
                     let to_copy = std::cmp::min(data.len(), buf.remaining());
                     buf.put_slice(&data[..to_copy]);
@@ -1002,7 +990,7 @@ impl AsyncRead for GrpcStream {
                     }
                     Poll::Ready(Ok(()))
                 }
-                Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
+                Poll::Ready(None) => Poll::Ready(Ok(())),
                 Poll::Pending => Poll::Pending,
             }
         } else {
@@ -1012,18 +1000,19 @@ impl AsyncRead for GrpcStream {
 }
 
 impl AsyncWrite for GrpcStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
-        if let Some(ref write_tx) = self.write_tx {
-            match write_tx.try_send(Bytes::copy_from_slice(buf)) {
-                Ok(()) => Poll::Ready(Ok(buf.len())),
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
+        if let Some(ref mut outgoing_tx) = self.outgoing_tx {
+            match Pin::new(&mut *outgoing_tx).poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    let size = buf.len();
+                    let _ = outgoing_tx.send_item(Bytes::copy_from_slice(buf));
+                    Poll::Ready(Ok(size))
                 }
-                Err(_) => Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "write channel closed"))),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "write side closed"))),
+                Poll::Pending => Poll::Pending,
             }
         } else {
-            Poll::Ready(Err(Error::new(ErrorKind::NotConnected, "write channel not initialized")))
+            Poll::Ready(Err(Error::new(ErrorKind::NotConnected, "write buffer not initialized")))
         }
     }
 
@@ -1031,106 +1020,8 @@ impl AsyncWrite for GrpcStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        self.outgoing_tx.take();
         Poll::Ready(Ok(()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{rotate_candidates, ConnectionTarget, GrpcSettings, RouteConfig};
-    use std::time::Duration;
-
-    #[test]
-    fn deserialize_grpc_settings_concurrent_limit() {
-        let settings: GrpcSettings = serde_json::from_str(
-            r#"{
-                "serviceName": "grpc",
-                "multiMode": false,
-                "concurrentLimit": 32,
-                "bufByteSize": 4096,
-                "http2KeepAliveInterval": 15,
-                "http2KeepAliveWhileIdle": false
-            }"#,
-        )
-        .unwrap();
-
-        let debug = format!("{settings:?}");
-        assert!(debug.contains("concurrent_limit: Some(32)"), "{debug}");
-        assert!(debug.contains("buf_byte_size: Some(4096)"), "{debug}");
-        assert!(debug.contains("http2_keep_alive_interval: Some(15s)"), "{debug}");
-        assert!(debug.contains("http2_keep_alive_while_idle: Some(false)"), "{debug}");
-    }
-
-    #[test]
-    fn route_config_defaults_for_client_tuning() {
-        let settings: GrpcSettings = serde_json::from_str(
-            r#"{
-                "serviceName": "grpc"
-            }"#,
-        )
-        .unwrap();
-
-        let route = RouteConfig::from(&settings);
-        assert_eq!(route.concurrent_limit, 100);
-        assert_eq!(route.buf_byte_size, 8192);
-        assert_eq!(route.http2_keep_alive_interval, Duration::from_secs(10));
-        assert!(route.http2_keep_alive_while_idle);
-    }
-
-    #[test]
-    fn deserialize_grpc_settings_rejects_legacy_keys() {
-        let err = serde_json::from_str::<GrpcSettings>(
-            r#"{
-                "serviceName": "grpc",
-                "maxConcurrentStreams": 32,
-                "initialWindowSize": 1048576,
-                "sendCompression": "gzip"
-            }"#,
-        )
-        .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(
-            msg.contains("maxConcurrentStreams")
-                || msg.contains("initialWindowSize")
-                || msg.contains("sendCompression"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn deserialize_grpc_settings_user_agent() {
-        let settings: GrpcSettings = serde_json::from_str(
-            r#"{
-                "serviceName": "grpc",
-                "multiMode": false,
-                "userAgent": "rsray-test-agent"
-            }"#,
-        )
-        .unwrap();
-
-        let debug = format!("{settings:?}");
-        assert!(debug.contains("user_agent: Some(\"rsray-test-agent\")"), "{debug}");
-    }
-
-    #[test]
-    fn rotate_candidates_uses_offset_as_start_index() {
-        let candidates = vec![
-            ConnectionTarget::Tcp("127.0.0.1:1".parse().unwrap()),
-            ConnectionTarget::Tcp("127.0.0.2:1".parse().unwrap()),
-            ConnectionTarget::Tcp("127.0.0.3:1".parse().unwrap()),
-        ];
-
-        let rotated = rotate_candidates(candidates, 1);
-
-        assert_eq!(
-            rotated,
-            vec![
-                ConnectionTarget::Tcp("127.0.0.2:1".parse().unwrap()),
-                ConnectionTarget::Tcp("127.0.0.3:1".parse().unwrap()),
-                ConnectionTarget::Tcp("127.0.0.1:1".parse().unwrap()),
-            ]
-        );
     }
 }

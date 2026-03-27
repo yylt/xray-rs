@@ -187,7 +187,7 @@ async fn run_proxy(config: Config) -> io::Result<()> {
                                                         {
                                                             Ok(connected) => {
                                                                 let _ = forwarder
-                                                                    .forward(proxy_stream.inner, connected.stream)
+                                                                    .forward(proxy_stream.inner, connected)
                                                                     .await;
                                                                 return;
                                                             }

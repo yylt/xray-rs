@@ -1,4 +1,4 @@
-use xray_rs::root;
+use xray_rs::{build_info, root};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -52,6 +52,8 @@ fn main() {
             writeln!(buf, "{}", format_log_prefix(record.level(), record.target(), &message))
         })
         .init();
+
+    build_info::log_startup_info();
 
     match root::execute() {
         Err(e) => {

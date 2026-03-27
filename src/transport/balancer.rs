@@ -1,25 +1,23 @@
-// src/transport/balancer.rs
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use ahash::RandomState;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::io::{Error, ErrorKind, Result};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-/// 负载均衡策略
+/// gRPC 负载均衡策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// 使用第一个 IP（默认）
-    First,
-    /// 轮询所有 IP
+    /// 轮询
     RoundRobin,
-    /// 随机选择
-    Random,
-    /// 最少连接数
-    LeastConnections,
-    /// 最快平均延迟（基于 EWMA）
-    FastestAverage,
+    /// Power-of-two choices with least-loaded score
+    LeastLoadedP2c,
 }
 
 impl Default for Strategy {
     fn default() -> Self {
-        Strategy::RoundRobin
+        Strategy::LeastLoadedP2c
     }
 }
 
@@ -27,94 +25,284 @@ impl Strategy {
     pub fn from_str(s: &str) -> Self {
         match s {
             "round_robin" => Strategy::RoundRobin,
-            "random" => Strategy::Random,
-            "least_connections" => Strategy::LeastConnections,
-            "fastest_average" => Strategy::FastestAverage,
-            _ => Strategy::First,
+            "least_loaded_p2c" => Strategy::LeastLoadedP2c,
+            _ => Strategy::LeastLoadedP2c,
         }
     }
 }
 
-/// 通用负载均衡器
-pub struct LoadBalancer {
-    strategy: Strategy,
-    counter: AtomicUsize,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GrpcTargetKey {
+    Tcp(std::net::SocketAddr),
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
 }
 
-impl LoadBalancer {
+#[derive(Debug)]
+pub struct TargetState {
+    inflight: AtomicUsize,
+    failure_penalty: AtomicUsize,
+    draining: AtomicBool,
+}
+
+impl TargetState {
+    fn new() -> Self {
+        Self {
+            inflight: AtomicUsize::new(0),
+            failure_penalty: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
+        }
+    }
+
+    pub fn record_stream_opened(&self) {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_stream_closed(&self) {
+        let _ = self
+            .inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+    }
+
+    pub fn record_open_success(&self) {
+        let _ = self
+            .failure_penalty
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+    }
+
+    pub fn record_open_failure(&self) {
+        self.failure_penalty.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::Relaxed);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed)
+    }
+
+    pub fn load_score(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed) + self.failure_penalty.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedTarget {
+    pub key: GrpcTargetKey,
+    pub state: Arc<TargetState>,
+}
+
+struct BalancerEntry {
+    state: Arc<TargetState>,
+    channel: Option<tonic::transport::Channel>,
+}
+
+impl BalancerEntry {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(TargetState::new()),
+            channel: None,
+        }
+    }
+}
+
+struct BalancerPool {
+    targets: HashMap<GrpcTargetKey, BalancerEntry, RandomState>,
+    order: Vec<GrpcTargetKey>,
+}
+
+impl BalancerPool {
+    fn new() -> Self {
+        Self {
+            targets: HashMap::with_hasher(RandomState::new()),
+            order: Vec::new(),
+        }
+    }
+}
+
+pub struct GrpcBalancer {
+    strategy: Strategy,
+    counter: AtomicUsize,
+    pool: Arc<RwLock<BalancerPool>>,
+}
+
+impl GrpcBalancer {
     pub fn new(strategy: Strategy) -> Self {
         Self {
             strategy,
             counter: AtomicUsize::new(0),
+            pool: Arc::new(RwLock::new(BalancerPool::new())),
         }
     }
 
-    /// 从 IP 列表中选择一个
-    pub fn select(&self, ips: &[IpAddr]) -> Option<IpAddr> {
-        if ips.is_empty() {
-            return None;
-        }
-
-        match self.strategy {
-            Strategy::First => Some(ips[0]),
-            Strategy::RoundRobin => {
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed) % ips.len();
-                Some(ips[idx])
-            }
-            Strategy::Random => {
-                // 简单实现：使用 counter 作为伪随机
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed) % ips.len();
-                Some(ips[idx])
-            }
-            Strategy::LeastConnections | Strategy::FastestAverage => {
-                // LeastConnections 和 FastestAverage 需要连接池状态
-                // 实际逻辑在 ConnectionPool 中实现，这里退化为 First
-                Some(ips[0])
-            }
-        }
-    }
-
-    /// 获取当前策略
     pub fn strategy(&self) -> Strategy {
         self.strategy
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
+    pub async fn sync_targets(&self, new_targets: Vec<GrpcTargetKey>) {
+        let mut pool = self.pool.write().await;
+        let new_set: HashSet<_> = new_targets.iter().cloned().collect();
 
-    #[test]
-    fn test_first_strategy() {
-        let lb = LoadBalancer::new(Strategy::First);
-        let ips = vec![
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
-        ];
+        for target in &new_targets {
+            let entry = pool.targets.entry(target.clone()).or_insert_with(BalancerEntry::new);
+            entry.state.set_draining(false);
+        }
 
-        assert_eq!(lb.select(&ips), Some(ips[0]));
-        assert_eq!(lb.select(&ips), Some(ips[0]));
+        for (target, entry) in pool.targets.iter_mut() {
+            if !new_set.contains(target) {
+                entry.state.set_draining(true);
+            }
+        }
+
+        pool.targets
+            .retain(|_, entry| !(entry.state.is_draining() && entry.state.inflight() == 0));
+
+        let mut seen = HashSet::new();
+        pool.order = new_targets
+            .into_iter()
+            .filter(|target| seen.insert(target.clone()) && pool.targets.contains_key(target))
+            .collect();
     }
 
-    #[test]
-    fn test_round_robin_strategy() {
-        let lb = LoadBalancer::new(Strategy::RoundRobin);
-        let ips = vec![
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
-            IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3)),
-        ];
-
-        assert_eq!(lb.select(&ips), Some(ips[0]));
-        assert_eq!(lb.select(&ips), Some(ips[1]));
-        assert_eq!(lb.select(&ips), Some(ips[2]));
-        assert_eq!(lb.select(&ips), Some(ips[0]));
+    pub async fn cached_channel(&self, key: &GrpcTargetKey) -> Option<tonic::transport::Channel> {
+        self.pool
+            .read()
+            .await
+            .targets
+            .get(key)
+            .and_then(|entry| entry.channel.clone())
     }
 
-    #[test]
-    fn test_empty_ips() {
-        let lb = LoadBalancer::new(Strategy::RoundRobin);
-        assert_eq!(lb.select(&[]), None);
+    pub async fn cache_channel(
+        &self,
+        key: &GrpcTargetKey,
+        channel: tonic::transport::Channel,
+    ) -> Option<tonic::transport::Channel> {
+        let mut pool = self.pool.write().await;
+        let entry = pool.targets.get_mut(key)?;
+        entry.channel = Some(channel.clone());
+        Some(channel)
+    }
+
+    pub async fn remove_cached_channel(&self, key: &GrpcTargetKey) {
+        if let Some(entry) = self.pool.write().await.targets.get_mut(key) {
+            entry.channel = None;
+        }
+    }
+
+    pub async fn select_target(&self, excluded: &[GrpcTargetKey]) -> Option<SelectedTarget> {
+        let excluded: HashSet<_> = excluded.iter().cloned().collect();
+        let pool = self.pool.read().await;
+
+        match self.strategy {
+            Strategy::RoundRobin => self.select_round_robin(&pool, &excluded),
+            Strategy::LeastLoadedP2c => self.select_least_loaded_p2c(&pool, &excluded),
+        }
+    }
+
+    fn select_round_robin(&self, pool: &BalancerPool, excluded: &HashSet<GrpcTargetKey>) -> Option<SelectedTarget> {
+        let len = pool.order.len();
+        if len == 0 {
+            return None;
+        }
+
+        let start = self.counter.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..len {
+            let key = &pool.order[(start + offset) % len];
+            let entry = pool.targets.get(key)?;
+            if excluded.contains(key) || entry.state.is_draining() {
+                continue;
+            }
+            return Some(SelectedTarget {
+                key: key.clone(),
+                state: entry.state.clone(),
+            });
+        }
+
+        None
+    }
+
+    fn select_least_loaded_p2c(
+        &self,
+        pool: &BalancerPool,
+        excluded: &HashSet<GrpcTargetKey>,
+    ) -> Option<SelectedTarget> {
+        let candidates: Vec<_> = pool
+            .order
+            .iter()
+            .filter_map(|key| {
+                let entry = pool.targets.get(key)?;
+                if excluded.contains(key) || entry.state.is_draining() {
+                    return None;
+                }
+                Some(SelectedTarget {
+                    key: key.clone(),
+                    state: entry.state.clone(),
+                })
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let len = candidates.len();
+        let pick = if len == 1 {
+            0
+        } else {
+            let first = self.counter.fetch_add(1, Ordering::Relaxed) % len;
+            let second = (first + 1 + self.counter.fetch_add(1, Ordering::Relaxed)) % len;
+            let a = &candidates[first];
+            let b = &candidates[second];
+            if a.state.load_score() <= b.state.load_score() {
+                first
+            } else {
+                second
+            }
+        };
+
+        Some(candidates[pick].clone())
+    }
+
+    pub async fn open_with_retry<T, F, Fut>(&self, mut open: F) -> Result<(SelectedTarget, T)>
+    where
+        F: FnMut(GrpcTargetKey) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let total_targets = self.pool.read().await.order.len();
+        if total_targets == 0 {
+            return Err(Error::new(ErrorKind::NotConnected, "No gRPC targets available"));
+        }
+
+        let mut excluded = Vec::new();
+        let mut last_error = None;
+        let max_attempts = total_targets.min(3);
+
+        for _ in 0..max_attempts {
+            let selected = match self.select_target(&excluded).await {
+                Some(selected) => selected,
+                None => break,
+            };
+
+            match open(selected.key.clone()).await {
+                Ok(value) => {
+                    selected.state.record_open_success();
+                    selected.state.record_stream_opened();
+                    return Ok((selected, value));
+                }
+                Err(err) => {
+                    selected.state.record_open_failure();
+                    excluded.push(selected.key.clone());
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| Error::new(ErrorKind::NotConnected, "No selectable gRPC targets")))
     }
 }

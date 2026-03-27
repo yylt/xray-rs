@@ -1,13 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::*;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
-use std::{
-    io::{self, Result},
-    net::SocketAddr,
-    time::Duration,
-};
+use std::io::{self, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -19,7 +15,6 @@ mod sockopt;
 
 pub mod balancer;
 pub mod grpc;
-pub mod pool;
 pub mod raw;
 pub mod tls;
 pub mod websocket;
@@ -89,26 +84,6 @@ pub enum Security {
 // Trait alias for streams that are both readable and writable
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
-
-#[derive(Debug, Clone)]
-pub struct ConnectInfo {
-    pub via: Option<SocketAddr>,
-    pub duration: Option<Duration>,
-}
-
-impl ConnectInfo {
-    pub fn none() -> Self {
-        Self {
-            via: None,
-            duration: None,
-        }
-    }
-}
-
-pub struct ConnectedStream {
-    pub stream: TrStream,
-    pub info: ConnectInfo,
-}
 
 pub enum TrStream {
     Tcp(TcpStream),
@@ -248,15 +223,15 @@ where
 // Buffered stream wrapper for HTTP proxy
 pub struct BufferedStream {
     inner: Box<TrStream>,
-    buffer: Option<Vec<u8>>,
+    buffer: Option<Bytes>,
     buffer_pos: usize,
 }
 
 impl BufferedStream {
-    pub fn new(inner: TrStream, buffer: Vec<u8>) -> Self {
+    pub fn new(inner: TrStream, buffer: impl Into<Bytes>) -> Self {
         Self {
             inner: Box::new(inner),
-            buffer: Some(buffer),
+            buffer: Some(buffer.into()),
             buffer_pos: 0,
         }
     }
@@ -414,10 +389,14 @@ pub enum Transport {
 }
 
 impl Transport {
-    pub fn new(set: &StreamSettings, dns: std::sync::Arc<crate::route::DnsResolver>) -> Result<Self> {
+    pub fn new(
+        set: &StreamSettings,
+        server: Option<Address>,
+        dns: std::sync::Arc<crate::route::DnsResolver>,
+    ) -> Result<Self> {
         match set.network {
             Network::Tcp => Ok(Transport::Raw(raw::Raw::new(set, dns))),
-            Network::Grpc => Ok(Transport::Grpc(grpc::Grpc::new(set, dns)?)),
+            Network::Grpc => Ok(Transport::Grpc(grpc::Grpc::new(set, server, dns)?)),
             Network::Ws => Ok(Transport::WebSocket(websocket::WebSocket::new(set, dns)?)),
         }
     }
@@ -440,28 +419,10 @@ impl Transport {
     }
 
     pub async fn connect(&self, dest: &Address, proto: Protocol) -> Result<TrStream> {
-        Ok(self.connect_with_info(dest, proto).await?.stream)
-    }
-
-    pub async fn connect_with_info(&self, dest: &Address, proto: Protocol) -> Result<ConnectedStream> {
         match self {
-            Transport::Raw(raw) => raw.connect(dest, proto).await.map(|stream| ConnectedStream {
-                stream,
-                info: ConnectInfo::none(),
-            }),
-            Transport::WebSocket(ws) => ws.connect(dest).await.map(|stream| ConnectedStream {
-                stream,
-                info: ConnectInfo::none(),
-            }),
-            Transport::Grpc(grpc) => grpc.connect_with_info(dest, proto).await,
+            Transport::Raw(raw) => raw.connect(dest, proto).await,
+            Transport::WebSocket(ws) => ws.connect(dest).await,
+            Transport::Grpc(grpc) => grpc.connect(dest, proto).await,
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    #[test]
-    fn unix_socket_support_matches_cfg() {
-        assert_eq!(super::unix_socket_supported(), cfg!(unix));
     }
 }

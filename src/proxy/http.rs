@@ -1,5 +1,6 @@
 use super::*;
 use crate::common::parse;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_HEADERS: usize = 64;
@@ -100,7 +101,7 @@ impl Proxy {
         let buf = read_http_request_head(&mut stream).await?;
         log::debug!("[HTTP] Received {} bytes before header completion", buf.len());
 
-        let (method, path, _header_len) = parse_request_line(&buf)?;
+        let (method, path, header_len) = parse_request_line(&buf)?;
         log::debug!("[HTTP] Request: {} {}", method, path);
 
         // 认证检查
@@ -109,20 +110,26 @@ impl Proxy {
             check_proxy_auth(&buf, acc, &mut stream).await?;
         }
 
+        let remainder = if buf.len() > header_len {
+            Some(buf.slice(header_len..))
+        } else {
+            None
+        };
+
         if method.eq_ignore_ascii_case("CONNECT") {
             log::debug!("[HTTP] Handling CONNECT request to {}", path);
-            handle_connect(stream, peer_addr, path).await
+            handle_connect(stream, peer_addr, path, remainder).await
         } else {
             log::debug!("[HTTP] Handling plain HTTP request");
-            handle_plain_http(stream, peer_addr, &buf).await
+            handle_plain_http(stream, peer_addr, buf).await
         }
     }
 }
 
 // --- HTTP 请求解析 ---
 
-async fn read_http_request_head(stream: &mut transport::TrStream) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(BUFFER_SIZE.min(1024));
+async fn read_http_request_head(stream: &mut transport::TrStream) -> std::io::Result<Bytes> {
+    let mut buf = BytesMut::with_capacity(BUFFER_SIZE.min(1024));
     let mut chunk = [0u8; 1024];
 
     loop {
@@ -144,7 +151,7 @@ async fn read_http_request_head(stream: &mut transport::TrStream) -> std::io::Re
         buf.extend_from_slice(&chunk[..n]);
 
         if find_header_terminator(&buf).is_some() {
-            return Ok(buf);
+            return Ok(buf.freeze());
         }
 
         if buf.len() >= BUFFER_SIZE {
@@ -243,6 +250,7 @@ async fn handle_connect(
     mut stream: transport::TrStream,
     peer_addr: Address,
     path: String,
+    remainder: Option<Bytes>,
 ) -> std::io::Result<ProxyStream> {
     log::debug!("[HTTP] Parsing CONNECT destination: {}", path);
     let dest = parse::parse_host_port(&path)?;
@@ -252,17 +260,28 @@ async fn handle_connect(
     AsyncWriteExt::write_all(&mut stream, response).await?;
     log::debug!("[HTTP] Sent 200 Connection Established");
 
+    let stream = wrap_stream_with_prefix(stream, remainder);
     Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, stream))
+}
+
+fn wrap_stream_with_prefix(stream: transport::TrStream, prefix: Option<Bytes>) -> transport::TrStream {
+    match prefix {
+        Some(prefix) if !prefix.is_empty() => {
+            let buffered = transport::BufferedStream::new(stream, prefix);
+            transport::TrStream::Buffered(Box::new(buffered))
+        }
+        _ => stream,
+    }
 }
 
 /// 处理普通 HTTP 代理请求 (GET/POST 等)
 async fn handle_plain_http(
     stream: transport::TrStream,
     peer_addr: Address,
-    raw_request: &[u8],
+    raw_request: Bytes,
 ) -> std::io::Result<ProxyStream> {
     log::debug!("[HTTP] Extracting Host header");
-    let host = extract_header(raw_request, "Host").ok_or_else(|| {
+    let host = extract_header(&raw_request, "Host").ok_or_else(|| {
         log::error!("[HTTP] Missing Host header");
         std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing Host header")
     })?;
@@ -271,7 +290,94 @@ async fn handle_plain_http(
     let dest = parse::parse_host_with_default_port(&host, 80);
     log::debug!("[HTTP] Destination: {:?}", dest);
 
-    let buffered = transport::BufferedStream::new(stream, raw_request.to_vec());
-    let wrapped = transport::TrStream::Buffered(Box::new(buffered));
+    let wrapped = wrap_stream_with_prefix(stream, Some(raw_request));
     Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::Address;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn connect_preserves_preread_tls_bytes() {
+        let (mut client, server) = tcp_pair().await;
+
+        let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let tls_hello = b"\x16\x03\x01\x00fake-client-hello";
+
+        let writer = tokio::spawn(async move {
+            client.write_all(request).await.unwrap();
+            client.write_all(tls_hello).await.unwrap();
+        });
+
+        let proxy_stream = Proxy::handle_connection(
+            transport::TrStream::Tcp(server),
+            Address::Inet("127.0.0.1:12345".parse().unwrap()),
+            &None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        writer.await.unwrap();
+
+        match proxy_stream.metadata.dst {
+            Address::Domain(ref host, port) => {
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 443);
+            }
+            other => panic!("unexpected destination: {:?}", other),
+        }
+
+        let mut inner = proxy_stream.inner;
+        let mut buf = vec![0u8; tls_hello.len()];
+        inner.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, tls_hello);
+    }
+
+    #[tokio::test]
+    async fn plain_http_replays_original_request() {
+        let (mut client, server) = tcp_pair().await;
+
+        let request = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
+
+        let writer = tokio::spawn(async move {
+            client.write_all(request).await.unwrap();
+        });
+
+        let proxy_stream = Proxy::handle_connection(
+            transport::TrStream::Tcp(server),
+            Address::Inet("127.0.0.1:12345".parse().unwrap()),
+            &None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        writer.await.unwrap();
+
+        match proxy_stream.metadata.dst {
+            Address::Domain(ref host, port) => {
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 80);
+            }
+            other => panic!("unexpected destination: {:?}", other),
+        }
+
+        let mut inner = proxy_stream.inner;
+        let mut buf = vec![0u8; request.len()];
+        inner.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, request);
+    }
 }

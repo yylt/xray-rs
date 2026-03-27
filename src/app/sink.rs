@@ -2,7 +2,7 @@ use crate::{
     common::{forward::StreamForwarder, Address, Protocol},
     proxy::{Outbounder, ProxyStream},
     route::DnsResolver,
-    transport::{self, ConnectedStream},
+    transport::{self, TrStream},
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -121,7 +121,7 @@ pub struct ProxySink {
 
 impl ProxySink {
     async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
-        let ConnectedStream { stream: remote, .. } = self
+        let remote = self
             .try_connect(&stream.metadata.dst, stream.metadata.protocol.clone())
             .await?;
         forwarder.forward(stream.inner, remote).await?;
@@ -130,11 +130,7 @@ impl ProxySink {
 
     /// 尝试建立到目标地址的代理连接（不消费 inbound stream）
     /// 用于支持 fallback 重试：只有连接成功后才消费 stream
-    pub async fn try_connect(
-        &self,
-        dst: &Address,
-        protocol: crate::common::Protocol,
-    ) -> std::io::Result<ConnectedStream> {
+    pub async fn try_connect(&self, dst: &Address, protocol: crate::common::Protocol) -> std::io::Result<TrStream> {
         self.outbounder.connect(dst, protocol).await
     }
 }
