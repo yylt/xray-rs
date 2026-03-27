@@ -1,8 +1,10 @@
 use super::*;
 use crate::common::parse;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_HEADERS: usize = 64;
 const BUFFER_SIZE: usize = 8192;
+const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct InSetting {
@@ -52,9 +54,24 @@ impl Proxy {
                     while let Some(result) = tokio_stream::StreamExt::next(&mut transport_stream).await {
                         match result {
                             Ok((stream, peer_addr)) => {
-                                match Self::handle_connection(stream, peer_addr, &account, allow_transparent).await {
+                                match Self::handle_connection(stream, peer_addr.clone(), &account, allow_transparent).await {
                                     Ok(ps) => yield Ok(ps),
-                                    Err(e) => yield Err(e),
+                                    Err(e) => {
+                                        match e.kind() {
+                                            std::io::ErrorKind::UnexpectedEof => {
+                                                log::debug!("[HTTP] peer {:?} closed connection before sending a complete request: {}", peer_addr, e);
+                                            }
+                                            std::io::ErrorKind::InvalidData => {
+                                                log::debug!("[HTTP] invalid request from {:?}: {}", peer_addr, e);
+                                            }
+                                            std::io::ErrorKind::PermissionDenied => {
+                                                log::debug!("[HTTP] authentication failed from {:?}: {}", peer_addr, e);
+                                            }
+                                            _ => {
+                                                log::warn!("[HTTP] connection handling error from {:?}: {}", peer_addr, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => yield Err(e),
@@ -80,25 +97,16 @@ impl Proxy {
     ) -> std::io::Result<ProxyStream> {
         log::debug!("[HTTP] New connection from {:?}", peer_addr);
 
-        let mut buf = vec![0u8; BUFFER_SIZE];
-        let n = AsyncReadExt::read(&mut stream, &mut buf).await?;
-        if n == 0 {
-            log::error!("[HTTP] Connection closed before receiving request");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Connection closed before receiving request",
-            ));
-        }
+        let buf = read_http_request_head(&mut stream).await?;
+        log::debug!("[HTTP] Received {} bytes before header completion", buf.len());
 
-        log::debug!("[HTTP] Received {} bytes", n);
-
-        let (method, path, _header_len) = parse_request_line(&buf[..n])?;
+        let (method, path, _header_len) = parse_request_line(&buf)?;
         log::debug!("[HTTP] Request: {} {}", method, path);
 
         // 认证检查
         if let Some(acc) = account {
             log::debug!("[HTTP] Checking proxy authentication");
-            check_proxy_auth(&buf[..n], acc, &mut stream).await?;
+            check_proxy_auth(&buf, acc, &mut stream).await?;
         }
 
         if method.eq_ignore_ascii_case("CONNECT") {
@@ -106,12 +114,53 @@ impl Proxy {
             handle_connect(stream, peer_addr, path).await
         } else {
             log::debug!("[HTTP] Handling plain HTTP request");
-            handle_plain_http(stream, peer_addr, &buf[..n]).await
+            handle_plain_http(stream, peer_addr, &buf).await
         }
     }
 }
 
 // --- HTTP 请求解析 ---
+
+async fn read_http_request_head(stream: &mut transport::TrStream) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(BUFFER_SIZE.min(1024));
+    let mut chunk = [0u8; 1024];
+
+    loop {
+        let n = AsyncReadExt::read(stream, &mut chunk).await?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Connection closed before receiving request",
+                ));
+            }
+
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Connection closed before receiving complete HTTP headers",
+            ));
+        }
+
+        buf.extend_from_slice(&chunk[..n]);
+
+        if find_header_terminator(&buf).is_some() {
+            return Ok(buf);
+        }
+
+        if buf.len() >= BUFFER_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HTTP request headers too large (>{} bytes)", BUFFER_SIZE),
+            ));
+        }
+    }
+}
+
+fn find_header_terminator(data: &[u8]) -> Option<usize> {
+    data.windows(HEADER_TERMINATOR.len())
+        .position(|window| window == HEADER_TERMINATOR)
+        .map(|pos| pos + HEADER_TERMINATOR.len())
+}
 
 /// 解析请求行，返回 (method, path, header_len)
 fn parse_request_line(data: &[u8]) -> std::io::Result<(String, String, usize)> {
@@ -131,8 +180,8 @@ fn parse_request_line(data: &[u8]) -> std::io::Result<(String, String, usize)> {
             Ok((method, path, header_len))
         }
         Ok(httparse::Status::Partial) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "HTTP request headers too large (>8KB)",
+            std::io::ErrorKind::UnexpectedEof,
+            "Incomplete HTTP request headers",
         )),
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -142,7 +191,7 @@ fn parse_request_line(data: &[u8]) -> std::io::Result<(String, String, usize)> {
 }
 
 /// 从 HTTP 请求头中提取指定 header 的值
-fn extract_header<'a>(data: &'a [u8], name: &str) -> Option<String> {
+fn extract_header(data: &[u8], name: &str) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut headers);
     if req.parse(data).is_ok() {

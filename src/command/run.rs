@@ -65,7 +65,6 @@ async fn run_proxy(config: Config) -> io::Result<()> {
         Some(dns_settings) => (dns_settings, true),
         None => (DnsSettings::default(), false),
     };
-    let dns_groups = dns_settings.groups.clone();
     let dns = {
         if has_dns_config {
             log::info!("Initializing DNS resolver with config");
@@ -119,7 +118,7 @@ async fn run_proxy(config: Config) -> io::Result<()> {
     // 3. Build router
     let router = Arc::new(match routing {
         Some(rs) => {
-            let mut router = rs.build_router(dns.clone(), &dns_groups)?;
+            let mut router = rs.build_router(dns.clone())?;
             if let Some(tag) = first_tag {
                 router.set_default(tag);
             }
@@ -158,7 +157,7 @@ async fn run_proxy(config: Config) -> io::Result<()> {
                     let mut stream = source.run_listen().await.unwrap();
                     while let Some(result) = stream.next().await {
                         match result {
-                            Err(e) => log::error!("accept error: {}", e),
+                            Err(e) => log::error!("listener error: {}", e),
                             Ok(proxy_stream) => {
                                 let sinks = sinks.clone();
                                 let router = router.clone();
@@ -187,8 +186,9 @@ async fn run_proxy(config: Config) -> io::Result<()> {
                                                             .await
                                                         {
                                                             Ok(connected) => {
-                                                                let _ =
-                                                                    forwarder.forward(proxy_stream.inner, connected.stream).await;
+                                                                let _ = forwarder
+                                                                    .forward(proxy_stream.inner, connected.stream)
+                                                                    .await;
                                                                 return;
                                                             }
                                                             Err(_e) => {

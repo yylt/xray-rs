@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::common::Address;
 use crate::proxy::ProxyStream;
 use crate::route::{
-    trie::{DomainTrie, IpTrie},
+    trie::{DomainMarisa, IpTrie},
     DnsResolver, Strategy,
 };
 
@@ -35,7 +35,7 @@ impl RoutingResult {
 #[derive(Debug)]
 pub struct Router {
     domain_strategy: Strategy,
-    domain_trie: DomainTrie,
+    domain_trie: DomainMarisa,
     ip_trie: IpTrie,
     inbound_rules: HashMap<String, String, RandomState>,
     default_tag: Option<String>,
@@ -49,10 +49,10 @@ impl Router {
     }
 
     pub fn new_with_strategy(strategy: Strategy) -> Self {
-        Self::new_with_tries(strategy, DomainTrie::new(), IpTrie::new())
+        Self::new_with_tries(strategy, DomainMarisa::new(), IpTrie::new())
     }
 
-    pub fn new_with_tries(strategy: Strategy, domain_trie: DomainTrie, ip_trie: IpTrie) -> Self {
+    pub fn new_with_tries(strategy: Strategy, domain_trie: DomainMarisa, ip_trie: IpTrie) -> Self {
         Self {
             domain_strategy: strategy,
             domain_trie,
@@ -86,8 +86,22 @@ impl Router {
     ///
     /// 优先级：inbound_tag > domain_strategy rules > default
     pub async fn route(&self, stream: &ProxyStream) -> Option<RoutingResult> {
+        log::debug!(
+            target: "route::router",
+            "route start: strategy={:?}, inbound_tag={:?}, dst={:?}",
+            self.domain_strategy,
+            stream.metadata.inbound_tag,
+            stream.metadata.dst,
+        );
+
         if !stream.metadata.inbound_tag.is_empty() {
             if let Some(tag) = self.inbound_rules.get(&stream.metadata.inbound_tag) {
+                log::debug!(
+                    target: "route::router",
+                    "route matched inbound rule: inbound_tag={:?}, outbound_tag={:?}",
+                    stream.metadata.inbound_tag,
+                    tag,
+                );
                 return Some(self.resolve_tag(tag));
             }
         }
@@ -96,11 +110,28 @@ impl Router {
             Strategy::AsIs => {
                 if let Address::Domain(domain, _) = &stream.metadata.dst {
                     if let Some(tag) = self.domain_trie.lookup(domain) {
+                        log::debug!(
+                            target: "route::router",
+                            "route AsIs: domain trie matched domain={:?}, tag={:?}",
+                            domain,
+                            tag,
+                        );
                         return Some(self.resolve_tag(tag));
                     }
+                    log::debug!(
+                        target: "route::router",
+                        "route AsIs: domain trie no match for domain={:?}",
+                        domain,
+                    );
                 }
                 if let Address::Inet(s) = &stream.metadata.dst {
                     if let Some(tag) = self.ip_trie.lookup(s.ip()) {
+                        log::debug!(
+                            target: "route::router",
+                            "route AsIs: ip trie matched ip={:?}, tag={:?}",
+                            s.ip(),
+                            tag,
+                        );
                         return Some(self.resolve_tag(tag));
                     }
                 }
@@ -108,12 +139,29 @@ impl Router {
             Strategy::IPIfNonMatch => {
                 if let Address::Domain(domain, _) = &stream.metadata.dst {
                     if let Some(tag) = self.domain_trie.lookup(domain) {
+                        log::debug!(
+                            target: "route::router",
+                            "route IPIfNonMatch: domain trie matched domain={:?}, tag={:?}",
+                            domain,
+                            tag,
+                        );
                         return Some(self.resolve_tag(tag));
                     }
+                    log::debug!(
+                        target: "route::router",
+                        "route IPIfNonMatch: domain trie no match for domain={:?}",
+                        domain,
+                    );
                     if let Some(dns) = &self.dns {
                         if let Ok(ips) = dns.resolve(domain).await {
                             if let Some(ip) = ips.first() {
                                 if let Some(tag) = self.ip_trie.lookup(*ip) {
+                                    log::debug!(
+                                        target: "route::router",
+                                        "route IPIfNonMatch: ip trie matched resolved ip={:?}, tag={:?}",
+                                        ip,
+                                        tag,
+                                    );
                                     return Some(self.resolve_tag(tag));
                                 }
                             }
@@ -122,6 +170,12 @@ impl Router {
                 }
                 if let Address::Inet(s) = &stream.metadata.dst {
                     if let Some(tag) = self.ip_trie.lookup(s.ip()) {
+                        log::debug!(
+                            target: "route::router",
+                            "route IPIfNonMatch: ip trie matched ip={:?}, tag={:?}",
+                            s.ip(),
+                            tag,
+                        );
                         return Some(self.resolve_tag(tag));
                     }
                 }
@@ -141,12 +195,24 @@ impl Router {
 
                 if let Address::Domain(domain, _) = &stream.metadata.dst {
                     if let Some(tag) = self.domain_trie.lookup(domain) {
+                        log::debug!(
+                            target: "route::router",
+                            "route IPOnDemand: domain trie matched domain={:?}, tag={:?}",
+                            domain,
+                            tag,
+                        );
                         return Some(self.resolve_tag(tag));
                     }
                 }
 
                 if let Some(ip) = ip_opt {
                     if let Some(tag) = self.ip_trie.lookup(ip) {
+                        log::debug!(
+                            target: "route::router",
+                            "route IPOnDemand: ip trie matched ip={:?}, tag={:?}",
+                            ip,
+                            tag,
+                        );
                         return Some(self.resolve_tag(tag));
                     }
                 }
@@ -154,8 +220,14 @@ impl Router {
         }
 
         if let Some(tag) = self.default_tag.as_ref() {
+            log::debug!(
+                target: "route::router",
+                "route fallback to default tag={:?}",
+                tag,
+            );
             return Some(RoutingResult::new(tag));
         }
+        log::debug!(target: "route::router", "route no match and no default");
         None
     }
 
@@ -171,12 +243,12 @@ impl Router {
 mod tests {
     use super::*;
     use crate::route::{
-        trie::{DomainTrieBuilder, IpTrieBuilder},
+        trie::{DomainMarisaBuilder, IpTrieBuilder},
         DnsSettings,
     };
 
     fn build_router(strategy: Strategy, domains: &[(&str, &str)], ips: &[(&str, &str)]) -> Router {
-        let mut domain_builder = DomainTrieBuilder::new();
+        let mut domain_builder = DomainMarisaBuilder::new();
         for (domain, tag) in domains {
             domain_builder.insert(domain, tag);
         }

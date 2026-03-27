@@ -10,9 +10,9 @@ pub use router::Router;
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io, net::IpAddr, sync::Arc, time::Duration};
+use std::{io, net::IpAddr, sync::Arc, time::Duration};
 
-use self::trie::{DomainTrieBuilder, IpTrieBuilder};
+use self::trie::{DomainMarisaBuilder, IpTrieBuilder};
 
 const DEFAULT_FORWARD_IDLE_TIMEOUT_SECS: u64 = 3600;
 
@@ -32,17 +32,23 @@ pub struct RoutingSettings {
 }
 
 impl RoutingSettings {
-    pub fn build_router(&self, dns: Arc<DnsResolver>, dns_groups: &[DnsGroup]) -> io::Result<Router> {
-        let dns_groups_by_name: HashMap<&str, &DnsGroup> =
-            dns_groups.iter().map(|group| (group.name.as_str(), group)).collect();
-
-        let mut domain_builder = DomainTrieBuilder::new();
+    pub fn build_router(&self, dns: Arc<DnsResolver>) -> io::Result<Router> {
+        let mut domain_builder = DomainMarisaBuilder::new();
         let mut ip_builder = IpTrieBuilder::new();
 
         if let Some(rules) = &self.rules {
             for rule in rules {
                 let target_tag = &rule.outbound_tag;
                 let has_conditions = rule.domain.is_some() || rule.ips.is_some() || rule.inbound_tag.is_some();
+
+                log::debug!(
+                    target: "route::config",
+                    "processing routing rule: domains={:?}, ips={:?}, inbound_tag={:?}, outbound_tag={:?}",
+                    rule.domain,
+                    rule.ips,
+                    rule.inbound_tag,
+                    rule.outbound_tag,
+                );
 
                 if !has_conditions {
                     log::warn!(
@@ -54,7 +60,7 @@ impl RoutingSettings {
 
                 if let Some(domains) = &rule.domain {
                     for domain in domains {
-                        add_domain_rule(&mut domain_builder, &dns_groups_by_name, domain, target_tag)?;
+                        add_domain_rule(&mut domain_builder, domain, target_tag)?;
                     }
                 }
 
@@ -90,20 +96,10 @@ impl RoutingSettings {
     }
 }
 
-fn add_domain_rule(
-    builder: &mut DomainTrieBuilder,
-    dns_groups_by_name: &HashMap<&str, &DnsGroup>,
-    domain: &str,
-    outbound_tag: &str,
-) -> io::Result<()> {
+fn add_domain_rule(builder: &mut DomainMarisaBuilder, domain: &str, outbound_tag: &str) -> io::Result<()> {
     let domain = domain.trim();
 
-    if let Some(group_name) = domain.strip_prefix("dns:") {
-        let group = dns_groups_by_name.get(group_name).copied().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("dns group '{}' not found", group_name))
-        })?;
-        add_dns_group_rule(builder, group, outbound_tag)?;
-    } else if let Some(file_path) = domain.strip_prefix("file:") {
+    if let Some(file_path) = domain.strip_prefix("file:") {
         add_domain_rules_from_file(builder, file_path, outbound_tag)?;
     } else {
         add_domain_rule_entry(builder, domain, outbound_tag);
@@ -112,7 +108,7 @@ fn add_domain_rule(
     Ok(())
 }
 
-fn add_domain_rule_entry(builder: &mut DomainTrieBuilder, domain: &str, outbound_tag: &str) {
+fn add_domain_rule_entry(builder: &mut DomainMarisaBuilder, domain: &str, outbound_tag: &str) {
     let domain = domain.trim();
     builder.insert(domain, outbound_tag);
 }
@@ -152,25 +148,13 @@ fn add_ip_rules_from_file(builder: &mut IpTrieBuilder, file_path: &str, outbound
     Ok(())
 }
 
-fn add_domain_rules_from_file(builder: &mut DomainTrieBuilder, file_path: &str, outbound_tag: &str) -> io::Result<()> {
+fn add_domain_rules_from_file(
+    builder: &mut DomainMarisaBuilder,
+    file_path: &str,
+    outbound_tag: &str,
+) -> io::Result<()> {
     for line in read_rule_lines(file_path)? {
         add_domain_rule_entry(builder, &line, outbound_tag);
-    }
-
-    Ok(())
-}
-
-fn add_dns_group_rule(builder: &mut DomainTrieBuilder, group: &DnsGroup, outbound_tag: &str) -> io::Result<()> {
-    for file_path in &group.files {
-        add_domain_rules_from_file(builder, file_path, outbound_tag)?;
-    }
-
-    for domain in &group.inline {
-        let domain = domain.trim();
-        if domain.is_empty() {
-            continue;
-        }
-        add_domain_rule_entry(builder, domain, outbound_tag);
     }
 
     Ok(())

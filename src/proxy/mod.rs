@@ -14,7 +14,7 @@ use log::error;
 use serde::{de::Error as DeError, Deserialize, Serialize};
 
 use std::io::Result;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncWriteExt};
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "protocol", content = "settings")]

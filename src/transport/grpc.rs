@@ -19,7 +19,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -31,9 +31,14 @@ use tower::ServiceExt;
 
 use log::{debug, error, warn};
 
-static BUF_BYTE_SIZE: usize = 16 * 1024;
+const DEFAULT_CLIENT_BUFFER_SIZE: usize = 1024;
+const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 8192;
+const DEFAULT_CONCURRENT_LIMIT: usize = 256;
+const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 10;
+const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = true;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrpcSettings {
     #[serde(rename = "serviceName")]
     service_name: String,
@@ -44,20 +49,32 @@ pub struct GrpcSettings {
     #[serde(rename = "authority")]
     authority: Option<String>,
 
-    #[serde(rename = "maxConcurrentStreams")]
-    max_concurrent_streams: Option<u32>,
-
-    #[serde(rename = "initialWindowSize")]
-    initial_window_size: Option<u32>,
+    #[serde(rename = "concurrentLimit")]
+    concurrent_limit: Option<usize>,
 
     #[serde(rename = "userAgent")]
     user_agent: Option<String>,
 
-    #[serde(rename = "sendCompression")]
-    send_compression: Option<String>,
-
     #[serde(rename = "bufByteSize")]
     buf_byte_size: Option<usize>,
+
+    #[serde(
+        rename = "http2KeepAliveInterval",
+        default,
+        deserialize_with = "deserialize_option_duration_secs"
+    )]
+    http2_keep_alive_interval: Option<std::time::Duration>,
+
+    #[serde(rename = "http2KeepAliveWhileIdle")]
+    http2_keep_alive_while_idle: Option<bool>,
+}
+
+fn deserialize_option_duration_secs<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let secs = Option::<u64>::deserialize(deserializer)?;
+    Ok(secs.map(Duration::from_secs))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -234,13 +251,15 @@ impl Grpc {
         let mut ep = endpoint.map_err(|err| Error::new(ErrorKind::InvalidInput, err.to_string()))?;
         if let Some(user_agent) = &self.route_config.user_agent {
             ep = ep
-                .user_agent(user_agent.clone())
+                .user_agent(user_agent)
                 .map_err(|err| Error::new(ErrorKind::InvalidInput, err.to_string()))?;
         }
-        if let Some(initial_window_size) = self.route_config.initial_window_size {
-            ep = ep.initial_stream_window_size(initial_window_size);
-            ep = ep.initial_connection_window_size(initial_window_size);
-        }
+        ep = ep
+            .concurrency_limit(self.route_config.concurrent_limit)
+            .buffer_size(self.route_config.buf_byte_size)
+            .http2_keep_alive_interval(self.route_config.http2_keep_alive_interval)
+            .keep_alive_while_idle(self.route_config.http2_keep_alive_while_idle)
+            .http2_adaptive_window(true);
 
         let connector_target = target.clone();
         let sockopt = self.sockopt.clone();
@@ -344,7 +363,7 @@ impl Grpc {
                 }
             }
             Err(err) => {
-                error!("gRPC streaming call failed code: {:?}): {}", err.code(), err.message());
+                error!("gRPC streaming call failed code: {:?}, msg: {}", err.code(), err.message());
             }
         }
     }
@@ -368,8 +387,7 @@ impl Grpc {
                 while let Ok(message) = stream.message().await {
                     match message {
                         Some(hunk) => {
-                            if let Err(e) = read_tx.send(Bytes::from(hunk.data)).await {
-                                error!("Failed to send data: {}", e);
+                            if let Err(_e) = read_tx.send(Bytes::from(hunk.data)).await {
                                 return;
                             }
                         }
@@ -381,7 +399,7 @@ impl Grpc {
                 }
             }
             Err(err) => {
-                error!("gRPC streaming call failed code: {:?}): {}", err.code(), err.message());
+                error!("gRPC streaming call failed code: {:?}, msg: {}", err.code(), err.message());
             }
         }
     }
@@ -393,9 +411,6 @@ impl Grpc {
     ) -> IoResult<GrpcStream> {
         let path = self.route_config.path();
         let mut grpc_client = tonic::client::Grpc::new(channel);
-        if let Some(send_compression) = self.route_config.send_compression {
-            grpc_client = grpc_client.send_compressed(send_compression);
-        }
 
         debug!(
             "[gRPC][client] preparing stream target={:?} path={} mode={}",
@@ -412,8 +427,7 @@ impl Grpc {
             .await
             .map_err(|err| Error::new(ErrorKind::ConnectionAborted, err.to_string()))?;
 
-        let buf_byte_size = self.route_config.buf_byte_size;
-        let (grpc_stream, (read_tx, write_rx)) = make_service(buf_byte_size);
+        let (grpc_stream, (read_tx, write_rx)) = make_service(DEFAULT_CHANNEL_BUFFER_SIZE);
         let is_multi = self.route_config.multi_mode;
 
         tokio::spawn(async move {
@@ -508,9 +522,7 @@ impl Grpc {
                                 let tls_server = tls_server.clone();
                                 let route_config = context.route_config.clone();
                                 let stream_tx = stream_tx.clone();
-                                let buf_byte_size = context.buf_byte_size;
-                                let initial_window_size = context.initial_window_size;
-                                let max_concurrent_streams = context.max_concurrent_streams;
+                                let buf_byte_size = context.server_buf_byte_size;
 
                                 tokio::spawn(async move {
                                     let peer_addr = Address::Inet(peer_addr);
@@ -520,8 +532,6 @@ impl Grpc {
                                         route_config,
                                         stream_tx,
                                         buf_byte_size,
-                                        initial_window_size,
-                                        max_concurrent_streams,
                                         tls_server,
                                     )
                                     .await {
@@ -584,9 +594,7 @@ impl Grpc {
 
                                 let route_config = context.route_config.clone();
                                 let stream_tx = stream_tx.clone();
-                                let buf_byte_size = context.buf_byte_size;
-                                let initial_window_size = context.initial_window_size;
-                                let max_concurrent_streams = context.max_concurrent_streams;
+                                let buf_byte_size = context.server_buf_byte_size;
                                 let unix_listener_path = listener_path.clone();
                                 let peer_addr = Address::Unix(unix_listener_path.clone());
 
@@ -597,8 +605,6 @@ impl Grpc {
                                         route_config,
                                         stream_tx,
                                         buf_byte_size,
-                                        initial_window_size,
-                                        max_concurrent_streams,
                                         None,
                                     )
                                     .await {
@@ -625,18 +631,14 @@ impl Grpc {
     fn listen_context(&self) -> ListenContext {
         ListenContext {
             route_config: Arc::new(self.route_config.clone()),
-            buf_byte_size: self.route_config.buf_byte_size,
-            initial_window_size: self.route_config.initial_window_size,
-            max_concurrent_streams: self.route_config.max_concurrent_streams,
+            server_buf_byte_size: DEFAULT_CHANNEL_BUFFER_SIZE,
         }
     }
 }
 
 struct ListenContext {
     route_config: Arc<RouteConfig>,
-    buf_byte_size: usize,
-    initial_window_size: Option<u32>,
-    max_concurrent_streams: Option<u32>,
+    server_buf_byte_size: usize,
 }
 
 struct TunGrpcService<M> {
@@ -689,7 +691,7 @@ where
     M: TunMessage,
 {
     async fn start_stream(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>), tonic::Status> {
-        let (grpc_stream, (read_tx, write_rx)) = make_service(self.buf_byte_size);
+        let (grpc_stream, (read_tx, write_rx)) = make_service(DEFAULT_CHANNEL_BUFFER_SIZE);
         debug!("[gRPC][server] handoff stream peer={:?}", self.peer_addr);
         self.stream_tx
             .send((grpc_stream, self.peer_addr.clone()))
@@ -769,8 +771,6 @@ async fn handle_connection<IO>(
     route_config: Arc<RouteConfig>,
     stream_tx: mpsc::Sender<(GrpcStream, Address)>,
     buf_byte_size: usize,
-    initial_window_size: Option<u32>,
-    max_concurrent_streams: Option<u32>,
     tls_server: Option<crate::transport::tls::server::Tls>,
 ) -> IoResult<()>
 where
@@ -838,14 +838,7 @@ where
             Ok(tls_stream) => {
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
 
-                let mut builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
-                if let Some(initial_window_size) = initial_window_size {
-                    builder.initial_stream_window_size(initial_window_size);
-                    builder.initial_connection_window_size(initial_window_size);
-                }
-                if let Some(max_concurrent_streams) = max_concurrent_streams {
-                    builder.max_concurrent_streams(max_concurrent_streams);
-                }
+                let builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
                 let conn = builder.serve_connection(io, service);
 
                 if let Err(e) = conn.await {
@@ -861,14 +854,7 @@ where
     } else {
         let io = hyper_util::rt::TokioIo::new(stream);
 
-        let mut builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
-        if let Some(initial_window_size) = initial_window_size {
-            builder.initial_stream_window_size(initial_window_size);
-            builder.initial_connection_window_size(initial_window_size);
-        }
-        if let Some(max_concurrent_streams) = max_concurrent_streams {
-            builder.max_concurrent_streams(max_concurrent_streams);
-        }
+        let builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
         let conn = builder.serve_connection(io, service);
 
         if let Err(e) = conn.await {
@@ -904,11 +890,11 @@ struct RouteConfig {
     authority: Option<String>,
     path: http::uri::PathAndQuery,
     multi_mode: bool,
-    max_concurrent_streams: Option<u32>,
-    initial_window_size: Option<u32>,
+    concurrent_limit: usize,
     user_agent: Option<String>,
-    send_compression: Option<tonic::codec::CompressionEncoding>,
     buf_byte_size: usize,
+    http2_keep_alive_interval: Duration,
+    http2_keep_alive_while_idle: bool,
     tun_path: http::uri::PathAndQuery,
     multi_tun_path: http::uri::PathAndQuery,
 }
@@ -976,20 +962,20 @@ impl From<&GrpcSettings> for RouteConfig {
         } else {
             tun_path.clone()
         };
-        let send_compression = match settings.send_compression.as_deref() {
-            Some(value) if value.eq_ignore_ascii_case("gzip") => Some(tonic::codec::CompressionEncoding::Gzip),
-            _ => None,
-        };
 
         RouteConfig {
             authority: settings.authority.clone(),
             path,
             multi_mode,
-            max_concurrent_streams: settings.max_concurrent_streams,
-            initial_window_size: settings.initial_window_size,
+            concurrent_limit: settings.concurrent_limit.unwrap_or(DEFAULT_CONCURRENT_LIMIT),
             user_agent: settings.user_agent.clone(),
-            send_compression,
-            buf_byte_size: settings.buf_byte_size.unwrap_or(BUF_BYTE_SIZE),
+            buf_byte_size: settings.buf_byte_size.unwrap_or(DEFAULT_CLIENT_BUFFER_SIZE),
+            http2_keep_alive_interval: settings
+                .http2_keep_alive_interval
+                .unwrap_or(Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS)),
+            http2_keep_alive_while_idle: settings
+                .http2_keep_alive_while_idle
+                .unwrap_or(DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE),
             tun_path,
             multi_tun_path,
         }
@@ -1052,36 +1038,65 @@ impl AsyncWrite for GrpcStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{rotate_candidates, ConnectionTarget, GrpcSettings};
+    use super::{rotate_candidates, ConnectionTarget, GrpcSettings, RouteConfig};
+    use std::time::Duration;
 
     #[test]
-    fn deserialize_grpc_settings_max_concurrent_streams() {
+    fn deserialize_grpc_settings_concurrent_limit() {
         let settings: GrpcSettings = serde_json::from_str(
             r#"{
                 "serviceName": "grpc",
                 "multiMode": false,
-                "maxConcurrentStreams": 32
+                "concurrentLimit": 32,
+                "bufByteSize": 4096,
+                "http2KeepAliveInterval": 15,
+                "http2KeepAliveWhileIdle": false
             }"#,
         )
         .unwrap();
 
         let debug = format!("{settings:?}");
-        assert!(debug.contains("max_concurrent_streams: Some(32)"), "{debug}");
+        assert!(debug.contains("concurrent_limit: Some(32)"), "{debug}");
+        assert!(debug.contains("buf_byte_size: Some(4096)"), "{debug}");
+        assert!(debug.contains("http2_keep_alive_interval: Some(15s)"), "{debug}");
+        assert!(debug.contains("http2_keep_alive_while_idle: Some(false)"), "{debug}");
     }
 
     #[test]
-    fn deserialize_grpc_settings_initial_window_size() {
+    fn route_config_defaults_for_client_tuning() {
         let settings: GrpcSettings = serde_json::from_str(
             r#"{
-                "serviceName": "grpc",
-                "multiMode": false,
-                "initialWindowSize": 1048576
+                "serviceName": "grpc"
             }"#,
         )
         .unwrap();
 
-        let debug = format!("{settings:?}");
-        assert!(debug.contains("initial_window_size: Some(1048576)"), "{debug}");
+        let route = RouteConfig::from(&settings);
+        assert_eq!(route.concurrent_limit, 100);
+        assert_eq!(route.buf_byte_size, 8192);
+        assert_eq!(route.http2_keep_alive_interval, Duration::from_secs(10));
+        assert!(route.http2_keep_alive_while_idle);
+    }
+
+    #[test]
+    fn deserialize_grpc_settings_rejects_legacy_keys() {
+        let err = serde_json::from_str::<GrpcSettings>(
+            r#"{
+                "serviceName": "grpc",
+                "maxConcurrentStreams": 32,
+                "initialWindowSize": 1048576,
+                "sendCompression": "gzip"
+            }"#,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maxConcurrentStreams")
+                || msg.contains("initialWindowSize")
+                || msg.contains("sendCompression"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -1097,21 +1112,6 @@ mod tests {
 
         let debug = format!("{settings:?}");
         assert!(debug.contains("user_agent: Some(\"rsray-test-agent\")"), "{debug}");
-    }
-
-    #[test]
-    fn deserialize_grpc_settings_send_compression() {
-        let settings: GrpcSettings = serde_json::from_str(
-            r#"{
-                "serviceName": "grpc",
-                "multiMode": false,
-                "sendCompression": "gzip"
-            }"#,
-        )
-        .unwrap();
-
-        let debug = format!("{settings:?}");
-        assert!(debug.contains("send_compression: Some("), "{debug}");
     }
 
     #[test]

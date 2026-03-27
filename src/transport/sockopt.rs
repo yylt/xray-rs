@@ -22,8 +22,8 @@ pub struct SocketOpt {
 impl Default for SocketOpt {
     fn default() -> Self {
         SocketOpt {
-            recv_buffer_size: Some(524288), // 512KB
-            send_buffer_size: Some(524288), // 512KB
+            recv_buffer_size: Some(131072), // 128KB
+            send_buffer_size: Some(131072), 
             tcp_nodelay: Some(true),
             tcp_congestion: None,
         }
