@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::*;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
 use std::{
     io::{self, Result},
@@ -19,7 +19,6 @@ mod sockopt;
 
 pub mod balancer;
 pub mod grpc;
-pub mod pool;
 pub mod raw;
 pub mod tls;
 pub mod websocket;
@@ -248,15 +247,15 @@ where
 // Buffered stream wrapper for HTTP proxy
 pub struct BufferedStream {
     inner: Box<TrStream>,
-    buffer: Option<Vec<u8>>,
+    buffer: Option<Bytes>,
     buffer_pos: usize,
 }
 
 impl BufferedStream {
-    pub fn new(inner: TrStream, buffer: Vec<u8>) -> Self {
+    pub fn new(inner: TrStream, buffer: impl Into<Bytes>) -> Self {
         Self {
             inner: Box::new(inner),
-            buffer: Some(buffer),
+            buffer: Some(buffer.into()),
             buffer_pos: 0,
         }
     }
