@@ -98,7 +98,13 @@ impl Default for InSetting {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OutSetting {
-    pub servers: Vec<ServerConfig>,
+    #[serde(rename = "address")]
+    pub address: String,
+
+    #[serde(rename = "port")]
+    pub port: u16,
+
+    #[serde(rename = "account")]
     pub account: Option<common::Account>,
 }
 
@@ -381,10 +387,10 @@ impl Proxy {
     }
 
     pub fn new_outbound(set: &OutSetting, tr: transport::Transport) -> Result<Self> {
-        let server = set
-            .servers
-            .first()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "No servers configured"))?;
+        let server = ServerConfig {
+            address: set.address.clone(),
+            port: set.port,
+        };
 
         Ok(Self {
             tr,

@@ -4,16 +4,16 @@
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Hunk {
     /// data contains the raw bytes being tunneled.
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data: bytes::Bytes,
 }
 /// MultiHunk represents multiple data chunks in a multiplexed tunnel stream.
 /// Allows batching multiple logical streams' data in a single message.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MultiHunk {
     /// data contains multiple byte arrays, each representing a separate logical stream's chunk.
-    #[prost(bytes = "vec", repeated, tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", repeated, tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<bytes::Bytes>,
 }
 /// Ping message sent by client to server for keepalive heartbeat.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

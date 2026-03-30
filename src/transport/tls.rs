@@ -121,7 +121,6 @@ fn create_server_config(settings: &TlsSettings) -> Result<ServerConfig> {
         alpn_protocols.iter().map(|p| p.as_bytes().to_vec()).collect()
     } else {
         vec![
-            b"h3".to_vec(),       // HTTP/3
             b"h2".to_vec(),       // HTTP/2
             b"http/1.1".to_vec(), // HTTP/1.1
         ]

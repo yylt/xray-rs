@@ -23,7 +23,7 @@ impl Default for SocketOpt {
     fn default() -> Self {
         SocketOpt {
             recv_buffer_size: Some(131072), // 128KB
-            send_buffer_size: Some(131072), 
+            send_buffer_size: Some(131072),
             tcp_nodelay: Some(true),
             tcp_congestion: None,
         }

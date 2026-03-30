@@ -68,6 +68,7 @@ impl OutboundSettings {
                     self.stream_settings
                         .as_ref()
                         .unwrap_or(&transport::StreamSettings::default()),
+                    None,
                     dns.clone(),
                 )?;
                 ConnectionSink::Direct(DirectSink { dns, transport: tr })

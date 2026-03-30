@@ -14,8 +14,8 @@ pub struct InSetting {
     id: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ServerConfig {
+#[derive(Serialize, Deserialize, Debug)]
+pub struct OutSetting {
     #[serde(rename = "address")]
     pub address: String,
 
@@ -26,26 +26,21 @@ pub struct ServerConfig {
     pub id: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct OutSetting {
-    #[serde(rename = "servers")]
-    servers: Vec<ServerConfig>,
-}
-
 pub struct Proxy {
-    user_id: Option<[u8; 16]>,
-    servers: Vec<ServerConfig>,
+    user_id: [u8; 16],
+    server: Address,
     tr: transport::Transport,
-    server_index: std::sync::atomic::AtomicUsize,
 }
 
 impl Proxy {
     pub fn new_inbound(sets: &InSetting, tr: transport::Transport) -> Result<Self> {
         Ok(Self {
-            user_id: Some(parse_uuid(&sets.id)?),
-            servers: vec![],
+            user_id: parse_uuid(&sets.id)?,
+            server: Address::Inet(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))),
             tr,
-            server_index: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -54,15 +49,10 @@ impl Proxy {
         tr: transport::Transport,
         _dns: std::sync::Arc<crate::route::DnsResolver>,
     ) -> Result<Self> {
-        if sets.servers.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "No servers configured"));
-        }
-
         Ok(Self {
-            user_id: None,
-            servers: sets.servers.clone(),
+            user_id: parse_uuid(&sets.id)?,
+            server: Address::try_from((&sets.address.as_str(), Some(sets.port)))?,
             tr,
-            server_index: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -71,7 +61,7 @@ impl Proxy {
 
         match stream_result {
             Ok(transport_stream) => {
-                let user_id = self.user_id.unwrap_or_default();
+                let user_id = self.user_id.clone();
 
                 let proxy_stream = async_stream::stream! {
                     tokio::pin!(transport_stream);
@@ -101,21 +91,8 @@ impl Proxy {
                 "VLESS outbound UDP-over-stream is not supported in this path",
             ));
         }
-
-        if self.servers.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "No outbound servers configured",
-            ));
-        }
-
-        let idx = self.server_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.servers.len();
-        let server = &self.servers[idx];
-
-        let server_addr = Address::try_from((&server.address, Some(server.port)))?;
-        let mut stream = self.tr.connect(&server_addr, Protocol::Tcp).await?;
-        let user_id = parse_uuid(&server.id)?;
-        send_vless_request(&mut stream, &user_id, target).await?;
+        let mut stream = self.tr.connect(&self.server, Protocol::Tcp).await?;
+        send_vless_request(&mut stream, &self.user_id, target).await?;
         read_vless_response(&mut stream).await?;
         Ok(stream)
     }

@@ -18,7 +18,9 @@ pub type BoxStream<T, E> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, E>>
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Account {
+    #[serde(rename = "user")]
     pub username: String,
+    #[serde(rename = "pass")]
     pub password: String,
 }
 

@@ -8,7 +8,7 @@ pub mod vless;
 
 use crate::{
     common::*,
-    transport::{self, ConnectInfo, ConnectedStream},
+    transport::{self, TrStream},
 };
 use log::error;
 use serde::{de::Error as DeError, Deserialize, Serialize};
@@ -168,7 +168,7 @@ impl Inbounder {
             None => &transport::StreamSettings::default(),
             Some(settings) => settings,
         };
-        let tr = transport::Transport::new(trset, dns.clone())?;
+        let tr = transport::Transport::new(trset, None, dns.clone())?;
         let inb = match set {
             None => return Err(io::Error::new(io::ErrorKind::Other, "no inbound settings".to_string())),
             Some(settings) => match settings {
@@ -322,25 +322,35 @@ impl Outbounder {
             None => &transport::StreamSettings::default(),
             Some(settings) => settings,
         };
-        let tr = transport::Transport::new(trset, dns.clone())?;
+
         let ob = match set {
             None => return Err(io::Error::new(io::ErrorKind::Other, "no outbound settings".to_string())),
-            Some(OutboundSettings::Black) => {
+            Some(OutboundSettings::Black) | Some(OutboundSettings::Freedom) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "black protocol should be handled at app layer".to_string(),
+                    "black|free protocol should be handled at app layer".to_string(),
                 ))
             }
-            Some(OutboundSettings::Freedom) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "freedom protocol should be handled at app layer".to_string(),
-                ))
+            Some(OutboundSettings::Socks(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Socks(socks::Proxy::new_outbound(s, tr)?)
             }
-            Some(OutboundSettings::Socks(s)) => Outbounder::Socks(socks::Proxy::new_outbound(s, tr)?),
-            Some(OutboundSettings::Trojan(s)) => Outbounder::Trojan(trojan::Proxy::new_outbound(s, tr, dns)?),
-            Some(OutboundSettings::Vless(s)) => Outbounder::Vless(vless::Proxy::new_outbound(s, tr, dns)?),
-            Some(OutboundSettings::Reverse(s)) => Outbounder::Reverse(reverse::ReversOutbound::new(s, tr)?),
+            Some(OutboundSettings::Trojan(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Trojan(trojan::Proxy::new_outbound(s, tr, dns)?)
+            }
+            Some(OutboundSettings::Vless(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Vless(vless::Proxy::new_outbound(s, tr, dns)?)
+            }
+            Some(OutboundSettings::Reverse(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Reverse(reverse::ReversOutbound::new(s, tr)?)
+            }
         };
         Ok(ob)
     }
@@ -354,20 +364,11 @@ impl Outbounder {
     }
 
     /// 建立出站连接，返回已就绪的 TrStream
-    pub async fn connect(&self, dst: &Address, protocol: Protocol) -> std::io::Result<ConnectedStream> {
+    pub async fn connect(&self, dst: &Address, protocol: Protocol) -> std::io::Result<TrStream> {
         match self {
-            Outbounder::Socks(proxy) => proxy.connect(dst, protocol).await.map(|stream| ConnectedStream {
-                stream,
-                info: ConnectInfo::none(),
-            }),
-            Outbounder::Trojan(proxy) => proxy.connect(dst, protocol).await.map(|stream| ConnectedStream {
-                stream,
-                info: ConnectInfo::none(),
-            }),
-            Outbounder::Vless(proxy) => proxy.connect(dst, protocol).await.map(|stream| ConnectedStream {
-                stream,
-                info: ConnectInfo::none(),
-            }),
+            Outbounder::Socks(proxy) => proxy.connect(dst, protocol).await,
+            Outbounder::Trojan(proxy) => proxy.connect(dst, protocol).await,
+            Outbounder::Vless(proxy) => proxy.connect(dst, protocol).await,
             Outbounder::Reverse(_proxy) => {
                 // Reverse outbound uses gRPC tunneling, not direct connect
                 Err(std::io::Error::new(

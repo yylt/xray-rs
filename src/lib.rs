@@ -1,4 +1,5 @@
 mod app;
+pub mod build_info;
 pub mod command;
 pub mod common;
 pub mod generated;
