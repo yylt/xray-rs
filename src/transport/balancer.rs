@@ -13,6 +13,8 @@ pub enum Strategy {
     RoundRobin,
     /// Power-of-two choices with least-loaded score
     LeastLoadedP2c,
+    /// Least Connections
+    LeastConnections,
 }
 
 impl Default for Strategy {
@@ -26,6 +28,7 @@ impl Strategy {
         match s {
             "round_robin" => Strategy::RoundRobin,
             "least_loaded_p2c" => Strategy::LeastLoadedP2c,
+            "least_connections" => Strategy::LeastConnections,
             _ => Strategy::LeastLoadedP2c,
         }
     }
@@ -202,6 +205,7 @@ impl GrpcBalancer {
         match self.strategy {
             Strategy::RoundRobin => self.select_round_robin(&pool, &excluded),
             Strategy::LeastLoadedP2c => self.select_least_loaded_p2c(&pool, &excluded),
+            Strategy::LeastConnections => self.select_least_connections(&pool, &excluded),
         }
     }
 
@@ -267,6 +271,35 @@ impl GrpcBalancer {
         };
 
         Some(candidates[pick].clone())
+    }
+
+    fn select_least_connections(
+        &self,
+        pool: &BalancerPool,
+        excluded: &HashSet<GrpcTargetKey>,
+    ) -> Option<SelectedTarget> {
+        let candidates = pool.order.iter().filter_map(|key| {
+            let entry = pool.targets.get(key)?;
+            if excluded.contains(key) || entry.state.is_draining() {
+                return None;
+            }
+            Some(SelectedTarget {
+                key: key.clone(),
+                state: entry.state.clone(),
+            })
+        });
+
+        candidates.min_by_key(|target| {
+            let inflight = target.state.inflight();
+            let failure_penalty = target.state.failure_penalty.load(Ordering::Relaxed);
+
+            // 评分策略：基础分为连接数
+            // 加上 failure_penalty 倍数的惩罚。这里以 (inflight + 1) * failure_penalty 为惩罚基数
+            // 也可以简单的返回 inflight + failure_penalty * 权重
+            // 这里我们用一种确保失败越多，排序越靠后的方法：
+            // 权重惩罚 = 失败次数 * 10 （每次失败相当于加10个连接的负载）
+            inflight + failure_penalty * 10
+        })
     }
 
     pub async fn open_with_retry<T, F, Fut>(&self, mut open: F) -> Result<(SelectedTarget, T)>

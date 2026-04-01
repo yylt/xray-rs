@@ -31,6 +31,8 @@ const DEFAULT_CONCURRENT_LIMIT: usize = 256;
 const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 10;
 const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = false;
 const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 60;
+const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+const DEFAULT_ACCEPT_BACKLOG: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +64,9 @@ pub struct GrpcSettings {
 
     #[serde(rename = "http2KeepAliveWhileIdle")]
     http2_keep_alive_while_idle: Option<bool>,
+
+    #[serde(rename = "loadBalancer")]
+    load_balancer: Option<String>,
 }
 
 fn deserialize_option_duration_secs<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -135,7 +140,11 @@ impl Grpc {
         };
 
         let route_config = RouteConfig::from(grpc_settings);
-        let balancer = Arc::new(super::balancer::GrpcBalancer::new(super::balancer::Strategy::LeastLoadedP2c));
+
+        let strategy_str = grpc_settings.load_balancer.as_deref().unwrap_or("least_connections");
+        let strategy = super::balancer::Strategy::from_str(strategy_str);
+
+        let balancer = Arc::new(super::balancer::GrpcBalancer::new(strategy));
 
         let dns_refresh_task = Self::spawn_dns_refresh_task(server.clone(), dns.clone(), balancer.clone());
 
@@ -464,7 +473,7 @@ impl Grpc {
         let sockopt = self.sockopt.clone();
         let tls_server = self.tls_server.clone();
         let route_config = Arc::new(self.route_config.clone());
-        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(self.route_config.buf_byte_size);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(DEFAULT_ACCEPT_BACKLOG);
 
         let stream = async_stream::stream! {
             loop {
@@ -537,7 +546,7 @@ impl Grpc {
         let sockopt = self.sockopt.clone();
         let route_config = Arc::new(self.route_config.clone());
         let listener_path = path.clone();
-        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(self.route_config.buf_byte_size);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(DEFAULT_ACCEPT_BACKLOG);
 
         let stream = async_stream::stream! {
             loop {
@@ -845,9 +854,9 @@ pub struct GrpcStream {
     target_state: Option<Arc<super::balancer::TargetState>>,
 }
 
-fn make_service(buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
-    let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(buf_byte_size);
-    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(buf_byte_size);
+fn make_service(_buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+    let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
 
     let stream_service = GrpcStream {
         read_buf: BytesMut::new(),
