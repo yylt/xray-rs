@@ -19,14 +19,17 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
 
 use hyper::client::conn::http2::SendRequest;
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
-use log::error;
+use log::{debug, error};
 use std::time::Instant;
 
 use super::*;
@@ -341,7 +344,6 @@ impl Xhttp {
             .header("Host", upload_address)
             .header("User-Agent", "xray-rs/v0.1.0")
             .header("Content-Type", "application/octet-stream")
-            .header("Transfer-Encoding", "chunked")
             .body(body)
             .unwrap();
 
@@ -356,23 +358,45 @@ impl Xhttp {
         Ok(XhttpStream::new(incoming, PollSender::new(tx)))
     }
 
-    pub async fn listen(&self, addr: &Address) -> IoResult<BoxStream<(super::TrStream, Address), std::io::Error>> {
-        let (stream_tx, mut stream_rx) = mpsc::channel(1024);
-
-        let bind_addr = match addr {
-            Address::Inet(a) => a.to_string(),
-            #[cfg(unix)]
-            Address::Unix(p) => p.to_string_lossy().to_string(),
-            
-            _ => return Err(Error::new(ErrorKind::InvalidInput, "Unsupported address type for TCP listener")),
+    fn listener_stream(
+        mut stream_rx: mpsc::Receiver<(super::TrStream, Address)>,
+    ) -> BoxStream<(super::TrStream, Address), std::io::Error> {
+        let stream = async_stream::stream! {
+            while let Some(item) = stream_rx.recv().await {
+                yield Ok(item);
+            }
         };
 
-        let listener = TcpListener::bind(&bind_addr).await?;
+        Box::pin(stream)
+    }
+
+    pub async fn listen(&self, addr: &Address) -> IoResult<BoxStream<(super::TrStream, Address), std::io::Error>> {
+        match addr {
+            Address::Inet(addr) => self.listen_tcp(addr).await,
+            #[cfg(unix)]
+            Address::Unix(path) => self.listen_unix(path).await,
+            #[cfg(not(unix))]
+            Address::Unix(_) => Err(Error::new(
+                ErrorKind::Unsupported,
+                "Unix sockets not supported on this platform",
+            )),
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "xhttp listen only supports Inet and Unix addresses",
+            )),
+        }
+    }
+
+    async fn listen_tcp(
+        &self,
+        addr: &std::net::SocketAddr,
+    ) -> IoResult<BoxStream<(super::TrStream, Address), std::io::Error>> {
+        let (stream_tx, stream_rx) = mpsc::channel(DEFAULT_CHANNEL_SERVER_CAPACITY);
+        let listener = TcpListener::bind(addr).await?;
         let pending = self.pending_streams.clone();
         let stx = stream_tx.clone();
         let base_path = self.settings.path.clone();
         let sockopt = self.opt.clone();
-
         let tls_server = self.tls_server.clone();
 
         tokio::spawn(async move {
@@ -396,7 +420,7 @@ impl Xhttp {
                             match tls.clone().accept(stream).await {
                                 Ok(tls_stream) => {
                                     let io = TokioIo::new(tls_stream);
-                                    Self::serve_connection(io, pending_clone, stx_clone, base_path_clone, peer_addr).await;
+                                    Self::serve_connection(io, pending_clone, stx_clone, base_path_clone, Address::Inet(peer_addr)).await;
                                 }
                                 Err(e) => {
                                     error!("TLS accept error from {}: {}", peer_addr, e);
@@ -404,27 +428,71 @@ impl Xhttp {
                             }
                         } else {
                             let io = TokioIo::new(stream);
-                            Self::serve_connection(io, pending_clone, stx_clone, base_path_clone, peer_addr).await;
+                            Self::serve_connection(io, pending_clone, stx_clone, base_path_clone, Address::Inet(peer_addr)).await;
                         }
                     });
                 }
             }
         });
 
-        let stream = async_stream::stream! {
-            while let Some(item) = stream_rx.recv().await {
-                yield Ok(item);
-            }
-        };
-
-        Ok(Box::pin(stream))
+        Ok(Self::listener_stream(stream_rx))
     }
+
+    #[cfg(unix)]
+    async fn listen_unix(
+        &self,
+        path: &std::path::PathBuf,
+    ) -> IoResult<BoxStream<(super::TrStream, Address), std::io::Error>> {
+        if self.tls_server.is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "xhttp Unix listen does not support TLS",
+            ));
+        }
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        let listener = UnixListener::bind(path)?;
+        let (stream_tx, stream_rx) = mpsc::channel(DEFAULT_CHANNEL_SERVER_CAPACITY);
+        let pending = self.pending_streams.clone();
+        let stx = stream_tx.clone();
+        let base_path = self.settings.path.clone();
+        let sockopt = self.opt.clone();
+        let listener_path = path.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let stream = match sockopt.apply_unixstream(stream) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("Failed to apply sockopt for {:?}: {}", listener_path, e);
+                            continue;
+                        }
+                    };
+
+                    let pending_clone = pending.clone();
+                    let stx_clone = stx.clone();
+                    let base_path_clone = base_path.clone();
+                    let peer_addr = Address::Unix(listener_path.clone());
+
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        Self::serve_connection(io, pending_clone, stx_clone, base_path_clone, peer_addr).await;
+                    });
+                }
+            }
+        });
+
+        Ok(Self::listener_stream(stream_rx))
+    }
+
     async fn serve_connection<I>(
         conn_io: TokioIo<I>,
         pending: Arc<Mutex<HashMap<String, PendingStream>>>,
         stx: mpsc::Sender<(super::TrStream, Address)>,
         base_path: String,
-        peer_addr: core::net::SocketAddr,
+        peer_addr: Address,
     ) where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -432,6 +500,7 @@ impl Xhttp {
             let pending = pending.clone();
             let stx = stx.clone();
             let base_path = base_path.clone();
+            let peer_addr = peer_addr.clone();
 
             async move {
                 let path = req.uri().path().to_string();
@@ -444,62 +513,140 @@ impl Xhttp {
                 let id = path[base_path.len() + 1..].to_string();
 
                 if req.method() == http::Method::POST {
+                    debug!(
+                        "[xhttp][server] recv POST peer={:?} path={} id={}",
+                        peer_addr,
+                        path,
+                        id
+                    );
                     let content_type = req
                         .headers()
                         .get("Content-Type")
                         .and_then(|h| h.to_str().ok())
                         .unwrap_or("");
                     if content_type != "application/octet-stream" {
+                        error!(
+                            "[xhttp][server] invalid POST content-type peer={:?} path={} id={} content_type={}",
+                            peer_addr,
+                            path,
+                            id,
+                            content_type
+                        );
                         let body = ChannelBody { rx: mpsc::channel(1).1 };
                         return Ok::<_, Infallible>(
                             Response::builder().status(StatusCode::BAD_REQUEST).body(body).unwrap(),
                         );
                     }
-                    let mut map = pending.lock().await;
-                    if let Some(PendingStream::DownloadPending { tx, .. }) = map.remove(&id) {
-                        // Match found
-                        let incoming = req.into_body();
-                        let xstream = XhttpStream::new(incoming, PollSender::new(tx));
 
-                        let _ = stx
-                            .send((super::TrStream::Xhttp(Box::new(xstream)), Address::Inet(peer_addr)))
-                            .await;
-                    } else {
-                        map.insert(
-                            id,
-                            PendingStream::UploadPending {
-                                incoming: req.into_body(),
-                                timestamp: Instant::now(),
-                            },
-                        );
+                    let mut req = Some(req);
+                    let matched_tx = {
+                        let mut map = pending.lock().await;
+                        if let Some(PendingStream::DownloadPending { tx, .. }) = map.remove(&id) {
+                            debug!(
+                                "[xhttp][server] matched POST with pending GET peer={:?} id={}",
+                                peer_addr,
+                                id
+                            );
+                            Some(tx)
+                        } else {
+                            debug!(
+                                "[xhttp][server] store POST as upload pending peer={:?} id={}",
+                                peer_addr,
+                                id
+                            );
+                            map.insert(
+                                id.clone(),
+                                PendingStream::UploadPending {
+                                    incoming: req.take().unwrap().into_body(),
+                                    timestamp: Instant::now(),
+                                },
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some(tx) = matched_tx {
+                        let incoming = req.take().unwrap().into_body();
+                        let xstream = XhttpStream::new(incoming, PollSender::new(tx));
+                        match stx
+                            .send((super::TrStream::Xhttp(Box::new(xstream)), peer_addr.clone()))
+                            .await
+                        {
+                            Ok(()) => debug!(
+                                "[xhttp][server] forwarded matched POST stream peer={:?} id={}",
+                                peer_addr,
+                                id
+                            ),
+                            Err(e) => error!(
+                                "[xhttp][server] failed to forward matched POST stream peer={:?} id={} err={}",
+                                peer_addr,
+                                id,
+                                e
+                            ),
+                        }
                     }
+
                     let body = ChannelBody { rx: mpsc::channel(1).1 };
                     Ok::<_, Infallible>(Response::new(body))
                 } else if req.method() == http::Method::GET {
+                    debug!(
+                        "[xhttp][server] recv GET peer={:?} path={} id={}",
+                        peer_addr,
+                        path,
+                        id
+                    );
                     let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SERVER_CAPACITY);
                     let body = ChannelBody { rx };
 
-                    let mut map = pending.lock().await;
-                    if let Some(PendingStream::UploadPending { incoming, .. }) = map.remove(&id) {
-                        // Match found
-                        let xstream = XhttpStream::new(incoming, PollSender::new(tx));
+                    let mut tx_opt = Some(tx);
+                    let matched_incoming = {
+                        let mut map = pending.lock().await;
+                        if let Some(PendingStream::UploadPending { incoming, .. }) = map.remove(&id) {
+                            debug!(
+                                "[xhttp][server] matched GET with pending POST peer={:?} id={}",
+                                peer_addr,
+                                id
+                            );
+                            Some(incoming)
+                        } else {
+                            debug!(
+                                "[xhttp][server] store GET as download pending peer={:?} id={}",
+                                peer_addr,
+                                id
+                            );
+                            map.insert(
+                                id.clone(),
+                                PendingStream::DownloadPending {
+                                    tx: tx_opt.take().unwrap(),
+                                    timestamp: Instant::now(),
+                                },
+                            );
+                            None
+                        }
+                    };
 
-                        let _ = stx
-                            .send((super::TrStream::Xhttp(Box::new(xstream)), Address::Inet(peer_addr)))
-                            .await;
-                    } else {
-                        map.insert(
-                            id,
-                            PendingStream::DownloadPending {
-                                tx,
-                                timestamp: Instant::now(),
-                            },
-                        );
+                    if let Some(incoming) = matched_incoming {
+                        let xstream = XhttpStream::new(incoming, PollSender::new(tx_opt.take().unwrap()));
+                        match stx
+                            .send((super::TrStream::Xhttp(Box::new(xstream)), peer_addr.clone()))
+                            .await
+                        {
+                            Ok(()) => debug!(
+                                "[xhttp][server] forwarded matched GET stream peer={:?} id={}",
+                                peer_addr,
+                                id
+                            ),
+                            Err(e) => error!(
+                                "[xhttp][server] failed to forward matched GET stream peer={:?} id={} err={}",
+                                peer_addr,
+                                id,
+                                e
+                            ),
+                        }
                     }
 
                     Ok::<_, Infallible>(
                         Response::builder()
-                            .header("Transfer-Encoding", "chunked")
                             .body(body)
                             .unwrap(),
                     )
@@ -515,7 +662,7 @@ impl Xhttp {
             }
         });
 
-        if let Err(err) = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        if let Err(err) = AutoBuilder::new(TokioExecutor::new())
             .serve_connection(conn_io, service)
             .await
         {
@@ -546,21 +693,30 @@ impl Stream for IncomingStream {
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        match this.incoming.poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if frame.is_data() {
-                    Poll::Ready(Some(Ok(frame.into_data().unwrap_or_default())))
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+        let mut this = self.project();
+        loop {
+            match this.incoming.as_mut().poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if frame.is_data() {
+                        return Poll::Ready(Some(Ok(frame.into_data().unwrap_or_default())));
+                    }
+
+                    debug!("[xhttp][stream] ignoring non-data frame from incoming body");
+                    continue;
                 }
+                Poll::Ready(Some(Err(e))) => {
+                    error!("[xhttp][stream] incoming body frame error: {}", e);
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))));
+                }
+                Poll::Ready(None) => {
+                    debug!("[xhttp][stream] incoming body EOF");
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
     }
 }
