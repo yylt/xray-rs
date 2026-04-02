@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 /// gRPC 负载均衡策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// 轮询
+    /// round-robin
     RoundRobin,
     /// Power-of-two choices with least-loaded score
     LeastLoadedP2c,
@@ -27,8 +27,8 @@ impl Strategy {
     pub fn from_str(s: &str) -> Self {
         match s {
             "round_robin" => Strategy::RoundRobin,
-            "least_loaded_p2c" => Strategy::LeastLoadedP2c,
-            "least_connections" => Strategy::LeastConnections,
+            "least_loaded" => Strategy::LeastLoadedP2c,
+            "least_connection" => Strategy::LeastConnections,
             _ => Strategy::LeastLoadedP2c,
         }
     }

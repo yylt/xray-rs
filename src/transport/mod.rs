@@ -18,6 +18,7 @@ pub mod grpc;
 pub mod raw;
 pub mod tls;
 pub mod websocket;
+pub mod xhttp;
 
 #[allow(dead_code)]
 pub(crate) const UNIX_SOCKET_UNSUPPORTED: &str = "Unix domain sockets are unsupported on this platform";
@@ -26,6 +27,10 @@ pub(crate) const UNIX_SOCKET_UNSUPPORTED: &str = "Unix domain sockets are unsupp
 pub(crate) fn unix_socket_supported() -> bool {
     cfg!(unix)
 }
+
+const DEFAULT_CHANNEL_CLIENT_CAPACITY: usize = 128;
+const DEFAULT_CHANNEL_SERVER_CAPACITY: usize = 256;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamSettings {
@@ -46,6 +51,9 @@ pub struct StreamSettings {
 
     #[serde(rename = "grpcSettings")]
     grpc_settings: Option<grpc::GrpcSettings>,
+
+    #[serde(rename = "xhttpSettings")]
+    xhttp_settings: Option<xhttp::XhttpSettings>,
 }
 
 impl Default for StreamSettings {
@@ -57,6 +65,7 @@ impl Default for StreamSettings {
             tls_settings: None,
             ws_settings: None,
             grpc_settings: None,
+            xhttp_settings: None,
         }
     }
 }
@@ -70,6 +79,8 @@ pub enum Network {
     Grpc,
     #[serde(rename = "ws", alias = "websocket")]
     Ws,
+    #[serde(rename = "xhttp", alias = "splithttp")]
+    Xhttp,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -98,6 +109,7 @@ pub enum TrStream {
     WebSocketTlsServer(Box<WebSocketIo<tokio_rustls::server::TlsStream<TcpStream>>>),
     WebSocketPlain(Box<WebSocketIo<TcpStream>>),
     Tun(Box<dyn AsyncStream>),
+    Xhttp(Box<xhttp::XhttpStream>),
 }
 
 pub struct WebSocketIo<IO> {
@@ -311,6 +323,7 @@ impl AsyncRead for TrStream {
             TrStream::WebSocketTlsServer(s) => std::pin::Pin::new(&mut **s).poll_read(cx, buf),
             TrStream::WebSocketPlain(s) => std::pin::Pin::new(&mut **s).poll_read(cx, buf),
             TrStream::Tun(s) => std::pin::Pin::new(&mut **s).poll_read(cx, buf),
+            TrStream::Xhttp(s) => std::pin::Pin::new(&mut **s).poll_read(cx, buf),
         }
     }
 }
@@ -337,6 +350,7 @@ impl AsyncWrite for TrStream {
             TrStream::WebSocketTlsServer(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
             TrStream::WebSocketPlain(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
             TrStream::Tun(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
+            TrStream::Xhttp(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
         }
     }
 
@@ -357,6 +371,7 @@ impl AsyncWrite for TrStream {
             TrStream::WebSocketTlsServer(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
             TrStream::WebSocketPlain(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
             TrStream::Tun(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
+            TrStream::Xhttp(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
         }
     }
 
@@ -377,6 +392,7 @@ impl AsyncWrite for TrStream {
             TrStream::WebSocketTlsServer(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
             TrStream::WebSocketPlain(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
             TrStream::Tun(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
+            TrStream::Xhttp(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
         }
     }
 }
@@ -386,6 +402,7 @@ pub enum Transport {
     Raw(raw::Raw), // Tcp, Udp, Unix,
     WebSocket(websocket::WebSocket),
     Grpc(grpc::Grpc),
+    Xhttp(xhttp::Xhttp),
 }
 
 impl Transport {
@@ -398,6 +415,7 @@ impl Transport {
             Network::Tcp => Ok(Transport::Raw(raw::Raw::new(set, dns))),
             Network::Grpc => Ok(Transport::Grpc(grpc::Grpc::new(set, server, dns)?)),
             Network::Ws => Ok(Transport::WebSocket(websocket::WebSocket::new(set, dns)?)),
+            Network::Xhttp => Ok(Transport::Xhttp(xhttp::Xhttp::new(set, server, dns)?)),
         }
     }
 
@@ -407,6 +425,7 @@ impl Transport {
             Transport::Grpc(grpc) => grpc.dns(),
             Transport::WebSocket(ws) => ws.dns(),
             Transport::Raw(raw) => raw.dns(),
+            Transport::Xhttp(xhttp) => xhttp.dns(),
         }
     }
 
@@ -415,6 +434,7 @@ impl Transport {
             Transport::Raw(raw) => raw.listen(addr).await,
             Transport::WebSocket(ws) => ws.listen(addr).await,
             Transport::Grpc(grpc) => grpc.listen(addr).await,
+            Transport::Xhttp(xhttp) => xhttp.listen(addr).await,
         }
     }
 
@@ -423,6 +443,7 @@ impl Transport {
             Transport::Raw(raw) => raw.connect(dest, proto).await,
             Transport::WebSocket(ws) => ws.connect(dest).await,
             Transport::Grpc(grpc) => grpc.connect(dest, proto).await,
+            Transport::Xhttp(xhttp) => xhttp.connect(dest, proto).await,
         }
     }
 }

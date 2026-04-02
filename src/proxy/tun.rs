@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -353,7 +353,7 @@ impl Proxy {
         let device = match Self::create_tun_device(&self.setting) {
             Ok(d) => d,
             Err(e) => {
-                error!("Failed to create TUN device: {}", e);
+                log::error!("Failed to create TUN device: {}", e);
                 return Box::pin(tokio_stream::empty());
             }
         };
@@ -479,7 +479,7 @@ impl Proxy {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to read from TUN device: {}", e);
+                        log::error!("Failed to read from TUN device: {}", e);
                         break;
                     }
                 }
