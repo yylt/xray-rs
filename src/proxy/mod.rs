@@ -10,11 +10,11 @@ use crate::{
     common::*,
     transport::{self, TrStream},
 };
-use log::error;
+
 use serde::{de::Error as DeError, Deserialize, Serialize};
 
 use std::io::Result;
-use tokio::io::{self, AsyncWriteExt};
+
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "protocol", content = "settings")]
@@ -170,7 +170,7 @@ impl Inbounder {
         };
         let tr = transport::Transport::new(trset, None, dns.clone())?;
         let inb = match set {
-            None => return Err(io::Error::new(io::ErrorKind::Other, "no inbound settings".to_string())),
+            None => return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "no inbound settings".to_string())),
             Some(settings) => match settings {
                 InboundSettings::Socks(s) => Inbounder::Socks(socks::Proxy::new_inbound(s, tr)?),
                 InboundSettings::Http(h) => Inbounder::Http(http::Proxy::new_inbound(h, tr)?),
@@ -324,10 +324,10 @@ impl Outbounder {
         };
 
         let ob = match set {
-            None => return Err(io::Error::new(io::ErrorKind::Other, "no outbound settings".to_string())),
+            None => return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "no outbound settings".to_string())),
             Some(OutboundSettings::Black) | Some(OutboundSettings::Freedom) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(tokio::io::Error::new(
+                    tokio::io::ErrorKind::Other,
                     "black|free protocol should be handled at app layer".to_string(),
                 ))
             }
@@ -359,7 +359,7 @@ impl Outbounder {
     pub async fn run(&mut self) -> Result<()> {
         match self {
             Outbounder::Reverse(proxy) => proxy.run().await,
-            _ => Err(io::Error::new(io::ErrorKind::Other, "protocol not support".to_string())),
+            _ => Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "protocol not support".to_string())),
         }
     }
 

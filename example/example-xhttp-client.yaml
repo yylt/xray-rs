@@ -1,0 +1,27 @@
+inbounds:
+  - listen: 127.0.0.1
+    port: 2080
+    protocol: http
+    tag: http-in
+    settings:
+      allowTransparent: false
+
+outbounds:
+  - tag: proxy
+    protocol: trojan
+    settings:
+      address: 127.0.0.1
+      port: 10443
+      password: test-password-123
+    streamSettings:
+      network: xhttp
+      security: none
+      xhttpSettings:
+        path: /test
+        upload:
+          address: 127.0.0.1
+          port: 20080
+        download:
+          address: 127.0.0.1
+          port: 20080
+

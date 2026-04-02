@@ -1,8 +1,8 @@
+use super::*;
 use crate::common::Address;
 use crate::generated::grpc_generated as pb;
 use http::uri::PathAndQuery;
 use serde::{Deserialize, Serialize};
-
 use bytes::{Buf, Bytes, BytesMut};
 use pb::*;
 use std::{
@@ -26,13 +26,12 @@ use tower::ServiceExt;
 
 use log::{debug, error, warn};
 
-const DEFAULT_BUFFER_SIZE: usize = 128 * 1024;
+const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_CONCURRENT_LIMIT: usize = 256;
 const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 10;
 const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = false;
 const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 60;
-const DEFAULT_CHANNEL_CAPACITY: usize = 64;
-const DEFAULT_ACCEPT_BACKLOG: usize = 1024;
+const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65535;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +53,9 @@ pub struct GrpcSettings {
 
     #[serde(rename = "bufByteSize")]
     buf_byte_size: Option<usize>,
+
+    #[serde(rename = "initialWindowsSize")]
+    initial_windows_size: Option<u32>,
 
     #[serde(
         rename = "http2KeepAliveInterval",
@@ -141,7 +143,7 @@ impl Grpc {
 
         let route_config = RouteConfig::from(grpc_settings);
 
-        let strategy_str = grpc_settings.load_balancer.as_deref().unwrap_or("least_connections");
+        let strategy_str = grpc_settings.load_balancer.as_deref().unwrap_or("least_connection");
         let strategy = super::balancer::Strategy::from_str(strategy_str);
 
         let balancer = Arc::new(super::balancer::GrpcBalancer::new(strategy));
@@ -238,6 +240,8 @@ impl Grpc {
         ep = ep
             .concurrency_limit(self.route_config.concurrent_limit)
             .http2_keep_alive_interval(self.route_config.http2_keep_alive_interval)
+            .initial_stream_window_size(self.route_config.initial_window_size)
+            .initial_connection_window_size(self.route_config.initial_connection_window_size)
             .keep_alive_while_idle(self.route_config.http2_keep_alive_while_idle)
             .buffer_size(self.route_config.buf_byte_size)
             .http2_adaptive_window(true);
@@ -473,7 +477,7 @@ impl Grpc {
         let sockopt = self.sockopt.clone();
         let tls_server = self.tls_server.clone();
         let route_config = Arc::new(self.route_config.clone());
-        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(DEFAULT_ACCEPT_BACKLOG);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(DEFAULT_CHANNEL_SERVER_CAPACITY);
 
         let stream = async_stream::stream! {
             loop {
@@ -546,7 +550,7 @@ impl Grpc {
         let sockopt = self.sockopt.clone();
         let route_config = Arc::new(self.route_config.clone());
         let listener_path = path.clone();
-        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(DEFAULT_ACCEPT_BACKLOG);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<(GrpcStream, Address)>(DEFAULT_CHANNEL_SERVER_CAPACITY);
 
         let stream = async_stream::stream! {
             loop {
@@ -855,8 +859,8 @@ pub struct GrpcStream {
 }
 
 fn make_service(_buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
-    let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
-    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CAPACITY);
+    let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
 
     let stream_service = GrpcStream {
         read_buf: BytesMut::new(),
@@ -877,6 +881,8 @@ struct RouteConfig {
     concurrent_limit: usize,
     user_agent: Option<String>,
     buf_byte_size: usize,
+    initial_window_size: u32,
+    initial_connection_window_size: u32,
     http2_keep_alive_interval: Duration,
     http2_keep_alive_while_idle: bool,
     tun_path: http::uri::PathAndQuery,
@@ -954,6 +960,8 @@ impl From<&GrpcSettings> for RouteConfig {
             concurrent_limit: settings.concurrent_limit.unwrap_or(DEFAULT_CONCURRENT_LIMIT),
             user_agent: settings.user_agent.clone(),
             buf_byte_size: settings.buf_byte_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            initial_window_size: settings.initial_windows_size.unwrap_or(DEFAULT_INITIAL_WINDOW_SIZE),
+            initial_connection_window_size: settings.initial_windows_size.unwrap_or(DEFAULT_INITIAL_WINDOW_SIZE),
             http2_keep_alive_interval: settings
                 .http2_keep_alive_interval
                 .unwrap_or(Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS)),
