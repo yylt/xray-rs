@@ -1,10 +1,10 @@
 use super::*;
 use crate::common::Address;
 use crate::generated::grpc_generated as pb;
-use http::uri::PathAndQuery;
-use serde::{Deserialize, Serialize};
 use bytes::{Buf, Bytes, BytesMut};
+use http::uri::PathAndQuery;
 use pb::*;
+use serde::{Deserialize, Serialize};
 use std::{
     io::{Error, ErrorKind, Result as IoResult},
     marker::PhantomData,

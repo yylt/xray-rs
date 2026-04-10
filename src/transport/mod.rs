@@ -31,7 +31,6 @@ pub(crate) fn unix_socket_supported() -> bool {
 const DEFAULT_CHANNEL_CLIENT_CAPACITY: usize = 128;
 const DEFAULT_CHANNEL_SERVER_CAPACITY: usize = 256;
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamSettings {
     #[serde(rename = "network", default)]

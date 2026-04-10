@@ -21,13 +21,9 @@ impl StreamForwarder {
         mut remote: TrStream,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(u64, u64)>> + Send + 'a>> {
         Box::pin(async move {
-            let result = tokio::io::copy_bidirectional_with_sizes(
-                &mut local,
-                &mut remote,
-                DEFAULT_BUF_SIZE,
-                DEFAULT_BUF_SIZE,
-            )
-            .await;
+            let result =
+                tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE)
+                    .await;
 
             let _ = local.shutdown().await;
             let _ = remote.shutdown().await;
