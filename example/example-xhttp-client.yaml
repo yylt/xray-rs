@@ -8,7 +8,7 @@ inbounds:
 
 outbounds:
   - tag: proxy
-    protocol: trojan
+    protocol: xhttp-out
     settings:
       address: 127.0.0.1
       port: 10443
@@ -20,8 +20,7 @@ outbounds:
         path: /test
         upload:
           address: 127.0.0.1
-          port: 20080
+          port: 28888
         download:
           address: 127.0.0.1
-          port: 20080
-
+          port: 28888

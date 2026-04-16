@@ -2,7 +2,7 @@ inbounds:
   - listen: 127.0.0.1
     port: 20080
     protocol: trojan
-    tag: trojan-xhttp-in
+    tag: xhttp-in
     settings:
       password: test-password-123
     streamSettings:
