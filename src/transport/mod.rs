@@ -4,7 +4,7 @@ use crate::common::*;
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
 use std::io::{self, Result};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::net::{TcpStream, UdpSocket};
@@ -122,6 +122,12 @@ impl<IO> WebSocketIo<IO> {
             inner,
             read_buf: BytesMut::new(),
         }
+    }
+
+    fn new_with_read_buf(inner: WebSocketStream<IO>, data: Bytes) -> Self {
+        let mut read_buf = BytesMut::with_capacity(data.len());
+        read_buf.extend_from_slice(&data);
+        Self { inner, read_buf }
     }
 }
 
@@ -437,12 +443,23 @@ impl Transport {
         }
     }
 
-    pub async fn connect(&self, dest: &Address, proto: Protocol) -> Result<TrStream> {
-        match self {
+    pub async fn connect(&self, dest: &Address, proto: Protocol, pre_data: Option<Bytes>) -> Result<TrStream> {
+        if let Transport::WebSocket(ws) = self {
+            return ws.connect(dest, pre_data).await;
+        }
+
+        let mut stream = match self {
             Transport::Raw(raw) => raw.connect(dest, proto).await,
-            Transport::WebSocket(ws) => ws.connect(dest).await,
             Transport::Grpc(grpc) => grpc.connect(dest, proto).await,
             Transport::Xhttp(xhttp) => xhttp.connect(dest, proto).await,
+            Transport::WebSocket(_) => unreachable!(),
+        }?;
+
+        if let Some(pre_data) = pre_data {
+            stream.write_all(&pre_data).await?;
+            stream.flush().await?;
         }
+
+        Ok(stream)
     }
 }

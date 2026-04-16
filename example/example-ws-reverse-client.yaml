@@ -1,0 +1,32 @@
+# Reverse Proxy Client Example (WebSocket transport)
+# Connects to server and listens on random port at server side
+# Supports vhost routing via HTTP Host header or TLS SNI
+
+outbounds:
+  - tag: reverse-out
+    protocol: reverse
+    settings:
+      address: "server.example.com"
+      port: 443
+      # Mode: "tcp" or "http" (both support sniffing, default: tcp)
+      mode: tcp
+      # Remote port: null/0 = random port assigned by OS, specific value = fixed port
+      # Use null for automatic assignment to avoid conflicts
+      remote_port: null
+      password: "your_secure_password_here"
+      # VHost rules for routing based on HTTP Host or TLS SNI
+      vhost:
+        - host: "api.example.com"
+          target: "127.0.0.1:3000"
+        - host: "web.example.com"
+          target: "127.0.0.1:8080"
+        - host: "*.admin.example.com"  # wildcard support (exact match or suffix match)
+          target: "127.0.0.1:9090"
+    streamSettings:
+      network: ws
+      security: tls
+      wsSettings:
+        path: "/ws"
+      tlsSettings:
+        serverName: "server.example.com"
+        allowInsecure: false

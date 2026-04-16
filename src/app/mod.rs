@@ -8,6 +8,9 @@ use crate::{common::*, proxy, route::DnsResolver, transport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::common::stats::SharedStats;
+use crate::route::SharedRouter;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InboundSettings {
     pub listen: String,
@@ -23,11 +26,37 @@ pub struct InboundSettings {
 }
 
 impl InboundSettings {
-    pub fn build_source(self, dns: Arc<DnsResolver>) -> std::io::Result<ConnectionSource> {
+    pub fn build_source(
+        self,
+        dns: Arc<DnsResolver>,
+        sinks: Option<Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>>,
+    ) -> std::io::Result<ConnectionSource> {
+        self.build_source_with_deps(dns, None, None, sinks)
+    }
+
+    /// Build source with additional dependencies for special inbounds like API
+    pub fn build_source_with_deps(
+        self,
+        dns: Arc<DnsResolver>,
+        stats: Option<SharedStats>,
+        router: Option<SharedRouter>,
+        sinks: Option<Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>>,
+    ) -> std::io::Result<ConnectionSource> {
         let tag = self.tag.clone().unwrap_or_else(|| "in".into());
         let listen_addr = Address::try_from((&self.listen, self.port))?;
 
         match self.settings.as_ref() {
+            Some(proxy::InboundSettings::Api(_)) => {
+                let inbounder = proxy::Inbounder::new_with_deps(
+                    self.settings.as_ref(),
+                    self.stream_settings.as_ref(),
+                    dns,
+                    stats,
+                    router,
+                    sinks,
+                )?;
+                Ok(ConnectionSource::Daemon(DaemonSource { inbounder, listen_addr }))
+            }
             Some(proxy::InboundSettings::Reverse(_)) => {
                 let inbounder = proxy::Inbounder::new(self.settings.as_ref(), self.stream_settings.as_ref(), dns)?;
                 Ok(ConnectionSource::Daemon(DaemonSource { inbounder, listen_addr }))

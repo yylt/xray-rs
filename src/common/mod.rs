@@ -1,6 +1,8 @@
 pub mod forward;
 pub mod parse;
+pub mod sniff;
 pub mod socks;
+pub mod stats;
 pub mod tls;
 
 use core::{pin::Pin, result::Result};

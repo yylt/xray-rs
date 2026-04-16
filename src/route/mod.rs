@@ -6,15 +6,13 @@ pub mod router;
 pub mod trie;
 
 pub use resolver::DnsResolver;
-pub use router::Router;
+pub use router::{Router, SharedRouter};
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use std::{io, net::IpAddr, sync::Arc, time::Duration};
+use std::{io, net::IpAddr, sync::Arc};
 
 use self::trie::{DomainMarisaBuilder, IpTrieBuilder};
-
-const DEFAULT_FORWARD_IDLE_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingSettings {
@@ -26,9 +24,6 @@ pub struct RoutingSettings {
 
     #[serde(rename = "fallback")]
     fallback: Option<Fallback>,
-
-    #[serde(rename = "forwardIdleTimeout")]
-    forward_idle_timeout: Option<u64>,
 }
 
 impl RoutingSettings {
@@ -89,10 +84,6 @@ impl RoutingSettings {
         }
 
         Ok(router)
-    }
-
-    pub fn forward_idle_timeout(&self) -> Duration {
-        Duration::from_secs(self.forward_idle_timeout.unwrap_or(DEFAULT_FORWARD_IDLE_TIMEOUT_SECS))
     }
 }
 
@@ -247,22 +238,4 @@ pub struct DnsGroup {
 
     #[serde(rename = "inline", default)]
     pub inline: Vec<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_forward_idle_timeout_can_be_configured() {
-        let settings: RoutingSettings = serde_json::from_str(
-            r#"{
-                "domainStrategy": "AsIs",
-                "forwardIdleTimeout": 15
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(settings.forward_idle_timeout(), std::time::Duration::from_secs(15));
-    }
 }

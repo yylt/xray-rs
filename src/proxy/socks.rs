@@ -402,10 +402,15 @@ impl Proxy {
     }
 
     /// Establish outbound connection to target through SOCKS5 proxy
-    pub async fn connect(&self, target: &Address, protocol: Protocol) -> std::io::Result<transport::TrStream> {
+    pub async fn connect(
+        &self,
+        target: &Address,
+        protocol: Protocol,
+        pre_data: Option<bytes::Bytes>,
+    ) -> std::io::Result<transport::TrStream> {
         if let ProxyMode::Outbound { server, account } = &self.mode {
             let server_addr = Address::Domain(server.address.clone(), server.port);
-            let mut stream = self.tr.connect(&server_addr, Protocol::Tcp).await?;
+            let mut stream = self.tr.connect(&server_addr, Protocol::Tcp, None).await?;
 
             let processor = Socks5Processor::new(account.clone());
             processor
@@ -417,6 +422,10 @@ impl Proxy {
                 Protocol::Tcp => {
                     send_connect_request(&mut stream, target).await?;
                     recv_connect_reply(&mut stream).await?;
+                    if let Some(pre_data) = pre_data {
+                        stream.write_all(&pre_data).await?;
+                        stream.flush().await?;
+                    }
                     Ok(stream)
                 }
                 Protocol::Udp => {

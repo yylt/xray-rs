@@ -2,6 +2,7 @@ use super::*;
 use crate::common::socks::Socks5Processor;
 use crate::proxy::trojan;
 use ahash::RandomState;
+use bytes::Bytes;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,23 +69,23 @@ pub struct OutSetting {
 // Shared Protocol Functions
 // ============================================================================
 
-fn encode_register_message(password_hash: &str, remote_port: u16) -> Vec<u8> {
+fn encode_register_message(password_hash: &str, remote_port: u16) -> Bytes {
     let mut buf = Vec::with_capacity(1 + PASSWORD_HASH_LEN + 2);
     buf.push(MSG_REGISTER);
     buf.extend_from_slice(password_hash.as_bytes());
     buf.extend_from_slice(&remote_port.to_be_bytes());
-    buf
+    Bytes::from(buf)
 }
 
-fn encode_register_response_success(client_id: Uuid) -> Vec<u8> {
+fn encode_register_response_success(client_id: Uuid) -> Bytes {
     let mut buf = Vec::with_capacity(1 + 1 + UUID_LEN);
     buf.push(MSG_REGISTER);
     buf.push(0x00); // success
     buf.extend_from_slice(client_id.as_bytes());
-    buf
+    Bytes::from(buf)
 }
 
-fn encode_register_response_failure(status: u8, error_msg: &str) -> Vec<u8> {
+fn encode_register_response_failure(status: u8, error_msg: &str) -> Bytes {
     let msg_bytes = error_msg.as_bytes();
     let msg_len = msg_bytes.len() as u16;
     let mut buf = Vec::with_capacity(1 + 1 + 2 + msg_bytes.len());
@@ -92,7 +93,7 @@ fn encode_register_response_failure(status: u8, error_msg: &str) -> Vec<u8> {
     buf.push(status);
     buf.extend_from_slice(&msg_len.to_be_bytes());
     buf.extend_from_slice(msg_bytes);
-    buf
+    Bytes::from(buf)
 }
 
 async fn read_address_from_stream(stream: &mut transport::TrStream) -> Result<Address> {
@@ -682,7 +683,7 @@ impl ReversOutbound {
         info!("Starting reverse Outbound, connecting to {:?}", self.server_addr);
 
         // Establish control connection
-        let mut control_stream = self.tr.connect(&self.server_addr, Protocol::Tcp).await?;
+        let mut control_stream = self.tr.connect(&self.server_addr, Protocol::Tcp, None).await?;
 
         // Send registration message
         let password_hash = trojan::compute_password_hash(&self.password);
@@ -752,7 +753,7 @@ impl ReversOutbound {
                     info!("New connection request: {} -> {:?}", conn_id, target_addr);
 
                     // Create new data connection to server
-                    let data_stream = match self.tr.connect(&self.server_addr, Protocol::Tcp).await {
+                    let data_stream = match self.tr.connect(&self.server_addr, Protocol::Tcp, None).await {
                         Ok(stream) => stream,
                         Err(e) => {
                             error!("Failed to connect to server for data connection: {}", e);

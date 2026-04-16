@@ -25,7 +25,7 @@ impl Default for SocketOpt {
             recv_buffer_size: Some(98304), // 96k
             send_buffer_size: Some(81920), // 80k
             tcp_nodelay: Some(true),
-            tcp_congestion: Some("bbr".to_string()),
+            tcp_congestion: None,
         }
     }
 }

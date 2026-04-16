@@ -1,3 +1,4 @@
+pub mod api;
 pub mod http;
 pub mod reverse;
 pub mod socks;
@@ -7,9 +8,11 @@ pub mod tun;
 pub mod vless;
 
 use crate::{
+    app::ConnectionSink,
     common::*,
     transport::{self, TrStream},
 };
+use bytes::Bytes;
 
 use serde::{de::Error as DeError, Deserialize, Serialize};
 
@@ -18,6 +21,9 @@ use std::io::Result;
 #[derive(Serialize, Debug)]
 #[serde(tag = "protocol", content = "settings")]
 pub enum InboundSettings {
+    #[serde(rename = "api")]
+    Api(api::InSetting),
+
     #[serde(rename = "http")]
     Http(http::InSetting),
 
@@ -61,6 +67,12 @@ impl<'de> Deserialize<'de> for InboundSettings {
         let raw = RawInboundSettings::deserialize(deserializer)?;
 
         match raw.protocol.as_str() {
+            "api" => match raw.settings {
+                Some(value) => serde_json::from_value(value)
+                    .map(InboundSettings::Api)
+                    .map_err(D::Error::custom),
+                None => Ok(InboundSettings::Api(api::InSetting::default())),
+            },
             "http" => match raw.settings {
                 Some(value) => serde_json::from_value(value)
                     .map(InboundSettings::Http)
@@ -80,7 +92,7 @@ impl<'de> Deserialize<'de> for InboundSettings {
             "reverse" => deserialize_settings(raw.settings).map(InboundSettings::Reverse),
             other => Err(D::Error::unknown_variant(
                 other,
-                &["http", "socks", "trojan", "vless", "reverse"],
+                &["api", "http", "socks", "trojan", "vless", "reverse"],
             )),
         }
     }
@@ -148,6 +160,7 @@ impl ProxyStream {
 }
 
 pub enum Inbounder {
+    Api(api::ApiInbound),
     Http(http::Proxy),
     Socks(socks::Proxy),
     Trojan(trojan::Proxy),
@@ -163,6 +176,18 @@ impl Inbounder {
         sset: Option<&transport::StreamSettings>,
         dns: std::sync::Arc<crate::route::DnsResolver>,
     ) -> Result<Self> {
+        Self::new_with_deps(set, sset, dns, None, None, None)
+    }
+
+    /// Create Inbounder with additional dependencies for special inbounds like API
+    pub fn new_with_deps(
+        set: Option<&InboundSettings>,
+        sset: Option<&transport::StreamSettings>,
+        dns: std::sync::Arc<crate::route::DnsResolver>,
+        stats: Option<crate::common::stats::SharedStats>,
+        router: Option<crate::route::router::SharedRouter>,
+        sinks: Option<std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<ConnectionSink>>>>,
+    ) -> Result<Self> {
         let trset = match sset {
             None => &transport::StreamSettings::default(),
             Some(settings) => settings,
@@ -176,6 +201,18 @@ impl Inbounder {
                 ))
             }
             Some(settings) => match settings {
+                InboundSettings::Api(a) => {
+                    let stats = stats.ok_or_else(|| {
+                        tokio::io::Error::new(tokio::io::ErrorKind::Other, "api inbound requires stats")
+                    })?;
+                    let router = router.ok_or_else(|| {
+                        tokio::io::Error::new(tokio::io::ErrorKind::Other, "api inbound requires router")
+                    })?;
+                    let sinks = sinks.ok_or_else(|| {
+                        tokio::io::Error::new(tokio::io::ErrorKind::Other, "api inbound requires sinks")
+                    })?;
+                    Inbounder::Api(api::ApiInbound::new(a, stats, router, sinks)?)
+                }
                 InboundSettings::Socks(s) => Inbounder::Socks(socks::Proxy::new_inbound(s, tr)?),
                 InboundSettings::Http(h) => Inbounder::Http(http::Proxy::new_inbound(h, tr)?),
                 InboundSettings::Trojan(t) => Inbounder::Trojan(trojan::Proxy::new_inbound(t, tr)?),
@@ -193,6 +230,18 @@ impl Inbounder {
 
     pub async fn run(self, addr: Address) -> Result<()> {
         match self {
+            Inbounder::Api(proxy) => {
+                let socket_addr = match &addr {
+                    Address::Inet(sock) => *sock,
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "api inbound requires TCP address",
+                        ))
+                    }
+                };
+                proxy.run(socket_addr).await
+            }
             Inbounder::Reverse(proxy) => proxy.run(addr).await,
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -376,11 +425,16 @@ impl Outbounder {
     }
 
     /// 建立出站连接，返回已就绪的 TrStream
-    pub async fn connect(&self, dst: &Address, protocol: Protocol) -> std::io::Result<TrStream> {
+    pub async fn connect(
+        &self,
+        dst: &Address,
+        protocol: Protocol,
+        pre_data: Option<Bytes>,
+    ) -> std::io::Result<TrStream> {
         match self {
-            Outbounder::Socks(proxy) => proxy.connect(dst, protocol).await,
-            Outbounder::Trojan(proxy) => proxy.connect(dst, protocol).await,
-            Outbounder::Vless(proxy) => proxy.connect(dst, protocol).await,
+            Outbounder::Socks(proxy) => proxy.connect(dst, protocol, pre_data).await,
+            Outbounder::Trojan(proxy) => proxy.connect(dst, protocol, pre_data).await,
+            Outbounder::Vless(proxy) => proxy.connect(dst, protocol, pre_data).await,
             Outbounder::Reverse(_proxy) => {
                 // Reverse outbound uses gRPC tunneling, not direct connect
                 Err(std::io::Error::new(
