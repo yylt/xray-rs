@@ -1,10 +1,11 @@
+pub mod domain_trie;
 pub mod forward;
+pub mod ip_trie;
 pub mod parse;
 pub mod sniff;
 pub mod socks;
 pub mod stats;
 pub mod tls;
-
 use core::{pin::Pin, result::Result};
 use serde::{Deserialize, Serialize};
 use std::future::Future;

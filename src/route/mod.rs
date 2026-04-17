@@ -22,8 +22,72 @@ pub struct RoutingSettings {
     #[serde(rename = "rules")]
     rules: Option<Vec<Rule>>,
 
-    #[serde(rename = "fallback")]
-    fallback: Option<Fallback>,
+    #[serde(rename = "fallbackTags")]
+    fallback_tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum Strategy {
+    #[default]
+    #[serde(rename = "AsIs")]
+    AsIs,
+    #[serde(rename = "IPIfNonMatch")]
+    IPIfNonMatch,
+    #[serde(rename = "IPOnDemand")]
+    IPOnDemand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Rule {
+    #[serde(rename = "domain", alias = "domains")]
+    domain: Option<Vec<String>>,
+
+    #[serde(rename = "ip", alias = "ips")]
+    ips: Option<Vec<String>>,
+
+    #[serde(rename = "inboundTag")]
+    inbound_tag: Option<String>,
+
+    #[serde(rename = "outboundTag")]
+    outbound_tag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSettings {
+    #[serde(rename = "disableCache", default)]
+    pub disable_cache: bool,
+
+    #[serde(rename = "hosts", default)]
+    pub hosts: Vec<String>,
+
+    #[serde(rename = "servers", default)]
+    pub servers: Vec<String>,
+
+    #[serde(rename = "groups", default)]
+    pub groups: Vec<DnsGroup>,
+}
+
+impl Default for DnsSettings {
+    fn default() -> Self {
+        Self {
+            disable_cache: true,
+            hosts: vec![],
+            servers: vec![],
+            groups: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsGroup {
+    #[serde(rename = "name")]
+    pub name: String,
+
+    #[serde(rename = "files", default)]
+    pub files: Vec<String>,
+
+    #[serde(rename = "inline", default)]
+    pub inline: Vec<String>,
 }
 
 impl RoutingSettings {
@@ -71,8 +135,8 @@ impl RoutingSettings {
             Router::new_with_tries(self.domain_strategy.clone(), domain_builder.build(), ip_builder.build())
                 .with_dns(dns);
 
-        if let Some(fallback) = &self.fallback {
-            router.set_fallback(fallback.tags.clone());
+        if let Some(fallback) = &self.fallback_tags {
+            router.set_fallback(fallback.clone());
         }
 
         if let Some(rules) = &self.rules {
@@ -168,74 +232,4 @@ fn read_rule_lines(file_path: &str) -> io::Result<Vec<String>> {
     }
 
     Ok(lines)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub enum Strategy {
-    #[default]
-    #[serde(rename = "AsIs")]
-    AsIs,
-    #[serde(rename = "IPIfNonMatch")]
-    IPIfNonMatch,
-    #[serde(rename = "IPOnDemand")]
-    IPOnDemand,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Rule {
-    #[serde(rename = "domain", alias = "domains")]
-    domain: Option<Vec<String>>,
-
-    #[serde(rename = "ip", alias = "ips")]
-    ips: Option<Vec<String>>,
-
-    #[serde(rename = "inboundTag")]
-    inbound_tag: Option<String>,
-
-    #[serde(rename = "outboundTag")]
-    outbound_tag: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Fallback {
-    #[serde(rename = "tags")]
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsSettings {
-    #[serde(rename = "disableCache", default)]
-    pub disable_cache: bool,
-
-    #[serde(rename = "hosts", default)]
-    pub hosts: Vec<String>,
-
-    #[serde(rename = "servers", default)]
-    pub servers: Vec<String>,
-
-    #[serde(rename = "groups", default)]
-    pub groups: Vec<DnsGroup>,
-}
-
-impl Default for DnsSettings {
-    fn default() -> Self {
-        Self {
-            disable_cache: true,
-            hosts: vec![],
-            servers: vec![],
-            groups: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsGroup {
-    #[serde(rename = "name")]
-    pub name: String,
-
-    #[serde(rename = "files", default)]
-    pub files: Vec<String>,
-
-    #[serde(rename = "inline", default)]
-    pub inline: Vec<String>,
 }

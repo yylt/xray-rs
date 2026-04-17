@@ -249,7 +249,7 @@ impl Router {
                 "route fallback to default tag={:?}",
                 tag,
             );
-            return Some(RoutingResult::new(tag));
+            return Some(self.resolve_tag(&tag));
         }
         log::debug!(target: "route::router", "route no match and no default");
         None
