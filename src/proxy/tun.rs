@@ -1,5 +1,6 @@
 use super::*;
 use ahash::RandomState;
+use bytes::Bytes;
 use etherparse::{NetHeaders, PacketHeaders};
 use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
@@ -53,24 +54,24 @@ pub struct FlowKey {
 }
 
 pub struct FlowState {
-    pub sender: mpsc::Sender<Vec<u8>>,
+    pub sender: mpsc::Sender<Bytes>,
     pub last_activity: Instant,
 }
 
 // Channel-based stream adapter for TUN flows
 pub struct TunStream {
-    rx: mpsc::Receiver<Vec<u8>>,
-    tx: mpsc::Sender<Vec<u8>>,
-    read_buf: Vec<u8>,
+    rx: mpsc::Receiver<Bytes>,
+    tx: mpsc::Sender<Bytes>,
+    read_buf: Bytes,
     read_pos: usize,
 }
 
 impl TunStream {
-    pub fn new(rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<Vec<u8>>) -> Self {
+    pub fn new(rx: mpsc::Receiver<Bytes>, tx: mpsc::Sender<Bytes>) -> Self {
         Self {
             rx,
             tx,
-            read_buf: Vec::new(),
+            read_buf: Bytes::new(),
             read_pos: 0,
         }
     }
@@ -84,14 +85,14 @@ impl AsyncRead for TunStream {
     ) -> Poll<std::io::Result<()>> {
         // If we have data in the buffer, copy it
         if self.read_pos < self.read_buf.len() {
-            let remaining = &self.read_buf[self.read_pos..];
+            let remaining = &self.read_buf.slice(self.read_pos..);
             let to_copy = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..to_copy]);
             self.read_pos += to_copy;
 
             // Clear buffer if fully consumed
             if self.read_pos >= self.read_buf.len() {
-                self.read_buf.clear();
+                self.read_buf = Bytes::new();
                 self.read_pos = 0;
             }
 
@@ -106,7 +107,7 @@ impl AsyncRead for TunStream {
 
                 // Store remaining data if any
                 if to_copy < data.len() {
-                    self.read_buf = data[to_copy..].to_vec();
+                    self.read_buf = data.slice(to_copy..);
                     self.read_pos = 0;
                 }
 
@@ -120,7 +121,7 @@ impl AsyncRead for TunStream {
 
 impl AsyncWrite for TunStream {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        let data = buf.to_vec();
+        let data = Bytes::copy_from_slice(buf);
         let len = data.len();
         match self.tx.try_send(data) {
             Ok(()) => Poll::Ready(Ok(len)),
@@ -160,7 +161,7 @@ impl ConnectionPool {
     pub async fn get_or_create(
         &self,
         key: FlowKey,
-    ) -> std::io::Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>, bool)> {
+    ) -> std::io::Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, bool)> {
         let mut flows = self.flows.lock().await;
 
         if let Some(state) = flows.get_mut(&key) {
@@ -195,7 +196,7 @@ impl ConnectionPool {
     }
 }
 
-pub fn parse_packet(data: &[u8]) -> std::io::Result<(FlowKey, Vec<u8>)> {
+pub fn parse_packet(data: &[u8]) -> std::io::Result<(FlowKey, Bytes)> {
     let headers = PacketHeaders::from_ip_slice(data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e)))?;
 
@@ -220,7 +221,7 @@ pub fn parse_packet(data: &[u8]) -> std::io::Result<(FlowKey, Vec<u8>)> {
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unsupported protocol")),
     };
 
-    let payload = headers.payload.slice().to_vec();
+    let payload = Bytes::copy_from_slice(headers.payload.slice());
 
     Ok((
         FlowKey {
@@ -234,10 +235,10 @@ pub fn parse_packet(data: &[u8]) -> std::io::Result<(FlowKey, Vec<u8>)> {
     ))
 }
 
-pub fn build_packet(flow_key: &FlowKey, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn build_packet(flow_key: &FlowKey, payload: &[u8]) -> std::io::Result<Bytes> {
     use etherparse::PacketBuilder;
 
-    let mut packet = Vec::new();
+    let mut packet = Vec::with_capacity(1500);
 
     // Build packet (swap src/dst for response)
     match (flow_key.dst_addr, flow_key.src_addr) {
@@ -292,7 +293,7 @@ pub fn build_packet(flow_key: &FlowKey, payload: &[u8]) -> std::io::Result<Vec<u
         }
     }
 
-    Ok(packet)
+    Ok(Bytes::from(packet))
 }
 #[allow(unused)]
 pub struct Proxy {

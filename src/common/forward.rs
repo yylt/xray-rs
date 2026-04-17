@@ -1,4 +1,6 @@
+use crate::common::stats::TrafficStats;
 use crate::transport::TrStream;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 pub struct StreamForwarder;
@@ -29,6 +31,33 @@ impl StreamForwarder {
             let _ = remote.shutdown().await;
 
             result
+        })
+    }
+
+    /// Forward with traffic statistics tracking
+    pub fn forward_with_stats<'a>(
+        &'a self,
+        mut local: TrStream,
+        mut remote: TrStream,
+        stats: Arc<TrafficStats>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(u64, u64)>> + Send + 'a>> {
+        Box::pin(async move {
+            // Use copy_bidirectional to transfer data between streams
+            let result =
+                tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE)
+                    .await;
+
+            let _ = local.shutdown().await;
+            let _ = remote.shutdown().await;
+
+            // Record the traffic stats
+            if let Ok((uplink, downlink)) = result {
+                stats.record_uplink(uplink);
+                stats.record_downlink(downlink);
+                Ok((uplink, downlink))
+            } else {
+                result
+            }
         })
     }
 }
@@ -95,5 +124,36 @@ mod tests {
         assert_eq!(&resp, b"world");
 
         let _ = forward_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stream_forwarder_with_stats() {
+        let (stream1, mut peer1) = tcp_pair().await;
+        let (stream2, mut peer2) = tcp_pair().await;
+
+        let stats = Arc::new(TrafficStats::new());
+        let forwarder = StreamForwarder::new();
+        let stats_clone = stats.clone();
+        let forward_task = tokio::spawn(async move {
+            forwarder
+                .forward_with_stats(TrStream::Tcp(stream1), TrStream::Tcp(stream2), stats_clone)
+                .await
+        });
+
+        peer1.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        peer2.read_exact(&mut buf).await.unwrap();
+
+        peer2.write_all(b"pong").await.unwrap();
+        peer1.read_exact(&mut buf).await.unwrap();
+
+        drop(peer1);
+        drop(peer2);
+        let (uplink, downlink) = forward_task.await.unwrap().unwrap();
+
+        assert_eq!(uplink, 4); // "ping"
+        assert_eq!(downlink, 4); // "pong"
+        assert_eq!(stats.uplink(), 4);
+        assert_eq!(stats.downlink(), 4);
     }
 }

@@ -1,10 +1,10 @@
 inbounds:
   - listen: 127.0.0.1
     port: 10443
-    protocol: trojan
-    tag: trojan-ws-in
+    protocol: vless
+    tag: vless-ws-in
     settings:
-      password: test-password-123
+      id: b3e82297-eab7-0f26-d714-a2091305b989
     streamSettings:
       network: ws
       security: none

@@ -84,15 +84,31 @@ impl Proxy {
         }
     }
 
-    pub async fn connect(&self, target: &Address, protocol: Protocol) -> std::io::Result<transport::TrStream> {
+    pub async fn connect(
+        &self,
+        target: &Address,
+        protocol: Protocol,
+        pre_data: Option<bytes::Bytes>,
+    ) -> std::io::Result<transport::TrStream> {
         if protocol == Protocol::Udp {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "VLESS outbound UDP-over-stream is not supported in this path",
             ));
         }
-        let mut stream = self.tr.connect(&self.server, Protocol::Tcp).await?;
-        send_vless_request(&mut stream, &self.user_id, target).await?;
+
+        let request = build_vless_request(&self.user_id, target)?;
+        let merged_pre_data = match pre_data {
+            Some(pre_data) => {
+                let mut merged = BytesMut::with_capacity(request.len() + pre_data.len());
+                merged.extend_from_slice(&request);
+                merged.extend_from_slice(&pre_data);
+                Some(merged.freeze())
+            }
+            None => Some(request),
+        };
+
+        let mut stream = self.tr.connect(&self.server, Protocol::Tcp, merged_pre_data).await?;
         read_vless_response(&mut stream).await?;
         Ok(stream)
     }
@@ -157,20 +173,14 @@ where
     read_target_address(stream).await
 }
 
-async fn send_vless_request<W>(stream: &mut W, user_id: &[u8; 16], target: &Address) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+fn build_vless_request(user_id: &[u8; 16], target: &Address) -> std::io::Result<bytes::Bytes> {
     let mut buf = BytesMut::with_capacity(128);
     buf.put_u8(VLESS_VERSION);
     buf.put_slice(user_id);
     buf.put_u8(0);
     buf.put_u8(VLESS_CMD_TCP);
     write_target_address(target, &mut buf)?;
-
-    AsyncWriteExt::write_all(stream, &buf).await?;
-    AsyncWriteExt::flush(stream).await?;
-    Ok(())
+    Ok(buf.freeze())
 }
 
 async fn send_vless_response<W>(stream: &mut W) -> std::io::Result<()>

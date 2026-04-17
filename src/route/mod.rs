@@ -6,15 +6,13 @@ pub mod router;
 pub mod trie;
 
 pub use resolver::DnsResolver;
-pub use router::Router;
+pub use router::{Router, SharedRouter};
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use std::{io, net::IpAddr, sync::Arc, time::Duration};
+use std::{io, net::IpAddr, sync::Arc};
 
 use self::trie::{DomainMarisaBuilder, IpTrieBuilder};
-
-const DEFAULT_FORWARD_IDLE_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingSettings {
@@ -24,11 +22,72 @@ pub struct RoutingSettings {
     #[serde(rename = "rules")]
     rules: Option<Vec<Rule>>,
 
-    #[serde(rename = "fallback")]
-    fallback: Option<Fallback>,
+    #[serde(rename = "fallbackTags")]
+    fallback_tags: Option<Vec<String>>,
+}
 
-    #[serde(rename = "forwardIdleTimeout")]
-    forward_idle_timeout: Option<u64>,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum Strategy {
+    #[default]
+    #[serde(rename = "AsIs")]
+    AsIs,
+    #[serde(rename = "IPIfNonMatch")]
+    IPIfNonMatch,
+    #[serde(rename = "IPOnDemand")]
+    IPOnDemand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Rule {
+    #[serde(rename = "domain", alias = "domains")]
+    domain: Option<Vec<String>>,
+
+    #[serde(rename = "ip", alias = "ips")]
+    ips: Option<Vec<String>>,
+
+    #[serde(rename = "inboundTag")]
+    inbound_tag: Option<String>,
+
+    #[serde(rename = "outboundTag")]
+    outbound_tag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSettings {
+    #[serde(rename = "disableCache", default)]
+    pub disable_cache: bool,
+
+    #[serde(rename = "hosts", default)]
+    pub hosts: Vec<String>,
+
+    #[serde(rename = "servers", default)]
+    pub servers: Vec<String>,
+
+    #[serde(rename = "groups", default)]
+    pub groups: Vec<DnsGroup>,
+}
+
+impl Default for DnsSettings {
+    fn default() -> Self {
+        Self {
+            disable_cache: true,
+            hosts: vec![],
+            servers: vec![],
+            groups: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsGroup {
+    #[serde(rename = "name")]
+    pub name: String,
+
+    #[serde(rename = "files", default)]
+    pub files: Vec<String>,
+
+    #[serde(rename = "inline", default)]
+    pub inline: Vec<String>,
 }
 
 impl RoutingSettings {
@@ -76,8 +135,8 @@ impl RoutingSettings {
             Router::new_with_tries(self.domain_strategy.clone(), domain_builder.build(), ip_builder.build())
                 .with_dns(dns);
 
-        if let Some(fallback) = &self.fallback {
-            router.set_fallback(fallback.tags.clone());
+        if let Some(fallback) = &self.fallback_tags {
+            router.set_fallback(fallback.clone());
         }
 
         if let Some(rules) = &self.rules {
@@ -89,10 +148,6 @@ impl RoutingSettings {
         }
 
         Ok(router)
-    }
-
-    pub fn forward_idle_timeout(&self) -> Duration {
-        Duration::from_secs(self.forward_idle_timeout.unwrap_or(DEFAULT_FORWARD_IDLE_TIMEOUT_SECS))
     }
 }
 
@@ -177,92 +232,4 @@ fn read_rule_lines(file_path: &str) -> io::Result<Vec<String>> {
     }
 
     Ok(lines)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub enum Strategy {
-    #[default]
-    #[serde(rename = "AsIs")]
-    AsIs,
-    #[serde(rename = "IPIfNonMatch")]
-    IPIfNonMatch,
-    #[serde(rename = "IPOnDemand")]
-    IPOnDemand,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Rule {
-    #[serde(rename = "domain", alias = "domains")]
-    domain: Option<Vec<String>>,
-
-    #[serde(rename = "ip", alias = "ips")]
-    ips: Option<Vec<String>>,
-
-    #[serde(rename = "inboundTag")]
-    inbound_tag: Option<String>,
-
-    #[serde(rename = "outboundTag")]
-    outbound_tag: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Fallback {
-    #[serde(rename = "tags")]
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsSettings {
-    #[serde(rename = "disableCache", default)]
-    pub disable_cache: bool,
-
-    #[serde(rename = "hosts", default)]
-    pub hosts: Vec<String>,
-
-    #[serde(rename = "servers", default)]
-    pub servers: Vec<String>,
-
-    #[serde(rename = "groups", default)]
-    pub groups: Vec<DnsGroup>,
-}
-
-impl Default for DnsSettings {
-    fn default() -> Self {
-        Self {
-            disable_cache: true,
-            hosts: vec![],
-            servers: vec![],
-            groups: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsGroup {
-    #[serde(rename = "name")]
-    pub name: String,
-
-    #[serde(rename = "files", default)]
-    pub files: Vec<String>,
-
-    #[serde(rename = "inline", default)]
-    pub inline: Vec<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_forward_idle_timeout_can_be_configured() {
-        let settings: RoutingSettings = serde_json::from_str(
-            r#"{
-                "domainStrategy": "AsIs",
-                "forwardIdleTimeout": 15
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(settings.forward_idle_timeout(), std::time::Duration::from_secs(15));
-    }
 }

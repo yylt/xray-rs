@@ -5,7 +5,7 @@ use sha2::{Digest, Sha224};
 use std::io::{Error, ErrorKind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 const TROJAN_HASH_LEN: usize = 56; // SHA224 hex
 const TROJAN_HEADER_LEN: usize = TROJAN_HASH_LEN + 2; // hash + CRLF
@@ -39,9 +39,6 @@ pub struct Proxy {
 
 struct TrojanUdpStream {
     inner: transport::TrStream,
-    // 当前实现采用“单 stream 固定单目标”的 UDP-over-stream 简化语义：
-    // 同一条 Trojan UDP stream 上所有写出的 frame 都编码为同一个 target。
-    // 这满足当前 sink/app 的固定目标转发模型，但不是 tj.md 意义上“每个包可切换目标”的完整语义。
     target: Address,
     read_raw: Vec<u8>,
     read_payload: Vec<u8>,
@@ -243,23 +240,37 @@ impl Proxy {
         }
     }
 
-    pub async fn connect(&self, target: &Address, protocol: Protocol) -> std::io::Result<transport::TrStream> {
+    pub async fn connect(
+        &self,
+        target: &Address,
+        protocol: Protocol,
+        pre_data: Option<bytes::Bytes>,
+    ) -> std::io::Result<transport::TrStream> {
         debug!(
             "[Trojan][connect] dialing server={:?}, target={:?}, protocol={:?}",
             self.server, target, protocol
-        );
-        let mut stream = self.tr.connect(&self.server, Protocol::Tcp).await?;
-        debug!(
-            "[Trojan][connect] transport connected to server={:?}, sending request for target={:?}",
-            self.server, target
         );
         let cmd = match protocol {
             Protocol::Tcp => TROJAN_CMD_CONNECT,
             Protocol::Udp => TROJAN_CMD_UDP_ASSOCIATE,
         };
 
-        send_trojan_request(&mut stream, &self.password_hash, cmd, target).await?;
-        debug!("[Trojan][connect] request sent cmd=0x{:02x}, target={:?}", cmd, target);
+        let request = build_trojan_request(&self.password_hash, cmd, target)?;
+        let merged_pre_data = match pre_data {
+            Some(pre_data) => {
+                let mut merged = Vec::with_capacity(request.len() + pre_data.len());
+                merged.extend_from_slice(&request);
+                merged.extend_from_slice(&pre_data);
+                Some(bytes::Bytes::from(merged))
+            }
+            None => Some(bytes::Bytes::from(request)),
+        };
+
+        let stream = self.tr.connect(&self.server, Protocol::Tcp, merged_pre_data).await?;
+        debug!(
+            "[Trojan][connect] request sent via pre_data cmd=0x{:02x}, target={:?}",
+            cmd, target
+        );
 
         if protocol == Protocol::Udp {
             Ok(transport::TrStream::Tun(Box::new(TrojanUdpStream::new(stream, target.clone()))))
@@ -466,12 +477,7 @@ fn build_trojan_udp_packet(target: &Address, payload: &[u8]) -> std::io::Result<
     Ok(packet)
 }
 
-async fn send_trojan_request(
-    stream: &mut transport::TrStream,
-    password_hash: &str,
-    cmd: u8,
-    target: &Address,
-) -> std::io::Result<()> {
+fn build_trojan_request(password_hash: &str, cmd: u8, target: &Address) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(128);
     buf.extend_from_slice(password_hash.as_bytes());
     buf.extend_from_slice(&TROJAN_CRLF);
@@ -488,7 +494,6 @@ async fn send_trojan_request(
         &password_hash[..password_hash.len().min(8)],
         buf.len()
     );
-    AsyncWriteExt::write_all(stream, &buf).await?;
-    AsyncWriteExt::flush(stream).await?;
-    Ok(())
+
+    Ok(buf)
 }

@@ -1,0 +1,49 @@
+# Reverse Proxy Server Example (WebSocket transport)
+# Accepts reverse proxy connections from clients
+
+inbounds:
+  - tag: reverse-in
+    listen: "0.0.0.0:8080"
+    protocol: reverse
+    settings:
+      password: "your_secure_password_here"  # Must match client
+      heartbeat: 30  # seconds
+      # Mode: "tcp" or "http" (default: tcp)
+      mode: tcp
+      # VHost rules for routing at server side (optional)
+      # These can also be configured on client; client rules take priority
+      vhost:
+        - host: "api.example.com"
+          target: "127.0.0.1:3000"
+        - host: "web.example.com"
+          target: "127.0.0.1:8080"
+    streamSettings:
+      network: ws
+      security: tls
+      wsSettings:
+        path: "/ws"
+      tlsSettings:
+        # Provide certificate for TLS
+        certificateFile: "/path/to/cert.pem"
+        keyFile: "/path/to/key.pem"
+
+# Example: TCP mode with random port assignment
+# Client can request any port (including 0 for random)
+# Server will assign an available port and report it back
+---
+# Alternative configuration: HTTP mode with specific remote port
+outbounds:
+  - tag: reverse-out-specific-port
+    protocol: reverse
+    settings:
+      address: "server.example.com"
+      port: 443
+      mode: http
+      remote_port: 8080  # Request specific port (must be >= 1024 and not in use)
+      password: "your_secure_password_here"
+      vhost:
+        - host: "app.example.com"
+          target: "127.0.0.1:5000"
+    streamSettings:
+      network: ws
+      security: tls

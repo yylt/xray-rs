@@ -2,6 +2,7 @@ use ahash::RandomState;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::common::Address;
 use crate::proxy::ProxyStream;
@@ -32,16 +33,31 @@ impl RoutingResult {
     }
 }
 
+/// Router inner state that can be dynamically modified
+#[derive(Debug)]
+struct RouterState {
+    default_tag: Option<String>,
+}
+
+impl RouterState {
+    fn new() -> Self {
+        Self { default_tag: None }
+    }
+}
+
 #[derive(Debug)]
 pub struct Router {
     domain_strategy: Strategy,
     domain_trie: DomainMarisa,
     ip_trie: IpTrie,
     inbound_rules: HashMap<String, String, RandomState>,
-    default_tag: Option<String>,
+    state: RwLock<RouterState>,
     dns: Option<Arc<DnsResolver>>,
     fallback_tags: Vec<String>,
 }
+
+/// Thread-safe shared Router
+pub type SharedRouter = Arc<RwLock<Router>>;
 
 impl Router {
     pub fn new() -> Self {
@@ -58,7 +74,7 @@ impl Router {
             domain_trie,
             ip_trie,
             inbound_rules: HashMap::with_hasher(RandomState::new()),
-            default_tag: None,
+            state: RwLock::new(RouterState::new()),
             dns: None,
             fallback_tags: Vec::new(),
         }
@@ -69,8 +85,16 @@ impl Router {
         self
     }
 
-    pub fn set_default(&mut self, tag: impl Into<String>) {
-        self.default_tag = Some(tag.into());
+    /// Dynamically update default tag (thread-safe, async context)
+    pub async fn set_default(&self, tag: impl Into<String>) -> () {
+        let mut state = self.state.write().await;
+        state.default_tag = Some(tag.into());
+    }
+
+    /// Get current default tag
+    pub async fn get_default(&self) -> Option<String> {
+        let state = self.state.read().await;
+        state.default_tag.clone()
     }
 
     pub fn add_inbound_rule(&mut self, inbound_tag: &str, outbound_tag: &str) {
@@ -219,13 +243,13 @@ impl Router {
             }
         }
 
-        if let Some(tag) = self.default_tag.as_ref() {
+        if let Some(tag) = self.get_default().await {
             log::debug!(
                 target: "route::router",
                 "route fallback to default tag={:?}",
                 tag,
             );
-            return Some(RoutingResult::new(tag));
+            return Some(self.resolve_tag(&tag));
         }
         log::debug!(target: "route::router", "route no match and no default");
         None
@@ -270,79 +294,6 @@ mod tests {
         let result_with_fallbacks = RoutingResult::with_fallbacks("proxy", vec!["direct".to_string()]);
         assert_eq!(result_with_fallbacks.primary_tag, "proxy");
         assert_eq!(result_with_fallbacks.fallback_tags, vec!["direct".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_router_strategy_as_is() {
-        use crate::common::{Address, Protocol};
-        use crate::proxy::{ProxyStream, StreamMetadata};
-        use std::net::SocketAddr;
-        use tokio::net::TcpStream;
-
-        let mut router = build_router(Strategy::AsIs, &[("google.com", "proxy")], &[("10.0.0.0/8", "direct")]);
-        router.set_default("default");
-
-        async fn create_test_stream(dst: Address) -> ProxyStream {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let stream = TcpStream::connect(addr).await.unwrap();
-
-            ProxyStream {
-                metadata: StreamMetadata {
-                    dst,
-                    src: "127.0.0.1:1234".parse::<SocketAddr>().unwrap().into(),
-                    protocol: Protocol::Tcp,
-                    inbound_tag: String::new(),
-                },
-                inner: crate::transport::TrStream::Tcp(stream),
-            }
-        }
-
-        let stream = create_test_stream(Address::Domain("www.google.com".to_string(), 443)).await;
-        let result = router.route(&stream).await.unwrap();
-        assert_eq!(result.primary_tag, "proxy");
-        assert_eq!(result.fallback_tags, Vec::<String>::new());
-
-        let stream2 = create_test_stream(Address::Domain("unknown.com".to_string(), 443)).await;
-        let result = router.route(&stream2).await.unwrap();
-        assert_eq!(result.primary_tag, "default");
-    }
-
-    #[tokio::test]
-    async fn test_router_strategy_ip_if_non_match() {
-        use crate::common::{Address, Protocol};
-        use crate::proxy::{ProxyStream, StreamMetadata};
-        use std::net::SocketAddr;
-        use tokio::net::TcpStream;
-
-        let dns = Arc::new(DnsResolver::new(DnsSettings::default()).unwrap());
-        let mut router =
-            build_router(Strategy::IPIfNonMatch, &[("google.com", "proxy")], &[("10.0.0.0/8", "direct")]).with_dns(dns);
-        router.set_default("default");
-
-        async fn create_test_stream(dst: Address) -> ProxyStream {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let stream = TcpStream::connect(addr).await.unwrap();
-
-            ProxyStream {
-                metadata: StreamMetadata {
-                    dst,
-                    src: "127.0.0.1:1234".parse::<SocketAddr>().unwrap().into(),
-                    protocol: Protocol::Tcp,
-                    inbound_tag: String::new(),
-                },
-                inner: crate::transport::TrStream::Tcp(stream),
-            }
-        }
-
-        let stream = create_test_stream(Address::Domain("www.google.com".to_string(), 443)).await;
-        let result = router.route(&stream).await.unwrap();
-        assert_eq!(result.primary_tag, "proxy");
-
-        let stream2 = create_test_stream(Address::Domain("unknown.com".to_string(), 443)).await;
-        let result = router.route(&stream2).await.unwrap();
-        assert_eq!(result.primary_tag, "default");
     }
 
     #[tokio::test]

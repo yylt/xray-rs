@@ -15,6 +15,18 @@ pub enum ConnectionSink {
     Daemon(DaemonSink),
 }
 
+impl std::fmt::Debug for ConnectionSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionSink::Direct(_) => write!(f, "ConnectionSink::Direct(<...>)")?,
+            ConnectionSink::Proxy(_) => write!(f, "ConnectionSink::Proxy(<...>)")?,
+            ConnectionSink::Block => write!(f, "ConnectionSink::Block")?,
+            ConnectionSink::Daemon(_) => write!(f, "ConnectionSink::Daemon(<...>)")?,
+        }
+        Ok(())
+    }
+}
+
 impl ConnectionSink {
     /// 处理一条 ProxyStream
     pub async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
@@ -51,7 +63,7 @@ impl DirectSink {
         let dst = self.resolve(&stream.metadata.dst).await?;
         match stream.metadata.protocol {
             Protocol::Tcp => {
-                let remote = self.transport.connect(&dst, Protocol::Tcp).await?;
+                let remote = self.transport.connect(&dst, Protocol::Tcp, None).await?;
                 forwarder.forward(stream.inner, remote).await?;
                 Ok(())
             }
@@ -61,7 +73,7 @@ impl DirectSink {
 
     async fn handle_udp(&self, stream: ProxyStream, dst: Address) -> std::io::Result<()> {
         let mut inbound = stream.inner;
-        let mut remote = self.transport.connect(&dst, Protocol::Udp).await?;
+        let mut remote = self.transport.connect(&dst, Protocol::Udp, None).await?;
 
         let remote_socket = match &mut remote {
             transport::TrStream::Udp(socket) => socket,
@@ -114,7 +126,6 @@ impl DirectSink {
     }
 }
 
-/// 代理出口：通过 trojan/socks 代理连接目标
 pub struct ProxySink {
     pub outbounder: Outbounder,
 }
@@ -131,11 +142,10 @@ impl ProxySink {
     /// 尝试建立到目标地址的代理连接（不消费 inbound stream）
     /// 用于支持 fallback 重试：只有连接成功后才消费 stream
     pub async fn try_connect(&self, dst: &Address, protocol: crate::common::Protocol) -> std::io::Result<TrStream> {
-        self.outbounder.connect(dst, protocol).await
+        self.outbounder.connect(dst, protocol, None).await
     }
 }
 
-/// Daemon mode sink: for protocols like Revers that run as background daemons
 pub struct DaemonSink {
     pub outbounder: Outbounder,
 }

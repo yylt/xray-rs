@@ -13,7 +13,8 @@ serde_json = "1.0"
 serde_yaml = { version = "0.9.34", features = [] }
 uuid = { version = "1.22", features = ["std", "v4"] }
 mimalloc = { version = "0.1.48", optional = true }
-
+parking_lot = { version = "0.12.5" }
+base64 = { version = "0.22.1" }
 # runtime
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
 hickory-resolver = { version = "0.25.2", default-features = false, features = [
@@ -35,12 +36,11 @@ x509-parser= "0.18.1"
 tun = { version = "0.8.6", features = ["async"], optional = true }
 etherparse = "0.19.0"
 tikv-jemallocator = { version = "0.6", optional = true }
-libc = "0.2"
 socket2 = "0.6"
 hyper-util = "0.1"
 http-body-util = "0.1"
 http = "1.4"
-hyper = "1.8"
+hyper = { version = "1.8", features = ["server", "http1"] }
 tonic = { version = "0.14.2", features = ["gzip"] }
 tonic-prost = "0.14"
 prost = "0.14"
@@ -55,6 +55,7 @@ thiserror = "2.0"
 hickory-proto = "0.25"
 lru = "0.16"
 ipnet = "2.12"
+url = "2.5"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 pin-project-lite = "0.2.17"
 
