@@ -1,61 +1,26 @@
+use super::*;
 use ahash::RandomState;
+use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
 
-use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::xfer::Protocol;
-use hickory_resolver::TokioResolver;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSettings {
+    #[serde(rename = "hosts", default)]
+    pub hosts: Vec<String>,
 
-use super::DnsSettings;
-
-/// DNS 缓存条目
-#[derive(Debug)]
-struct CacheEntry {
-    ips: Vec<IpAddr>,
-    expires: Instant,
+    #[serde(rename = "servers", default)]
+    pub servers: Vec<String>,
 }
 
-/// DNS 缓存
-#[derive(Debug)]
-struct DnsCache {
-    entries: RwLock<HashMap<String, CacheEntry, RandomState>>,
-    ttl: Duration,
-}
-
-impl DnsCache {
-    fn new(ttl: Duration) -> Self {
+impl Default for DnsSettings {
+    fn default() -> Self {
         Self {
-            entries: RwLock::new(HashMap::with_hasher(RandomState::new())),
-            ttl,
+            hosts: vec![],
+            servers: vec![],
         }
-    }
-
-    fn get(&self, domain: &str) -> Option<Vec<IpAddr>> {
-        let map = self.entries.read().unwrap();
-        map.get(domain).and_then(|entry| {
-            if Instant::now() < entry.expires {
-                Some(entry.ips.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    fn insert(&self, domain: &str, ips: Vec<IpAddr>) {
-        if self.ttl.as_secs() == 0 {
-            return;
-        }
-        let mut map = self.entries.write().unwrap();
-        map.insert(
-            domain.to_string(),
-            CacheEntry {
-                ips,
-                expires: Instant::now() + self.ttl,
-            },
-        );
     }
 }
 
@@ -63,7 +28,6 @@ impl DnsCache {
 #[derive(Debug)]
 struct DnsServerInstance {
     resolver: TokioResolver,
-    server_type: String,
 }
 
 /// DNS 解析器
@@ -71,7 +35,6 @@ struct DnsServerInstance {
 pub struct DnsResolver {
     hosts: HashMap<String, Vec<IpAddr>, RandomState>,
     resolvers: Vec<DnsServerInstance>,
-    cache: DnsCache,
 }
 
 impl DnsResolver {
@@ -112,92 +75,27 @@ impl DnsResolver {
             }
         }
 
-        let cache_ttl = if settings.disable_cache {
-            Duration::from_secs(0)
-        } else {
-            Duration::from_secs(300)
-        };
-
-        log::info!("DNS resolver initialized: {} hosts, {} resolvers", hosts.len(), resolvers.len());
-
-        Ok(Self {
-            hosts,
-            resolvers,
-            cache: DnsCache::new(cache_ttl),
-        })
+        Ok(Self { hosts, resolvers })
     }
 
-    /// 创建 resolver 实例（会复用连接）
     fn create_resolver(server: &str) -> std::io::Result<DnsServerInstance> {
         use std::net::SocketAddr;
 
-        if server.starts_with("tcp://") {
-            // TCP DNS
-            let addr_str = &server[6..];
-            let addr: SocketAddr = addr_str
-                .parse()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // UDP/TCP DNS
+        let addr: SocketAddr = server
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-            let mut config = ResolverConfig::new();
-            config.add_name_server(NameServerConfig::new(addr, Protocol::Tcp));
+        let name_server =
+            NameServerConfig::new(addr.ip(), true, vec![ConnectionConfig::tcp(), ConnectionConfig::udp()]);
+        let config = ResolverConfig::from_parts(None, vec![], vec![name_server]);
 
-            let resolver = TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
-                .with_options(ResolverOpts::default())
-                .build();
+        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(ResolverOpts::default())
+            .build()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-            Ok(DnsServerInstance {
-                resolver,
-                server_type: format!("TCP({})", addr_str),
-            })
-        } else if server.starts_with("https://") {
-            // DoH - hickory-resolver 0.24 支持预设的 DNS 服务
-            let config = if server.contains("dns.google") {
-                ResolverConfig::google()
-            } else if server.contains("cloudflare-dns.com") || server.contains("1.1.1.1") {
-                ResolverConfig::cloudflare()
-            } else if server.contains("doh.pub") {
-                // doh.pub 使用 Cloudflare 的配置（都是标准 DoH）
-                ResolverConfig::cloudflare()
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    format!("Custom DoH server not supported in hickory-resolver 0.24: {}", server),
-                ));
-            };
-
-            let resolver = TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
-                .with_options(ResolverOpts::default())
-                .build();
-
-            Ok(DnsServerInstance {
-                resolver,
-                server_type: format!("DoH({})", server),
-            })
-        } else if server.starts_with("tls://") {
-            // DoT - hickory-resolver 0.24 可能不直接支持 DoT
-            // 暂时返回不支持错误
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!("DoT (DNS over TLS) not yet supported in hickory-resolver 0.24: {}", server),
-            ));
-        } else {
-            // UDP DNS
-            let addr: SocketAddr = server
-                .parse()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-            let mut config = ResolverConfig::new();
-            config.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
-
-            let resolver = TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
-                .with_options(ResolverOpts::default())
-                .build();
-
-            Ok(DnsServerInstance {
-                resolver,
-                server_type: format!("UDP({})", server),
-            })
-        }
+        Ok(DnsServerInstance { resolver })
     }
 
     fn load_hosts_file(path: &str) -> std::io::Result<HashMap<String, Vec<IpAddr>, RandomState>> {
@@ -232,26 +130,17 @@ impl DnsResolver {
     }
 
     pub async fn resolve(&self, domain: &str) -> std::io::Result<Vec<IpAddr>> {
-        let domain_lower = domain.to_lowercase();
-
-        // 1. 检查 hosts
-        if let Some(ips) = self.hosts.get(&domain_lower) {
+        // 检查 hosts
+        if let Some(ips) = self.hosts.get(domain) {
             log::debug!("DNS: {} resolved from hosts: {:?}", domain, ips);
             return Ok(ips.clone());
         }
 
-        // 2. 检查缓存
-        if let Some(ips) = self.cache.get(&domain_lower) {
-            log::debug!("DNS: {} resolved from cache: {:?}", domain, ips);
-            return Ok(ips);
-        }
-
-        // 3. 查询 DNS servers（如果配置了）
+        //  查询 DNS servers
         if !self.resolvers.is_empty() {
             match self.query_servers_concurrent(domain).await {
                 Ok(ips) => {
                     log::debug!("DNS: {} resolved from servers: {:?}", domain, ips);
-                    self.cache.insert(&domain_lower, ips.clone());
                     return Ok(ips);
                 }
                 Err(e) => {
@@ -261,7 +150,7 @@ impl DnsResolver {
             }
         }
 
-        // 4. 使用系统 resolver
+        // 系统 resolver
         log::debug!("DNS: {} using system resolver", domain);
         let addrs: Vec<IpAddr> = tokio::net::lookup_host(format!("{}:0", domain))
             .await
@@ -276,83 +165,36 @@ impl DnsResolver {
             ));
         }
 
-        self.cache.insert(&domain_lower, addrs.clone());
         Ok(addrs)
     }
 
-    /// 并发查询所有 DNS servers，返回最快的响应（使用 JoinSet）
     async fn query_servers_concurrent(&self, domain: &str) -> std::io::Result<Vec<IpAddr>> {
-        use tokio::task::JoinSet;
-        use tokio::time::{timeout, Duration};
+        use futures::stream::{FuturesUnordered, StreamExt};
 
-        let mut set = JoinSet::new();
-        let query_timeout = Duration::from_secs(5);
+        let mut futures = FuturesUnordered::new();
 
-        // 为每个 resolver 添加查询任务
         for instance in &self.resolvers {
-            let resolver = instance.resolver.clone();
-            let domain = domain.to_string();
-            let server_type = instance.server_type.clone();
-
-            set.spawn(async move {
-                log::debug!("DNS: querying {} for {}", server_type, domain);
-                let result = resolver
-                    .lookup_ip(&domain)
-                    .await
-                    .map(|response| response.iter().collect::<Vec<IpAddr>>())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-
-                if let Ok(ref ips) = result {
-                    log::debug!("DNS: {} returned {} addresses for {}", server_type, ips.len(), domain);
-                } else if let Err(ref e) = result {
-                    log::debug!("DNS: {} failed for {}: {}", server_type, domain, e);
-                }
-
-                result
-            });
+            futures.push(async move { instance.resolver.lookup_ip(domain).await });
         }
 
-        // 等待第一个成功的响应
-        let mut last_error = None;
+        let mut last_err = None;
 
-        let result = timeout(query_timeout, async {
-            while let Some(result) = set.join_next().await {
-                match result {
-                    Ok(Ok(ips)) if !ips.is_empty() => {
-                        // 成功获取结果，中止其他任务
-                        set.abort_all();
-                        return Ok(ips);
-                    }
-                    Ok(Ok(_)) => {
-                        // 空结果，继续等待
-                        continue;
-                    }
-                    Ok(Err(e)) => {
-                        last_error = Some(e);
-                        continue;
-                    }
-                    Err(e) => {
-                        last_error = Some(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Task join error: {}", e),
-                        ));
-                        continue;
+        while let Some(result) = futures.next().await {
+            match result {
+                Ok(lookup) => {
+                    let records: Vec<IpAddr> = lookup.iter().collect();
+                    if !records.is_empty() {
+                        return Ok(records);
                     }
                 }
-            }
-
-            Err(last_error
-                .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "all DNS servers failed")))
-        })
-        .await;
-
-        match result {
-            Ok(r) => r,
-            Err(_) => {
-                // 超时，中止所有任务
-                set.abort_all();
-                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS query timeout"))
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
+
+        Err(last_err
+            .map(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No records found")))
     }
 }

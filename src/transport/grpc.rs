@@ -15,6 +15,8 @@ use std::{
     time::Duration,
 };
 
+use futures::ready;
+use log::{debug, error, warn};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::mpsc,
@@ -22,16 +24,11 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
-use tower::ServiceExt;
-
-use log::{debug, error, warn};
 
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
-const DEFAULT_CONCURRENT_LIMIT: usize = 256;
-const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 10;
-const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = false;
-const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 60;
-const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65535;
+const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
+const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = true;
+const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,17 +42,11 @@ pub struct GrpcSettings {
     #[serde(rename = "authority")]
     authority: Option<String>,
 
-    #[serde(rename = "concurrentLimit")]
-    concurrent_limit: Option<usize>,
-
     #[serde(rename = "userAgent")]
     user_agent: Option<String>,
 
     #[serde(rename = "bufByteSize")]
     buf_byte_size: Option<usize>,
-
-    #[serde(rename = "initialWindowsSize")]
-    initial_windows_size: Option<u32>,
 
     #[serde(
         rename = "http2KeepAliveInterval",
@@ -238,10 +229,7 @@ impl Grpc {
                 .map_err(|err| Error::new(ErrorKind::InvalidInput, err.to_string()))?;
         }
         ep = ep
-            .concurrency_limit(self.route_config.concurrent_limit)
             .http2_keep_alive_interval(self.route_config.http2_keep_alive_interval)
-            .initial_stream_window_size(self.route_config.initial_window_size)
-            .initial_connection_window_size(self.route_config.initial_connection_window_size)
             .keep_alive_while_idle(self.route_config.http2_keep_alive_while_idle)
             .buffer_size(self.route_config.buf_byte_size)
             .http2_adaptive_window(true);
@@ -300,11 +288,6 @@ impl Grpc {
         outgoing_rx: mpsc::Receiver<Bytes>,
         incoming_tx: mpsc::Sender<Bytes>,
     ) {
-        debug!(
-            "[gRPC][client] starting stream mode={} path={}",
-            if is_multi { "multi" } else { "single" },
-            path
-        );
         if is_multi {
             Self::run_multi_stream(path, grpc_client, outgoing_rx, incoming_tx).await;
         } else {
@@ -341,10 +324,7 @@ impl Grpc {
                                 }
                             }
                         }
-                        None => {
-                            debug!("[gRPC][client] remote closed stream mode=multi path={}", path_for_log);
-                            return;
-                        }
+                        None => return,
                     }
                 }
             }
@@ -381,10 +361,7 @@ impl Grpc {
                                 return;
                             }
                         }
-                        None => {
-                            debug!("[gRPC][client] remote closed stream mode=single path={}", path_for_log);
-                            return;
-                        }
+                        None => return,
                     }
                 }
             }
@@ -415,14 +392,14 @@ impl Grpc {
     }
 
     async fn open_stream_via_target_key(&self, key: &super::balancer::GrpcTargetKey) -> IoResult<GrpcStream> {
+        // 尝试从缓存获取通道
         if let Some(channel) = self.balancer.cached_channel(key).await {
-            let mut readiness = channel.clone();
-            if readiness.ready().await.is_ok() {
-                return self.open_stream_on_channel(channel).await;
+            match self.open_stream_on_channel(channel).await {
+                Ok(stream) => return Ok(stream),
+                Err(_e) => self.balancer.remove_cached_channel(key).await,
             }
-            self.balancer.remove_cached_channel(key).await;
         }
-
+        // 建立新通道并缓存
         let target = ConnectionTarget::from_balancer_key(key);
         let channel = self.connect_channel_new(&target).await?;
         let channel = self
@@ -676,7 +653,6 @@ where
 {
     async fn start_stream(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>), tonic::Status> {
         let (grpc_stream, incoming_tx, outgoing_rx) = make_service(self.buf_byte_size);
-        debug!("[gRPC][server] handoff stream peer={:?}", self.peer_addr);
         self.stream_tx
             .send((grpc_stream, self.peer_addr.clone()))
             .await
@@ -688,7 +664,6 @@ where
     }
 
     fn spawn_reader(&self, mut request_stream: tonic::Streaming<M>, incoming_tx: mpsc::Sender<Bytes>) {
-        let peer_addr = self.peer_addr.clone();
         tokio::spawn(async move {
             while let Some(message) = request_stream.next().await {
                 match message {
@@ -704,7 +679,6 @@ where
                     }
                 }
             }
-            debug!("[gRPC][server] request stream ended peer={:?}", peer_addr);
         });
     }
 
@@ -764,8 +738,6 @@ where
 {
     use hyper::service::service_fn;
 
-    debug!("[gRPC][server] accepted connection peer={:?}", peer_addr);
-
     let service_peer_addr = peer_addr.clone();
     let service = service_fn(move |req: http::Request<hyper::body::Incoming>| {
         let route_config = route_config.clone();
@@ -786,11 +758,6 @@ where
                     )
                 }
                 ServerRoute::Tun => {
-                    debug!(
-                        "[gRPC][server] matched route=Tun peer={:?} path={}",
-                        peer_addr,
-                        req.uri().path()
-                    );
                     let service = TunGrpcService::<Hunk> {
                         peer_addr,
                         stream_tx,
@@ -800,11 +767,6 @@ where
                     Ok::<_, std::convert::Infallible>(service.handle(req).await)
                 }
                 ServerRoute::TunMulti => {
-                    debug!(
-                        "[gRPC][server] matched route=TunMulti peer={:?} path={}",
-                        peer_addr,
-                        req.uri().path()
-                    );
                     let service = TunGrpcService::<MultiHunk> {
                         peer_addr,
                         stream_tx,
@@ -850,20 +812,13 @@ where
     Ok(())
 }
 
-pub struct GrpcStream {
-    read_buf: BytesMut,
-    incoming_rx: Option<mpsc::Receiver<Bytes>>,
-    outgoing_tx: Option<PollSender<Bytes>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-    target_state: Option<Arc<super::balancer::TargetState>>,
-}
-
 fn make_service(_buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
 
     let stream_service = GrpcStream {
-        read_buf: BytesMut::new(),
+        read_buf: Bytes::new(),
+        write_buf: BytesMut::with_capacity(8192),
         incoming_rx: Some(incoming_rx),
         outgoing_tx: Some(PollSender::new(outgoing_tx)),
         task: None,
@@ -878,11 +833,8 @@ struct RouteConfig {
     authority: Option<String>,
     path: http::uri::PathAndQuery,
     multi_mode: bool,
-    concurrent_limit: usize,
     user_agent: Option<String>,
     buf_byte_size: usize,
-    initial_window_size: u32,
-    initial_connection_window_size: u32,
     http2_keep_alive_interval: Duration,
     http2_keep_alive_while_idle: bool,
     tun_path: http::uri::PathAndQuery,
@@ -957,11 +909,8 @@ impl From<&GrpcSettings> for RouteConfig {
             authority: settings.authority.clone(),
             path,
             multi_mode,
-            concurrent_limit: settings.concurrent_limit.unwrap_or(DEFAULT_CONCURRENT_LIMIT),
             user_agent: settings.user_agent.clone(),
             buf_byte_size: settings.buf_byte_size.unwrap_or(DEFAULT_BUFFER_SIZE),
-            initial_window_size: settings.initial_windows_size.unwrap_or(DEFAULT_INITIAL_WINDOW_SIZE),
-            initial_connection_window_size: settings.initial_windows_size.unwrap_or(DEFAULT_INITIAL_WINDOW_SIZE),
             http2_keep_alive_interval: settings
                 .http2_keep_alive_interval
                 .unwrap_or(Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS)),
@@ -972,6 +921,15 @@ impl From<&GrpcSettings> for RouteConfig {
             multi_tun_path,
         }
     }
+}
+
+pub struct GrpcStream {
+    read_buf: Bytes,
+    write_buf: BytesMut,
+    incoming_rx: Option<mpsc::Receiver<Bytes>>,
+    outgoing_tx: Option<PollSender<Bytes>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    target_state: Option<Arc<super::balancer::TargetState>>,
 }
 
 impl Drop for GrpcStream {
@@ -995,15 +953,15 @@ impl AsyncRead for GrpcStream {
             self.read_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
-
         if let Some(ref mut incoming_rx) = self.incoming_rx {
             match Pin::new(incoming_rx).poll_recv(cx) {
-                Poll::Ready(Some(data)) => {
+                Poll::Ready(Some(mut data)) => {
                     let to_copy = std::cmp::min(data.len(), buf.remaining());
                     buf.put_slice(&data[..to_copy]);
 
                     if to_copy < data.len() {
-                        self.read_buf.extend_from_slice(&data[to_copy..]);
+                        data.advance(to_copy);
+                        self.read_buf = data;
                     }
                     Poll::Ready(Ok(()))
                 }
@@ -1018,26 +976,43 @@ impl AsyncRead for GrpcStream {
 
 impl AsyncWrite for GrpcStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
-        if let Some(ref mut outgoing_tx) = self.outgoing_tx {
-            match Pin::new(&mut *outgoing_tx).poll_reserve(cx) {
-                Poll::Ready(Ok(())) => {
-                    let size = buf.len();
-                    let _ = outgoing_tx.send_item(Bytes::copy_from_slice(buf));
-                    Poll::Ready(Ok(size))
-                }
-                Poll::Ready(Err(_)) => Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "write side closed"))),
-                Poll::Pending => Poll::Pending,
+        if self.write_buf.len() >= 1048576 {
+            if self.as_mut().poll_flush(cx)?.is_pending() {
+                return Poll::Pending;
             }
-        } else {
-            Poll::Ready(Err(Error::new(ErrorKind::NotConnected, "write buffer not initialized")))
         }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        self.write_buf.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        let this = self.get_mut();
+
+        let tx = match this.outgoing_tx.as_mut() {
+            Some(tx) => tx,
+            None => return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "closed"))),
+        };
+
+        while !this.write_buf.is_empty() {
+            match Pin::new(&mut *tx).poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    let data = this.write_buf.split().freeze();
+                    if tx.send_item(data).is_err() {
+                        return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "send failed")));
+                    }
+                }
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "sender closed"))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        ready!(self.as_mut().poll_flush(cx))?;
         self.outgoing_tx.take();
         Poll::Ready(Ok(()))
     }

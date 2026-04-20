@@ -1,70 +1,48 @@
-use ahash::AHashMap;
+use fst::{Map, MapBuilder};
+use std::collections::{BTreeMap, HashMap};
 
 pub type TagId = u32;
-pub type LabelId = u32;
-pub type NodeIndex = u32;
-
-#[derive(Default)]
-struct BuilderNode {
-    // LabelId -> 下一个节点的索引
-    children: AHashMap<LabelId, NodeIndex>,
-    tag_id: Option<TagId>,
-}
-
-pub struct DomainSuffixTrie {
-    nodes: Vec<BuilderNode>,
-    tags: Box<[Box<str>]>,
-    label_map: AHashMap<Box<str>, LabelId>,
-}
 
 pub struct DomainSuffixTrieBuilder {
-    nodes: Vec<BuilderNode>,
-    label_to_id: AHashMap<Box<str>, LabelId>,
-    id_to_label: Vec<Box<str>>,
-    tag_to_id: AHashMap<Box<str>, TagId>,
+    items: BTreeMap<Vec<u8>, TagId>,
+    tag_to_id: HashMap<Box<str>, TagId>,
     id_to_tag: Vec<Box<str>>,
 }
 
 impl DomainSuffixTrieBuilder {
     pub fn new() -> Self {
         Self {
-            nodes: vec![BuilderNode::default()],
-            label_to_id: AHashMap::new(),
-            id_to_label: Vec::new(),
-            tag_to_id: AHashMap::new(),
+            items: BTreeMap::new(),
+            tag_to_id: HashMap::new(),
             id_to_tag: Vec::new(),
         }
     }
 
-    pub fn insert(&mut self, domain: &str, tag: &str) {
-        let tag_id = self.intern_tag(tag);
-        let mut current_idx = 0;
+    /// 核心逻辑：将域名反转并转换为字节序列
+    #[inline]
+    fn reverse_domain_bytes(domain: &str) -> Vec<u8> {
+        let mut parts: Vec<&str> = domain.trim_matches('.').split('.').collect();
+        parts.reverse();
 
-        for label_str in domain.trim_matches('.').rsplit('.') {
-            let label_id = self.intern_label(label_str);
+        // 预计算长度，减少分配次数
+        let len = parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_sub(1);
+        let mut result = Vec::with_capacity(len);
 
-            if let Some(&next_idx) = self.nodes[current_idx].children.get(&label_id) {
-                current_idx = next_idx as usize;
-            } else {
-                let next_idx = self.nodes.len() as NodeIndex;
-                self.nodes[current_idx].children.insert(label_id, next_idx);
-                self.nodes.push(BuilderNode::default());
-                current_idx = next_idx as usize;
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                result.push(b'.');
             }
+            result.extend_from_slice(part.as_bytes());
         }
-
-        self.nodes[current_idx].tag_id = Some(tag_id);
+        result
     }
 
-    fn intern_label(&mut self, label: &str) -> LabelId {
-        if let Some(&id) = self.label_to_id.get(label) {
-            return id;
-        }
-        let id = self.id_to_label.len() as LabelId;
-        let boxed: Box<str> = label.to_lowercase().into();
-        self.label_to_id.insert(boxed.clone(), id);
-        self.id_to_label.push(boxed);
-        id
+    pub fn insert(&mut self, domain: &str, tag: &str) {
+        let tag_id = self.intern_tag(tag);
+        let reversed_bytes = Self::reverse_domain_bytes(domain);
+
+        // 直接存入 BTreeMap，保持字节序排列
+        self.items.insert(reversed_bytes, tag_id);
     }
 
     fn intern_tag(&mut self, tag: &str) -> TagId {
@@ -78,37 +56,150 @@ impl DomainSuffixTrieBuilder {
         id
     }
 
-    pub fn build(self) -> DomainSuffixTrie {
-        DomainSuffixTrie {
-            nodes: self.nodes,
-            tags: self.id_to_tag.into_boxed_slice(),
-            label_map: self.label_to_id,
+    pub fn build(self) -> Result<DomainSuffixTrie, fst::Error> {
+        let mut builder = MapBuilder::memory();
+
+        // BTreeMap 保证了迭代时的字节序是有序的，满足 FST 的插入要求
+        for (key, value) in self.items {
+            builder.insert(key, value as u64)?;
         }
+
+        let map_data = builder.into_inner()?;
+        Ok(DomainSuffixTrie {
+            map: Map::new(map_data)?,
+            id_to_tag: self.id_to_tag.into_boxed_slice(),
+        })
     }
 }
 
+#[derive(Debug)]
+pub struct DomainSuffixTrie {
+    // 核心 FST 存储
+    map: Map<Vec<u8>>,
+    // 标签索引表
+    id_to_tag: Box<[Box<str>]>,
+}
+
 impl DomainSuffixTrie {
-    pub fn lookup(&self, domain: &str) -> Option<&str> {
-        let mut current_idx = 0;
-        let mut best_tag = self.nodes[0].tag_id;
+    pub fn new() -> Self {
+        let empty_map = Map::new(Vec::new()).unwrap();
+        Self {
+            map: empty_map,
+            id_to_tag: Box::new([]),
+        }
+    }
+    fn lookup_big(&self, domain: &str) -> Option<&str> {
+        // 预处理
+        let domain = domain.trim_matches('.').to_ascii_lowercase();
+        if domain.is_empty() {
+            return None;
+        }
 
-        for label_str in domain.trim_matches('.').rsplit('.') {
-            let label_id = match self.label_map.get(label_str) {
-                Some(&id) => id,
-                None => return best_tag.map(|id| self.tags[id as usize].as_ref()),
-            };
+        let rev_labels: Vec<&str> = domain.rsplit('.').collect();
+        let rev_domain = rev_labels.join(".");
+        let rev_bytes = rev_domain.as_bytes();
 
-            // 2. 根据 LabelId 往下走
-            if let Some(&next_idx) = self.nodes[current_idx].children.get(&label_id) {
-                current_idx = next_idx as usize;
-                if let Some(t) = self.nodes[current_idx].tag_id {
-                    best_tag = Some(t);
+        let mut last_match = None;
+
+        // 扫描前缀匹配
+        for i in 0..rev_bytes.len() {
+            if i == rev_bytes.len() - 1 || rev_bytes[i + 1] == b'.' {
+                if let Some(id) = self.map.get(&rev_bytes[..=i]) {
+                    last_match = Some(id);
                 }
-            } else {
-                break;
+            }
+        }
+        last_match.and_then(|id| self.id_to_tag.get(id as usize).map(|s| s.as_ref()))
+    }
+
+    pub fn lookup(&self, domain: &str) -> Option<&str> {
+        let domain = domain.trim_matches('.');
+        if domain.is_empty() {
+            return None;
+        }
+
+        // 使用栈分配的小缓冲区（适配常见长度的域名）
+        let mut buf = [0u8; 256];
+        let bytes = domain.as_bytes();
+        let len = bytes.len();
+
+        if len > 256 {
+            return self.lookup_big(domain);
+        } // 极长域名降级处理
+
+        let mut pos = 0;
+        for part in domain.rsplit('.') {
+            if pos > 0 {
+                buf[pos] = b'.';
+                pos += 1;
+            }
+            let part_bytes = part.as_bytes();
+            let end = pos + part_bytes.len();
+            buf[pos..end].copy_from_slice(part_bytes);
+            pos = end;
+        }
+
+        let search_target = &buf[..pos];
+        let mut last_match = None;
+
+        for i in 0..search_target.len() {
+            if i == search_target.len() - 1 || search_target[i + 1] == b'.' {
+                if let Some(id) = self.map.get(&search_target[..=i]) {
+                    last_match = Some(id);
+                }
             }
         }
 
-        best_tag.map(|id| self.tags[id as usize].as_ref())
+        last_match.and_then(|id| self.id_to_tag.get(id as usize).map(|s| s.as_ref()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_trie_lookup_miss() {
+        // 空初始化测试：创建空的 trie，查询任意域名应返回 None
+        let builder = DomainSuffixTrieBuilder::new();
+        let trie = builder.build().unwrap();
+
+        assert!(trie.lookup("example.com").is_none(), "空 trie 查询应返回 None");
+        assert!(trie.lookup("sub.example.com").is_none());
+        assert!(trie.lookup("any.domain.test").is_none());
+    }
+
+    #[test]
+    fn test_lookup_match() {
+        // 匹配测试：插入域名规则后，查询匹配域名应命中
+        let mut builder = DomainSuffixTrieBuilder::new();
+        builder.insert("example.com", "example_tag");
+        builder.insert("test.org", "test_tag");
+        let trie = builder.build().unwrap();
+
+        // 精确匹配
+        assert_eq!(trie.lookup("example.com"), Some("example_tag"), "精确域名应命中");
+        assert_eq!(trie.lookup("test.org"), Some("test_tag"));
+
+        // 子域名匹配（因为是后缀树，子域名应命中）
+        assert_eq!(trie.lookup("sub.example.com"), Some("example_tag"), "子域名应命中父规则");
+        assert_eq!(trie.lookup("deep.sub.example.com"), Some("example_tag"), "深层子域名也应命中");
+    }
+
+    #[test]
+    fn test_lookup_mismatch() {
+        // 不匹配测试：插入规则后，查询不相关域名应未命中
+        let mut builder = DomainSuffixTrieBuilder::new();
+        builder.insert("example.com", "example_tag");
+        let trie = builder.build().unwrap();
+
+        // 完全不相关域名
+        assert!(trie.lookup("other.com").is_none(), "不相关域名应未命中");
+        assert!(trie.lookup("example.org").is_none(), "不同 TLD 应未命中");
+        assert!(trie.lookup("test.com").is_none(), "不同二级域名应未命中");
+
+        // 边界情况
+        assert!(trie.lookup("exampl.com").is_none(), "近似域名应未命中");
+        assert!(trie.lookup("example.co").is_none(), "不同后缀应未命中");
     }
 }

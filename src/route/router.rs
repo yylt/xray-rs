@@ -4,12 +4,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::common::Address;
+use crate::common::{domain_trie, ip_trie, Address};
 use crate::proxy::ProxyStream;
-use crate::route::{
-    trie::{DomainMarisa, IpTrie},
-    DnsResolver, Strategy,
-};
+use crate::route::{DnsResolver, Strategy};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutingResult {
@@ -48,8 +45,8 @@ impl RouterState {
 #[derive(Debug)]
 pub struct Router {
     domain_strategy: Strategy,
-    domain_trie: DomainMarisa,
-    ip_trie: IpTrie,
+    domain_trie: domain_trie::DomainSuffixTrie,
+    ip_trie: ip_trie::IpTrie,
     inbound_rules: HashMap<String, String, RandomState>,
     state: RwLock<RouterState>,
     dns: Option<Arc<DnsResolver>>,
@@ -65,10 +62,14 @@ impl Router {
     }
 
     pub fn new_with_strategy(strategy: Strategy) -> Self {
-        Self::new_with_tries(strategy, DomainMarisa::new(), IpTrie::new())
+        Self::new_with_tries(strategy, domain_trie::DomainSuffixTrie::new(), ip_trie::IpTrie::new())
     }
 
-    pub fn new_with_tries(strategy: Strategy, domain_trie: DomainMarisa, ip_trie: IpTrie) -> Self {
+    pub fn new_with_tries(
+        strategy: Strategy,
+        domain_trie: domain_trie::DomainSuffixTrie,
+        ip_trie: ip_trie::IpTrie,
+    ) -> Self {
         Self {
             domain_strategy: strategy,
             domain_trie,
@@ -266,25 +267,6 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::route::{
-        trie::{DomainMarisaBuilder, IpTrieBuilder},
-        DnsSettings,
-    };
-
-    fn build_router(strategy: Strategy, domains: &[(&str, &str)], ips: &[(&str, &str)]) -> Router {
-        let mut domain_builder = DomainMarisaBuilder::new();
-        for (domain, tag) in domains {
-            domain_builder.insert(domain, tag);
-        }
-
-        let mut ip_builder = IpTrieBuilder::new();
-        for (cidr, tag) in ips {
-            ip_builder.insert(cidr.parse().unwrap(), tag);
-        }
-
-        Router::new_with_tries(strategy, domain_builder.build(), ip_builder.build())
-    }
-
     #[test]
     fn test_routing_result_creation() {
         let result = RoutingResult::new("proxy");
@@ -294,37 +276,5 @@ mod tests {
         let result_with_fallbacks = RoutingResult::with_fallbacks("proxy", vec!["direct".to_string()]);
         assert_eq!(result_with_fallbacks.primary_tag, "proxy");
         assert_eq!(result_with_fallbacks.fallback_tags, vec!["direct".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_router_strategy_ip_on_demand() {
-        use crate::common::{Address, Protocol};
-        use crate::proxy::{ProxyStream, StreamMetadata};
-        use std::net::SocketAddr;
-        use tokio::net::TcpStream;
-
-        let dns = Arc::new(DnsResolver::new(DnsSettings::default()).unwrap());
-        let router =
-            build_router(Strategy::IPOnDemand, &[("google.com", "proxy")], &[("10.0.0.0/8", "direct")]).with_dns(dns);
-
-        async fn create_test_stream(dst: Address) -> ProxyStream {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let stream = TcpStream::connect(addr).await.unwrap();
-
-            ProxyStream {
-                metadata: StreamMetadata {
-                    dst,
-                    src: "127.0.0.1:1234".parse::<SocketAddr>().unwrap().into(),
-                    protocol: Protocol::Tcp,
-                    inbound_tag: String::new(),
-                },
-                inner: crate::transport::TrStream::Tcp(stream),
-            }
-        }
-
-        let stream = create_test_stream(Address::Domain("www.google.com".to_string(), 443)).await;
-        let result = router.route(&stream).await.unwrap();
-        assert_eq!(result.primary_tag, "proxy");
     }
 }

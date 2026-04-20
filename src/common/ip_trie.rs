@@ -20,14 +20,14 @@ impl IpNode {
         }
     }
 }
-
+#[derive(Debug)]
 pub struct IpTrie {
     nodes: Vec<IpNode>,
     v4_root: NodeIndex,
     v6_root: NodeIndex,
     tags: Box<[Box<str>]>,
 }
-
+#[derive(Debug)]
 pub struct IpTrieBuilder {
     nodes: Vec<IpNode>,
     v4_root: NodeIndex,
@@ -128,6 +128,15 @@ impl IpTrieBuilder {
 }
 
 impl IpTrie {
+    pub fn new() -> Self {
+        Self {
+            nodes: vec![IpNode::new()],
+            v4_root: EMPTY_NODE,
+            v6_root: EMPTY_NODE,
+            tags: Box::new([]),
+        }
+    }
+
     pub fn lookup(&self, ip: IpAddr) -> Option<&str> {
         match ip {
             IpAddr::V4(v4) => self.lookup_bitwise(self.v4_root, u32::from(v4), 32),
@@ -167,5 +176,119 @@ impl IpTrie {
         }
 
         last_found_tag.map(|id| self.tags[id as usize].as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_empty_trie_lookup_miss() {
+        // 空初始化测试：创建空的 trie，查询应返回 None
+        let builder = IpTrieBuilder::new();
+        let trie = builder.build();
+
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        assert!(trie.lookup(ip).is_none(), "空 trie 查询应返回 None");
+    }
+
+    #[test]
+    fn test_lookup_match() {
+        // 匹配测试：插入 CIDR 规则后，查询该网段内 IP 应命中
+        let mut builder = IpTrieBuilder::new();
+        let cidr = "192.168.0.0/16".parse::<IpNet>().unwrap();
+        builder.insert(cidr, "local_network");
+        let trie = builder.build();
+
+        // 命中：同网段 IP
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(trie.lookup(ip), Some("local_network"), "同网段 IP 应命中");
+
+        // 边界：网络地址本身
+        let network_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0));
+        assert_eq!(trie.lookup(network_ip), Some("local_network"));
+
+        // 边界：广播地址（192.168.255.255）
+        let broadcast_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 255, 255));
+        assert_eq!(trie.lookup(broadcast_ip), Some("local_network"));
+    }
+
+    #[test]
+    fn test_lookup_mismatch() {
+        // 不匹配测试：插入规则后，查询其他网段 IP 应未命中
+        let mut builder = IpTrieBuilder::new();
+        let cidr = "192.168.0.0/16".parse::<IpNet>().unwrap();
+        builder.insert(cidr, "local_network");
+        let trie = builder.build();
+
+        // 未命中：不同网段 IP（10.x.x.x）
+        let ip_other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(trie.lookup(ip_other).is_none(), "不同网段 IP 应未命中");
+
+        // 未命中：另一不同网段（172.x.x.x）
+        let ip_another = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+        assert!(trie.lookup(ip_another).is_none());
+
+        // 边界：刚好在网段前一个地址
+        let before_network = IpAddr::V4(Ipv4Addr::new(192, 167, 255, 255));
+        assert!(trie.lookup(before_network).is_none());
+
+        // 边界：刚好在网段后一个地址
+        let after_network = IpAddr::V4(Ipv4Addr::new(192, 169, 0, 0));
+        assert!(trie.lookup(after_network).is_none());
+    }
+
+    #[test]
+    fn test_ipv6_empty_trie_lookup_miss() {
+        // IPv6 空初始化测试
+        let builder = IpTrieBuilder::new();
+        let trie = builder.build();
+
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        assert!(trie.lookup(ip).is_none(), "IPv6 空 trie 查询应返回 None");
+    }
+
+    #[test]
+    fn test_ipv6_lookup_match() {
+        // IPv6 匹配测试
+        let mut builder = IpTrieBuilder::new();
+        let cidr = "2001:db8::/32".parse::<IpNet>().unwrap();
+        builder.insert(cidr, "ipv6_network");
+        let trie = builder.build();
+
+        // 命中：同网段 IPv6
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1));
+        assert_eq!(trie.lookup(ip), Some("ipv6_network"), "IPv6 同网段应命中");
+
+        // 命中：网络地址本身
+        let network_ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0));
+        assert_eq!(trie.lookup(network_ip), Some("ipv6_network"));
+
+        // 命中：网段内其他地址
+        let another_ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0xffff, 0, 0, 0, 0xffff));
+        assert_eq!(trie.lookup(another_ip), Some("ipv6_network"));
+    }
+
+    #[test]
+    fn test_ipv6_lookup_mismatch() {
+        // IPv6 不匹配测试
+        let mut builder = IpTrieBuilder::new();
+        let cidr = "2001:db8::/32".parse::<IpNet>().unwrap();
+        builder.insert(cidr, "ipv6_network");
+        let trie = builder.build();
+
+        // 未命中：不同网段 IPv6
+        let other_ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 1));
+        assert!(trie.lookup(other_ip).is_none(), "IPv6 不同网段应未命中");
+
+        // 未命中：完全不同的前缀
+        let another_ip = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1));
+        assert!(trie.lookup(another_ip).is_none());
+
+        // 边界：刚好在网段后一个地址
+        let after_network = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0));
+        assert!(trie.lookup(after_network).is_none());
     }
 }

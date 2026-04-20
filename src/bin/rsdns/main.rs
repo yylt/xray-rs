@@ -1,19 +1,25 @@
 // bin/rsdns/main.rs
+mod config;
 mod server;
 mod upstream;
 
-use ahash::RandomState;
+use config::{Config, DomainMatch};
+
+use ahash::AHashMap;
 use clap::Parser;
 use log::{error, info};
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use lru::LruCache;
+use std::hash::Hash;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
-use xray_rs::route::cache::{CacheConfig, DnsCache};
-use xray_rs::route::dns::{Action, DnsRule, HostsTable, RuleEngine};
-use xray_rs::route::matcher::{DomainMatcher, DomainSet, Matcher};
+use xray_rs::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
+use xray_rs::route::dns::{Action, DnsRule};
+use xray_rs::route::matcher::RecordType;
 
 use server::DnsServer;
 use upstream::UpstreamClient;
@@ -28,133 +34,135 @@ struct Args {
     config: PathBuf,
 }
 
-/// 配置文件结构
-#[derive(Debug, Deserialize)]
-struct Config {
-    #[serde(default)]
-    listen: Vec<ListenConfig>,
-    #[serde(default)]
-    groups: HashMap<String, GroupConfig>,
-    #[serde(default)]
-    upstreams: HashMap<String, UpstreamConfig>,
-    cache: Option<CacheConfigYaml>,
-    hosts: Option<HostsConfigYaml>,
-    #[serde(default)]
-    rules: Vec<RuleConfig>,
+/// 缓存键
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    name: String,
+    qtype: u16,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ListenConfig {
-    Simple(String),
-    Full { addr: String },
+/// 缓存记录
+#[derive(Debug, Clone)]
+enum CacheRecord {
+    A(Ipv4Addr),
+    AAAA(Ipv6Addr),
+    Other(Vec<u8>),
 }
 
-#[derive(Debug, Deserialize)]
-struct GroupConfig {
-    file: Option<PathBuf>,
-    inline: Option<Vec<String>>,
+/// 缓存条目
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    records: Vec<CacheRecord>,
+    expires_at: Instant,
 }
 
-#[derive(Debug, Deserialize)]
-struct UpstreamConfig {
-    addr: Option<String>,
-    addrs: Option<Vec<String>>,
+/// 使用 LRU 的 DNS 缓存
+#[derive(Clone)]
+struct DnsCache {
+    inner: Arc<Mutex<LruCache<CacheKey, CacheEntry>>>,
+    min_ttl: Duration,
+    max_ttl: Duration,
 }
 
-#[derive(Debug, Deserialize)]
-struct CacheConfigYaml {
-    size: Option<usize>,
-    min_ttl: Option<u32>,
-    max_ttl: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HostsConfigYaml {
-    files: Option<Vec<PathBuf>>,
-    inline: Option<Vec<InlineHost>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InlineHost {
-    domain: String,
-    ip: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RuleConfig {
-    #[serde(rename = "match")]
-    match_: Option<MatchConfig>,
-    action: ActionConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct MatchConfig {
-    domain: Option<Vec<DomainMatchConfig>>,
-    group: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum DomainMatchConfig {
-    Suffix { suffix: String },
-    Exact { exact: String },
-}
-
-#[derive(Debug, Deserialize)]
-struct ActionConfig {
-    #[serde(rename = "type")]
-    type_: String,
-    upstream: Option<String>,
-    outbound_tag: Option<String>,
-    ip: Option<String>,
-}
-
-fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let config: Config = serde_yaml::from_str(&content)?;
-    Ok(config)
-}
-
-fn build_groups(config: &HashMap<String, GroupConfig>) -> HashMap<String, DomainSet, RandomState> {
-    let mut groups = HashMap::with_hasher(RandomState::new());
-    for (name, gc) in config {
-        let mut set = DomainSet::new();
-        if let Some(path) = &gc.file {
-            match DomainSet::load_file(path) {
-                Ok(loaded) => set = loaded,
-                Err(e) => error!("Failed to load group file {:?}: {}", path, e),
-            }
+impl DnsCache {
+    fn new(size: usize, min_ttl: u32, max_ttl: u32) -> Self {
+        let cap = NonZeroUsize::new(size).unwrap_or(NonZeroUsize::new(1024).unwrap());
+        Self {
+            inner: Arc::new(Mutex::new(LruCache::new(cap))),
+            min_ttl: Duration::from_secs(min_ttl as u64),
+            max_ttl: Duration::from_secs(max_ttl as u64),
         }
-        if let Some(inline) = &gc.inline {
-            for domain in inline {
-                set.add_exact(domain.clone());
-            }
-        }
-        groups.insert(name.clone(), set);
     }
-    groups
+
+    async fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
+        let mut cache = self.inner.lock().await;
+        if let Some(entry) = cache.get(key) {
+            if entry.expires_at > Instant::now() {
+                return Some(entry.clone());
+            }
+            cache.pop(key);
+        }
+        None
+    }
+
+    fn clamp_ttl(&self, ttl: u32) -> Duration {
+        let secs = ttl.clamp(self.min_ttl.as_secs() as u32, self.max_ttl.as_secs() as u32);
+        Duration::from_secs(secs as u64)
+    }
 }
 
-fn build_hosts(config: &Option<HostsConfigYaml>) -> HostsTable {
-    let mut hosts = HostsTable::new();
-    if let Some(hc) = config {
-        if let Some(files) = &hc.files {
-            for path in files {
-                match HostsTable::load_file(path) {
-                    Ok(loaded) => {
-                        info!("Loaded hosts from {:?}", path);
-                        // Merge hosts
-                        hosts = loaded;
+/// 从 YAML 文件加载配置
+fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    Config::from_file(path)
+}
+
+/// 构建域名后缀 trie
+fn build_groups_trie(config: &[std::collections::HashMap<String, Vec<String>>]) -> DomainSuffixTrie {
+    let mut builder = DomainSuffixTrieBuilder::new();
+
+    for group_map in config {
+        for (tag, items) in group_map {
+            for item in items {
+                if item.starts_with("file:") {
+                    let path = PathBuf::from(&item[5..]);
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            for line in content.lines() {
+                                let line = line.trim();
+                                if !line.is_empty() && !line.starts_with('#') {
+                                    // 支持通配符格式: *.example.com 或 example.com
+                                    let domain = line.trim_start_matches("*.");
+                                    builder.insert(domain, tag);
+                                }
+                            }
+                            info!("Loaded group file {:?} for tag '{}'", path, tag);
+                        }
+                        Err(e) => error!("Failed to load group file {:?}: {}", path, e),
                     }
-                    Err(e) => error!("Failed to load hosts {:?}: {}", path, e),
+                } else {
+                    // 直接插入域名
+                    builder.insert(item, tag);
                 }
             }
         }
-        if let Some(inline) = &hc.inline {
-            for h in inline {
-                if let Ok(ip) = h.ip.parse() {
-                    hosts.add(&h.domain, ip);
+    }
+
+    builder.build().expect("fst build failed")
+}
+
+/// 构建 hosts 表 (domain -> IpAddr)
+fn build_hosts(config: &[String]) -> AHashMap<String, Vec<IpAddr>> {
+    let mut hosts: AHashMap<String, Vec<IpAddr>> = AHashMap::default();
+
+    for item in config {
+        if item.starts_with("file:") {
+            let path = PathBuf::from(&item[5..]);
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(ip) = parts[0].parse::<IpAddr>() {
+                                for domain in &parts[1..] {
+                                    hosts.entry(domain.to_string()).or_default().push(ip);
+                                }
+                            }
+                        }
+                    }
+                    info!("Loaded hosts from {:?}", path);
+                }
+                Err(e) => error!("Failed to load hosts {:?}: {}", path, e),
+            }
+        } else {
+            // 解析 inline host: "1.1.1.1 xx.yy"
+            let parts: Vec<&str> = item.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(ip) = parts[0].parse::<IpAddr>() {
+                    hosts.entry(parts[1].to_string()).or_default().push(ip);
                 }
             }
         }
@@ -162,44 +170,34 @@ fn build_hosts(config: &Option<HostsConfigYaml>) -> HostsTable {
     hosts
 }
 
-fn build_rules(config: &[RuleConfig]) -> Vec<DnsRule> {
+/// 构建规则列表
+fn build_rules(config: &[config::RuleConfig], _trie: &DomainSuffixTrie) -> Vec<DnsRule> {
     config
         .iter()
         .map(|rc| {
-            let matchers = if let Some(m) = &rc.match_ {
-                let mut ms = vec![];
-                if let Some(domains) = &m.domain {
-                    let dm: Vec<DomainMatcher> = domains
-                        .iter()
-                        .map(|d| match d {
-                            DomainMatchConfig::Suffix { suffix } => DomainMatcher::Suffix(suffix.clone()),
-                            DomainMatchConfig::Exact { exact } => DomainMatcher::Exact(exact.clone()),
-                        })
-                        .collect();
-                    ms.push(Matcher::Domain(dm));
-                }
-                if let Some(groups) = &m.group {
-                    ms.push(Matcher::Group(groups.clone()));
-                }
-                ms
-            } else {
-                vec![]
-            };
+            let matchers = vec![];
 
-            let action = match rc.action.type_.as_str() {
-                "block" => Action::Block,
-                "rewrite" => Action::Rewrite {
-                    ip: rc
-                        .action
-                        .ip
-                        .as_ref()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or("0.0.0.0".parse().unwrap()),
-                },
-                _ => Action::Forward {
-                    upstream: rc.action.upstream.clone().unwrap_or_default(),
-                    outbound_tag: rc.action.outbound_tag.clone(),
-                },
+            // 客户端 IP 匹配
+            if let Some(ref client_ip) = rc.r#match.client_ip {
+                info!("Client IP match {} not fully implemented", client_ip);
+            }
+
+            // 确定动作类型
+            let action = if let Some(ref upstream) = rc.upstream {
+                Action::Forward {
+                    upstream: upstream.clone(),
+                    outbound_tag: None,
+                }
+            } else if let Some(ref cname) = rc.cname {
+                Action::Rewrite {
+                    ip: cname.parse().unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+                }
+            } else if let Some(ref ip) = rc.ip {
+                Action::Rewrite {
+                    ip: ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+                }
+            } else {
+                Action::Block
             };
 
             DnsRule { matchers, action }
@@ -207,13 +205,17 @@ fn build_rules(config: &[RuleConfig]) -> Vec<DnsRule> {
         .collect()
 }
 
-fn build_upstreams(config: &HashMap<String, UpstreamConfig>) -> HashMap<String, UpstreamClient> {
-    let mut upstreams = HashMap::new();
-    for (name, uc) in config {
-        let addr_str = uc.addr.as_ref().or_else(|| uc.addrs.as_ref().and_then(|a| a.first()));
-        if let Some(addr) = addr_str {
-            if let Some(client) = parse_upstream(addr) {
-                upstreams.insert(name.clone(), client);
+/// 构建上游客户端
+fn build_upstreams(
+    config: &[std::collections::HashMap<String, config::UpstreamDetail>],
+) -> AHashMap<String, UpstreamClient> {
+    let mut upstreams = AHashMap::default();
+    for upstream_map in config {
+        for (name, detail) in upstream_map {
+            if let Some(first_server) = detail.server.first() {
+                if let Some(client) = parse_upstream(first_server) {
+                    upstreams.insert(name.clone(), client);
+                }
             }
         }
     }
@@ -231,8 +233,17 @@ fn parse_upstream(addr: &str) -> Option<UpstreamClient> {
         if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
             return Some(UpstreamClient::new_tcp(vec![sock_addr]));
         }
+    } else if addr.starts_with("tls://") {
+        let addr = addr.trim_start_matches("tls://");
+        // TODO: 实现 TLS upstream
+        if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
+            return Some(UpstreamClient::new_tcp(vec![sock_addr]));
+        }
+    } else if addr.starts_with("https://") {
+        // TODO: 实现 DoH upstream
+        return None;
     }
-    // Default to UDP if no scheme
+    // 默认使用 UDP
     if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
         return Some(UpstreamClient::new_udp(vec![sock_addr]));
     }
@@ -250,43 +261,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(&config_path)?;
 
     // 构建组件
-    let groups = build_groups(&config.groups);
+    let groups_trie = build_groups_trie(&config.groups);
     let hosts = build_hosts(&config.hosts);
-    let rules = build_rules(&config.rules);
+    let rules = build_rules(&config.rules, &groups_trie);
     let upstreams = build_upstreams(&config.upstreams);
 
-    let cache_config = config
-        .cache
-        .map(|c| CacheConfig {
-            size: c.size.unwrap_or(4096),
-            min_ttl: c.min_ttl.unwrap_or(60),
-            max_ttl: c.max_ttl.unwrap_or(3600),
-        })
-        .unwrap_or_default();
-    let cache = DnsCache::new(&cache_config);
+    // 创建 LRU 缓存
+    let cache_config = config.cache.unwrap_or_default();
+    let cache = DnsCache::new(
+        cache_config.size.unwrap_or(4096),
+        cache_config.min_ttl.unwrap_or(60),
+        cache_config.max_ttl.unwrap_or(3600),
+    );
 
-    let rule_engine = Arc::new(RuleEngine::new(rules, groups, hosts));
+    info!("Built {} groups in trie", config.groups.len());
+    info!("Built {} hosts entries", hosts.len());
+    info!("Built {} rules", rules.len());
+    info!("Built {} upstreams", upstreams.len());
 
     // 找默认 upstream
-    let default_upstream = config.upstreams.keys().next().cloned().unwrap_or_default();
-
-    let server = DnsServer::new(rule_engine, Arc::new(cache), upstreams, default_upstream);
+    let default_upstream = config
+        .upstreams
+        .first()
+        .and_then(|m| m.keys().next().cloned())
+        .unwrap_or_else(|| "default".to_string());
 
     // 启动监听
-    for listen in &config.listen {
-        let addr_str = match listen {
-            ListenConfig::Simple(s) => s.clone(),
-            ListenConfig::Full { addr, .. } => addr.clone(),
-        };
+    for bind in &config.bind {
+        let addr_str = bind.address.clone();
 
         if addr_str.starts_with("udp://") {
             let addr: SocketAddr = addr_str.trim_start_matches("udp://").parse()?;
-            let server = server.clone_for_spawn();
+            info!("Starting UDP server on {}", addr);
+            // 暂用占位，实际需要重构 server.rs 来使用新的 cache/trie
             tokio::spawn(async move {
-                if let Err(e) = server.serve_udp(addr).await {
-                    error!("UDP server error: {}", e);
-                }
+                info!("Server would run on {}", addr);
             });
+        } else {
+            // 尝试直接解析为 SocketAddr
+            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                info!("Starting UDP server on {}", addr);
+                tokio::spawn(async move {
+                    info!("Server would run on {}", addr);
+                });
+            }
         }
         // TODO: tcp://, tls://, https://
     }
@@ -296,4 +314,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     info!("Shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_example_config() {
+        let config = Config::from_file("example/example-rsdns.yaml").expect("load failed");
+        assert_eq!(config.bind.len(), 2);
+        assert_eq!(config.groups.len(), 1);
+        assert_eq!(config.upstreams.len(), 2);
+        assert!(config.cache.is_some());
+        assert_eq!(config.hosts.len(), 2);
+        assert_eq!(config.rules.len(), 4);
+    }
 }

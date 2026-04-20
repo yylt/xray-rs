@@ -6,6 +6,7 @@ pub mod sniff;
 pub mod socks;
 pub mod stats;
 pub mod tls;
+pub mod trie;
 use core::{pin::Pin, result::Result};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
