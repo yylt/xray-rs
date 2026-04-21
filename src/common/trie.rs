@@ -77,7 +77,7 @@ pub struct DomainMarisaBuilder {
     root: BuildNode,
     tags: TagPoolBuilder,
 }
-
+#[deprecated(since = "0.1.0", note = "请使用 common::domain_trie 代替")]
 impl DomainMarisaBuilder {
     pub fn new() -> Self {
         Self {
@@ -283,6 +283,7 @@ pub struct IpTrieBuilder {
     tags: TagPoolBuilder,
 }
 
+#[deprecated(since = "0.1.0", note = "请使用 common::domain_trie 代替")]
 impl IpTrieBuilder {
     pub fn new() -> Self {
         Self {
@@ -464,8 +465,8 @@ fn normalize_v6(bits: u128, prefix_len: u8) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
-
     fn build_domain_marisa(rules: &[(&str, &str)]) -> DomainMarisa {
         let mut builder = DomainMarisaBuilder::new();
         for (domain, tag) in rules {

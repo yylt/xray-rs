@@ -15,15 +15,12 @@ uuid = { version = "1.22", features = ["std", "v4"] }
 mimalloc = { version = "0.1.48", optional = true }
 parking_lot = { version = "0.12.5" }
 base64 = { version = "0.22.1" }
+fst = { version = "0.4.7" }
 # runtime
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
-hickory-resolver = { version = "0.25.2", default-features = false, features = [
-  "system-config",
-  "tokio",
-  "rustls-platform-verifier",
-] }
+hickory-resolver = { version = "0.26.0" }
 aws-lc-rs = { version = "*", optional = true }
-tokio = { version = "1.49.0", features = ["io-std", "net", "signal", "sync", "time"] }
+tokio = { version = "1.49.0", features = ["io-std", "net", "signal", "sync", "time", "fs"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
 tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.18" }
@@ -35,7 +32,9 @@ rustls-pemfile = { version = "2.2.0", features = [] }
 x509-parser= "0.18.1"
 tun = { version = "0.8.6", features = ["async"], optional = true }
 etherparse = "0.19.0"
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true, features = ["profiling"] }
+tikv-jemalloc-sys = { version = "0.6", optional = true, features = ["profiling"] }
+pprof = { version = "0.14", optional = true, features = ["prost-codec", "flamegraph"] }
 socket2 = "0.6"
 hyper-util = "0.1"
 http-body-util = "0.1"
@@ -79,7 +78,8 @@ strip = false
 default = ["aws-lc-rs", "jemalloc", "tun"]
 tun = ["dep:tun"]
 mimalloc = ["dep:mimalloc"]
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
+profiling = ["dep:pprof"]
 aws-lc-rs = [
   "dep:aws-lc-rs",
   "tokio-rustls/aws-lc-rs",

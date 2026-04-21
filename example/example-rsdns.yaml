@@ -1,0 +1,72 @@
+bind:
+  - address: 0.0.0.0:53
+    ip6: off
+    ip4: on
+  - address: 0.0.0.0:853
+    cert_file: path_to_cert
+    key_file: path_to_key
+groups:
+  - ad:
+      - file:/path/to/file
+      - example.com
+upstreams:
+  - doh:
+      bootstrap: false
+      server:
+        - https://x.x/dns-query
+        - h3://y.y/dns-query
+  - default:
+      bootstrap: true
+      server:
+        - tls://1.1.1.1
+        - tls://dot.pub
+        - 223.5.5.5
+cache:
+  size: 1024
+  serve_stale: false # 乐观缓存
+  min_ttl: 30
+  max_ttl: 300
+hosts:
+  - file:/path/to/file
+  - "1.1.1.1 xx.yy"
+rules:
+  - priority: 100
+    match:
+      domain_group: ad # 引用 groups 中的 ad 组
+      domain: ["example.com"]
+    action:
+      type: block
+      ipv4: 0.0.0.0
+      ipv6: "::"
+    cache: true
+
+  - match:
+      domain: ["example.com"]
+    action:
+      type: reject # NXDOMAIN
+    ttl: 600
+
+  # CNAME 改写规则
+  - match:
+      domain_group: foo
+      domain: ["foo.com"]
+    action:
+      type: cname
+      target: bar.com
+  - match:
+      client_ip: ["1.1.1.1/24"]
+      domain: ["foo.com"]
+    action:
+      type: cname
+      target: bar.com
+  - match:
+      domain_group: bar
+    action:
+      type: upstream
+      name: default
+      ip6: off
+  - match:
+      any: true
+    action:
+      type: upstream
+      name: default

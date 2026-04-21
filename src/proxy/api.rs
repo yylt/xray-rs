@@ -1,6 +1,8 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(all(target_os = "linux", feature = "profiling"))]
+use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -18,6 +20,178 @@ use crate::app::ConnectionSink;
 use crate::common::stats::SharedStats;
 use crate::common::{Address, BoxStream, Protocol};
 use crate::route::SharedRouter;
+
+// Profiling handlers - only on Linux
+#[cfg(all(target_os = "linux", feature = "profiling"))]
+mod profiling {
+    use super::*;
+
+    /// Query parameters for profiling endpoints
+    #[derive(Debug, Deserialize)]
+    pub struct ProfilingQuery {
+        #[serde(default = "default_seconds")]
+        pub seconds: u64,
+    }
+
+    fn default_seconds() -> u64 {
+        10
+    }
+
+    impl ProfilingQuery {
+        /// Parse query string and validate seconds parameter
+        pub fn from_query(query: Option<&str>) -> Result<Self, String> {
+            let query_str = query.unwrap_or("");
+            let params: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query_str.as_bytes())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+
+            let seconds = params
+                .get("seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or_else(default_seconds);
+
+            // Validate bounds: 0 < seconds <= 300 (5 minutes max)
+            if seconds == 0 {
+                return Err("seconds must be greater than 0".to_string());
+            }
+            if seconds > 300 {
+                return Err("seconds must not exceed 300".to_string());
+            }
+
+            Ok(Self { seconds })
+        }
+    }
+
+    /// Binary response helper for profile data
+    fn binary_response(status: StatusCode, body: Bytes, filename: &str) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+            .body(Full::new(body))
+            .unwrap()
+    }
+
+    fn encode_profile(profile: pprof::protos::Profile) -> Vec<u8> {
+        use pprof::protos::Message;
+        let mut buf = Vec::new();
+        profile.encode(&mut buf).unwrap_or_default();
+        buf
+    }
+
+    /// CPU profile handler using pprof
+    pub async fn handle_pprof_cpu(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        let query = match ProfilingQuery::from_query(req.uri().query()) {
+            Ok(q) => q,
+            Err(e) => {
+                return Ok(super::json_response(StatusCode::BAD_REQUEST, json!({"error": e})));
+            }
+        };
+
+        // Create pprof profiler
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(100) // 100 Hz sampling
+            .blocklist(&["libc", "libgcc", "ld-linux"])
+            .build();
+
+        let guard = match guard {
+            Ok(g) => g,
+            Err(e) => {
+                return Ok(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": format!("failed to start profiler: {}", e)}),
+                ));
+            }
+        };
+
+        // Wait for sampling duration
+        tokio::time::sleep(Duration::from_secs(query.seconds)).await;
+
+        // Generate protobuf profile
+        match guard.report().build() {
+            Ok(report) => match report.pprof() {
+                Ok(profile) => {
+                    let profile_bytes = encode_profile(profile);
+                    Ok(binary_response(StatusCode::OK, Bytes::from(profile_bytes), "profile.pb"))
+                }
+                Err(e) => Ok(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": format!("failed to generate profile: {}", e)}),
+                )),
+            },
+            Err(e) => Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("failed to build report: {}", e)}),
+            )),
+        }
+    }
+
+    /// Memory profile handler using jemalloc
+    /// MALLOC_CONF="prof:true,prof_active:true" ./binary start
+    pub async fn handle_prof_mem(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        #[cfg(all(feature = "jemalloc", feature = "profiling"))]
+        {
+            use std::ffi::CString;
+
+            // Get query parameters
+            let query = match ProfilingQuery::from_query(req.uri().query()) {
+                Ok(q) => q,
+                Err(e) => {
+                    return Ok(super::json_response(StatusCode::BAD_REQUEST, json!({"error": e})));
+                }
+            };
+
+            // Wait for sampling window
+            tokio::time::sleep(Duration::from_secs(query.seconds)).await;
+
+            // Trigger memory profiling dump
+            let temp_path = format!("/tmp/jemalloc_profile_{}.prof", std::process::id());
+
+            // Use raw mallctl to dump the heap profile
+            let cmd = CString::new(format!("prof.dump,{}", temp_path)).unwrap();
+
+            unsafe {
+                let ret = tikv_jemalloc_sys::mallctl(
+                    cmd.as_ptr() as *const i8,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if ret != 0 {
+                    return Ok(super::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": format!("jemalloc dump failed with code: {}", ret)}),
+                    ));
+                }
+            }
+
+            // Read the dump file
+            match tokio::fs::read(&temp_path).await {
+                Ok(data) => {
+                    // Clean up temp file
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    Ok(binary_response(StatusCode::OK, Bytes::from(data), "profile.pb"))
+                }
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    Ok(super::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": format!("failed to read profile: {}", e)}),
+                    ))
+                }
+            }
+        }
+
+        #[cfg(not(all(feature = "jemalloc", feature = "profiling")))]
+        {
+            Ok(super::json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                json!({"error": "jemalloc and profiling features required"}),
+            ))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InSetting {
@@ -115,6 +289,16 @@ async fn handle_request(
         ("GET", "/stats") => handle_get_stats(req, stats).await,
         ("POST", "/handler") => handle_post_handler(req, router, sinks).await,
         ("GET", "/check") => handle_get_check(req, sinks).await,
+        // Profiling endpoints - Linux only
+        #[cfg(all(target_os = "linux", feature = "profiling"))]
+        ("GET", "/pprof/cpu") => profiling::handle_pprof_cpu(req).await,
+        #[cfg(all(target_os = "linux", feature = "profiling"))]
+        ("GET", "/prof/mem") => profiling::handle_prof_mem(req).await,
+        #[cfg(not(all(target_os = "linux", feature = "profiling")))]
+        ("GET", "/pprof/cpu") | ("GET", "/prof/mem") => Ok(json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            json!({"error": "profiling only supported on Linux with profiling feature enabled"}),
+        )),
         _ => Ok(json_response(StatusCode::NOT_FOUND, json!({"error": "not found"}))),
     }
 }
