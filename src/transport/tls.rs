@@ -20,13 +20,13 @@ use tokio_rustls::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsSettings {
     #[serde(rename = "serverName")]
-    server_name: Option<String>,
+    pub server_name: Option<String>,
 
     #[serde(rename = "alpn")]
     alpn_protocols: Option<Vec<String>>,
 
     #[serde(rename = "allowInsecure")]
-    allow_insecure: Option<bool>,
+    pub allow_insecure: Option<bool>,
 
     #[serde(rename = "cipherSuites")]
     cipher_suites: Option<Vec<String>>,

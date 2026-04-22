@@ -16,6 +16,7 @@ mimalloc = { version = "0.1.48", optional = true }
 parking_lot = { version = "0.12.5" }
 base64 = { version = "0.22.1" }
 fst = { version = "0.4.7" }
+ginepro = { version = "0.9.0" }
 # runtime
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
 hickory-resolver = { version = "0.26.0" }
@@ -57,6 +58,9 @@ ipnet = "2.12"
 url = "2.5"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 pin-project-lite = "0.2.17"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [[bin]]
 name = "rsdns"
