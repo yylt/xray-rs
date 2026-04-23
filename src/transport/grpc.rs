@@ -11,14 +11,15 @@ use std::{
     time::Duration,
 };
 
-use futures::{StreamExt, ready};
+use futures::{ready, StreamExt};
 use log::{error, warn};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Mutex, mpsc},
+    sync::{mpsc, Mutex},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
+use tonic::codegen::*;
 use tonic::transport::channel;
 
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
@@ -136,6 +137,7 @@ pub struct Grpc {
     client: Mutex<grpc_generated::tunnel_client::TunnelClient<channel::Channel>>,
     multimode: bool,
     buf_byte_size: usize,
+    service_name: String,
 }
 
 impl Grpc {
@@ -158,6 +160,7 @@ impl Grpc {
 
         Ok(Grpc {
             dns,
+            service_name: grpc_settings.service_name.clone(),
             client: Mutex::new(client),
             multimode: grpc_settings.multi_mode.unwrap_or(false),
             buf_byte_size: grpc_settings.buf_byte_size.map_or(DEFAULT_BUFFER_SIZE, |x| x),
@@ -254,9 +257,26 @@ impl Grpc {
 
     async fn listen_tcp(
         &self,
-        _addr: &std::net::SocketAddr,
+        addr: &std::net::SocketAddr,
     ) -> IoResult<crate::common::BoxStream<(super::TrStream, Address), std::io::Error>> {
-        Err(Error::new(ErrorKind::Unsupported, "gRPC inbound listen is not implemented yet"))
+        let (new_conn_tx, new_conn_rx) = tokio::sync::mpsc::channel(32);
+        let sname = self.service_name.clone();
+        let server_future = async move {
+            let service = GrpcTunnelService { new_conn_tx };
+
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(grpc_generated::tunnel_server::TunnelServer::new(service, sname.as_str))
+                .serve(*addr)
+                .await
+            {
+                error!("gRPC server failed: {}", e);
+            }
+        };
+
+        tokio::spawn(server_future);
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(new_conn_rx).map(Ok).boxed();
+        Ok(stream)
     }
 
     #[cfg(unix)]
@@ -268,6 +288,101 @@ impl Grpc {
             ErrorKind::Unsupported,
             "gRPC inbound listen over Unix socket is not implemented yet",
         ))
+    }
+}
+
+struct GrpcTunnelService {
+    new_conn_tx: tokio::sync::mpsc::Sender<(super::TrStream, Address)>,
+}
+
+#[tonic::async_trait]
+impl grpc_generated::tunnel_server::Tunnel for GrpcTunnelService {
+    type TunStream = tokio_stream::wrappers::ReceiverStream<grpc_generated::Hunk>;
+    type TunMultiStream = tokio_stream::wrappers::ReceiverStream<grpc_generated::MultiHunk>;
+
+    async fn tun(
+        &self,
+        request: tonic::Request<tonic::Streaming<grpc_generated::Hunk>>,
+    ) -> Result<tonic::Response<Self::TunStream>, tonic::Status> {
+        let mut incoming_stream = request.into_inner();
+        let (stream_service, incoming_tx, mut outgoing_rx) = make_service(self.buf_byte_size);
+        // 获取客户端地址（如果有）
+        let remote_addr = request
+            .remote_addr()
+            .map(|addr| Address::Inet(addr))
+            .unwrap_or_else(|| Address::Other("unknown".to_string()));
+
+        // 将新连接发送给 listen 返回的 stream
+        if self
+            .new_conn_tx
+            .send((TrStream::Grpc(stream_service), remote_addr))
+            .await
+            .is_err()
+        {
+            return Err(tonic::Status::internal("failed to send new connection"));
+        }
+
+        // 启动任务：从 gRPC 请求流中读取数据，写入 incoming_tx
+        let inbound_task = tokio::spawn(async move {
+            while let Some(chunk) = incoming_stream.message().await? {
+                if incoming_tx.send(chunk.data).await.is_err() {
+                    break;
+                }
+            }
+            Ok::<_, tonic::Status>(())
+        });
+
+        // 创建响应流：将 outgoing_rx 的数据转换为 gRPC Hunk 并发送给客户端
+        let output_stream =
+            tokio_stream::wrappers::ReceiverStream::new(outgoing_rx).map(|data| grpc_generated::Hunk { data });
+
+        // 等待 inbound 任务完成（忽略结果，因为流关闭时会自动结束）
+        tokio::spawn(async move {
+            let _ = inbound_task.await;
+        });
+
+        Ok(tonic::Response::new(output_stream))
+    }
+
+    async fn tun_multi(
+        &self,
+        request: tonic::Request<tonic::Streaming<grpc_generated::MultiHunk>>,
+    ) -> Result<tonic::Response<Self::TunMultiStream>, tonic::Status> {
+        let mut incoming_stream = request.into_inner();
+        let (stream_service, incoming_tx, mut outgoing_rx) = make_service(self.buf_byte_size);
+        let remote_addr = request
+            .remote_addr()
+            .map(|addr| Address::Inet(addr))
+            .unwrap_or_else(|| Address::Other("unknown".to_string()));
+
+        if self
+            .new_conn_tx
+            .send((TrStream::Grpc(stream_service), remote_addr))
+            .await
+            .is_err()
+        {
+            return Err(tonic::Status::internal("failed to send new connection"));
+        }
+
+        let inbound_task = tokio::spawn(async move {
+            while let Some(chunk) = incoming_stream.message().await? {
+                for data in chunk.data {
+                    if incoming_tx.send(data).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok::<_, tonic::Status>(())
+        });
+
+        let output_stream = tokio_stream::wrappers::ReceiverStream::new(outgoing_rx)
+            .map(|data| grpc_generated::MultiHunk { data: vec![data] });
+
+        tokio::spawn(async move {
+            let _ = inbound_task.await;
+        });
+
+        Ok(tonic::Response::new(output_stream))
     }
 }
 
