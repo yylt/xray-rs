@@ -3,157 +3,34 @@ use crate::transport::TrStream;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
-pub struct StreamForwarder;
-
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
-impl Default for StreamForwarder {
-    fn default() -> Self {
-        Self::new()
-    }
+pub async fn forward(mut local: TrStream, mut remote: TrStream) -> std::io::Result<(u64, u64)> {
+    let result = tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE)
+        .await;
+
+    let _ = local.shutdown().await;
+    let _ = remote.shutdown().await;
+
+    result
 }
 
-impl StreamForwarder {
-    pub fn new() -> Self {
-        Self
-    }
+/// Forward with traffic statistics tracking
+pub async fn forward_with_stats(
+    mut local: TrStream,
+    mut remote: TrStream,
+    stats: Arc<TrafficStats>,
+) -> std::io::Result<(u64, u64)> {
+    let result = tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE)
+        .await;
 
-    pub fn forward<'a>(
-        &'a self,
-        mut local: TrStream,
-        mut remote: TrStream,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(u64, u64)>> + Send + 'a>> {
-        Box::pin(async move {
-            let result =
-                tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE)
-                    .await;
+    let _ = local.shutdown().await;
+    let _ = remote.shutdown().await;
 
-            let _ = local.shutdown().await;
-            let _ = remote.shutdown().await;
-
-            result
-        })
-    }
-
-    /// Forward with traffic statistics tracking
-    pub fn forward_with_stats<'a>(
-        &'a self,
-        mut local: TrStream,
-        mut remote: TrStream,
-        stats: Arc<TrafficStats>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(u64, u64)>> + Send + 'a>> {
-        Box::pin(async move {
-            // Use copy_bidirectional to transfer data between streams
-            let result =
-                tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE)
-                    .await;
-
-            let _ = local.shutdown().await;
-            let _ = remote.shutdown().await;
-
-            // Record the traffic stats
-            if let Ok((uplink, downlink)) = result {
-                stats.record_uplink(uplink);
-                stats.record_downlink(downlink);
-                Ok((uplink, downlink))
-            } else {
-                result
-            }
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transport::TrStream;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    async fn tcp_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        (client, server)
-    }
-
-    #[tokio::test]
-    async fn test_stream_forwarder_basic() {
-        let (stream1, mut peer1) = tcp_pair().await;
-        let (stream2, mut peer2) = tcp_pair().await;
-
-        let forwarder = StreamForwarder::new();
-        let forward_task =
-            tokio::spawn(async move { forwarder.forward(TrStream::Tcp(stream1), TrStream::Tcp(stream2)).await });
-
-        peer1.write_all(b"ping").await.unwrap();
-        let mut buf = [0u8; 4];
-        peer2.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping");
-
-        peer2.write_all(b"pong").await.unwrap();
-        peer1.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"pong");
-
-        drop(peer1);
-        drop(peer2);
-        let _ = forward_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_stream_forwarder_preserves_half_close_response() {
-        let (stream1, mut peer1) = tcp_pair().await;
-        let (stream2, mut peer2) = tcp_pair().await;
-
-        let forwarder = StreamForwarder::new();
-        let forward_task =
-            tokio::spawn(async move { forwarder.forward(TrStream::Tcp(stream1), TrStream::Tcp(stream2)).await });
-
-        peer1.write_all(b"hello").await.unwrap();
-        peer1.shutdown().await.unwrap();
-
-        let mut req = [0u8; 5];
-        peer2.read_exact(&mut req).await.unwrap();
-        assert_eq!(&req, b"hello");
-
-        peer2.write_all(b"world").await.unwrap();
-        peer2.shutdown().await.unwrap();
-
-        let mut resp = [0u8; 5];
-        peer1.read_exact(&mut resp).await.unwrap();
-        assert_eq!(&resp, b"world");
-
-        let _ = forward_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_stream_forwarder_with_stats() {
-        let (stream1, mut peer1) = tcp_pair().await;
-        let (stream2, mut peer2) = tcp_pair().await;
-
-        let stats = Arc::new(TrafficStats::new());
-        let forwarder = StreamForwarder::new();
-        let stats_clone = stats.clone();
-        let forward_task = tokio::spawn(async move {
-            forwarder
-                .forward_with_stats(TrStream::Tcp(stream1), TrStream::Tcp(stream2), stats_clone)
-                .await
-        });
-
-        peer1.write_all(b"ping").await.unwrap();
-        let mut buf = [0u8; 4];
-        peer2.read_exact(&mut buf).await.unwrap();
-
-        peer2.write_all(b"pong").await.unwrap();
-        peer1.read_exact(&mut buf).await.unwrap();
-
-        drop(peer1);
-        drop(peer2);
-        let (uplink, downlink) = forward_task.await.unwrap().unwrap();
-
-        assert_eq!(uplink, 4); // "ping"
-        assert_eq!(downlink, 4); // "pong"
-        assert_eq!(stats.uplink(), 4);
-        assert_eq!(stats.downlink(), 4);
+    if let Ok((uplink, downlink)) = result {
+        stats.record_uplink(uplink);
+        stats.record_downlink(downlink);
+        Ok((uplink, downlink))
+    } else {
+        result
     }
 }

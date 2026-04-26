@@ -505,7 +505,8 @@ async fn probe_outbound_latency(sink: &ConnectionSink, target: &Address) -> io::
         ConnectionSink::Proxy(proxy_sink) => {
             // Use the outbound proxy to connect
             let mut stream = proxy_sink
-                .try_connect(target, Protocol::Tcp)
+                .outbounder
+                .connect(target, Protocol::Tcp, None)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connect failed: {}", e)))?;
 

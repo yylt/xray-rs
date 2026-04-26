@@ -6,7 +6,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     app::{self, ConnectionSink},
-    common::{forward::StreamForwarder, stats},
+    common::stats,
     proxy::{self},
     route::{DnsResolver, DnsSettings, Router, RoutingSettings},
 };
@@ -230,8 +230,6 @@ async fn start_inbounds(
             let sinks = sinks.clone();
             let router = router.clone();
             let stats = stats.clone();
-            let forwarder = Arc::new(StreamForwarder::new());
-
             let handle = tokio::spawn(async move {
                 let mut stream = source.run_listen().await.unwrap();
                 while let Some(result) = stream.next().await {
@@ -241,8 +239,7 @@ async fn start_inbounds(
                             let sinks = sinks.clone();
                             let router = router.clone();
                             let stats = stats.clone();
-                            let forwarder = forwarder.clone();
-                            tokio::spawn(handle_proxy_stream(proxy_stream, sinks, router, stats, forwarder));
+                            tokio::spawn(handle_proxy_stream(proxy_stream, sinks, router, stats));
                         }
                     }
                 }
@@ -260,7 +257,6 @@ async fn handle_proxy_stream(
     sinks: Arc<HashMap<String, Arc<ConnectionSink>>>,
     router: Arc<tokio::sync::RwLock<Router>>,
     stats: stats::SharedStats,
-    forwarder: Arc<StreamForwarder>,
 ) {
     // Perform routing
     let routing_result = router.read().await.route(&proxy_stream).await;
@@ -274,42 +270,40 @@ async fn handle_proxy_stream(
             result.primary_tag
         );
 
-        let dst = &proxy_stream.metadata.dst;
-
         let tags_to_try = std::iter::once(&result.primary_tag).chain(result.fallback_tags.iter());
+        let mut stream = Some(proxy_stream);
 
         for tag in tags_to_try {
-            if let Some(sink) = sinks.get(tag) {
-                match sink.as_ref() {
-                    app::ConnectionSink::Proxy(proxy_sink) => {
-                        match proxy_sink
-                            .try_connect(&dst, proxy_stream.metadata.protocol.clone())
-                            .await
-                        {
-                            Ok(connected) => {
-                                // Perform forwarding with stats tracking
-                                let stats_for_tag = stats.read().await.get_outbound_stats(tag);
+            let current_stream = match stream.take() {
+                Some(stream) => stream,
+                None => return,
+            };
 
-                                let _ = if let Some(stats_ref) = stats_for_tag {
-                                    forwarder
-                                        .forward_with_stats(proxy_stream.inner, connected, stats_ref)
-                                        .await
-                                } else {
-                                    forwarder.forward(proxy_stream.inner, connected).await
-                                };
-                                return;
-                            }
-                            Err(_e) => {
-                                continue;
-                            }
-                        }
+            let Some(sink) = sinks.get(tag) else {
+                stream = Some(current_stream);
+                continue;
+            };
+
+            match sink.as_ref() {
+                app::ConnectionSink::Proxy(proxy_sink) => match proxy_sink.handle(current_stream).await {
+                    Ok(Some(next_stream)) => {
+                        stream = Some(next_stream);
                     }
-                    _ => {
-                        let _ = sink.handle(proxy_stream, forwarder.as_ref()).await;
+                    Ok(None) => return,
+                    Err(e) => {
+                        log::error!("handler failed: {:?}", e);
                         return;
                     }
+                },
+                _ => {
+                    let _ = sink.handle(current_stream).await;
+                    return;
                 }
             }
+        }
+
+        if stream.is_some() {
+            log::error!("[Routing] All outbound tags failed");
         }
     } else {
         log::error!("[Routing] No route found");

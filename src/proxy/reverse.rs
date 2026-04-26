@@ -547,11 +547,10 @@ impl ReversInbound {
         // Target connection successful
         send_socks5_success(&mut pending_conn.socks_stream, &pending_conn.target_addr).await?;
 
-        // Forward traffic bidirectionally using StreamForwarder
-        let forwarder = crate::common::forward::StreamForwarder::new();
+        // Forward traffic bidirectionally
         let socks_tr_stream = transport::TrStream::Tcp(pending_conn.socks_stream);
 
-        if let Err(e) = forwarder.forward(stream, socks_tr_stream).await {
+        if let Err(e) = crate::common::forward::forward(stream, socks_tr_stream).await {
             error!("Traffic forwarding error: {}", e);
         }
 
@@ -843,11 +842,10 @@ impl ReversOutbound {
                 let result_msg = vec![MSG_TARGET_RESULT, 0x00, 0x00];
                 data_stream.write_all(&result_msg).await?;
 
-                // Forward traffic using StreamForwarder
-                let forwarder = crate::common::forward::StreamForwarder::new();
+                // Forward traffic
                 let target_tr_stream = transport::TrStream::Tcp(target_stream);
 
-                if let Err(e) = forwarder.forward(data_stream, target_tr_stream).await {
+                if let Err(e) = crate::common::forward::forward(data_stream, target_tr_stream).await {
                     error!("Traffic forwarding error: {}", e);
                 }
 

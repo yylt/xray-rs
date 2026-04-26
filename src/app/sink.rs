@@ -1,8 +1,8 @@
 use crate::{
-    common::{forward::StreamForwarder, Address, Protocol},
+    common::{forward, Address, Protocol},
     proxy::{Outbounder, ProxyStream},
     route::DnsResolver,
-    transport::{self, TrStream},
+    transport::{self},
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,13 +29,13 @@ impl std::fmt::Debug for ConnectionSink {
 
 impl ConnectionSink {
     /// 处理一条 ProxyStream
-    pub async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
+    pub async fn handle(&self, stream: ProxyStream) -> std::io::Result<Option<ProxyStream>> {
         match self {
-            ConnectionSink::Direct(sink) => sink.handle(stream, forwarder).await,
-            ConnectionSink::Proxy(sink) => sink.handle(stream, forwarder).await,
+            ConnectionSink::Direct(sink) => sink.handle(stream).await.map(|_| None),
+            ConnectionSink::Proxy(sink) => sink.handle(stream).await,
             ConnectionSink::Block => {
                 drop(stream);
-                Ok(())
+                Ok(None)
             }
             ConnectionSink::Daemon(_) => {
                 // Daemon sinks don't handle individual streams
@@ -59,12 +59,12 @@ pub struct DirectSink {
 }
 
 impl DirectSink {
-    async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
+    async fn handle(&self, stream: ProxyStream) -> std::io::Result<()> {
         let dst = self.resolve(&stream.metadata.dst).await?;
         match stream.metadata.protocol {
             Protocol::Tcp => {
                 let remote = self.transport.connect(&dst, Protocol::Tcp, None).await?;
-                forwarder.forward(stream.inner, remote).await?;
+                forward::forward(stream.inner, remote).await?;
                 Ok(())
             }
             Protocol::Udp => self.handle_udp(stream, dst).await,
@@ -131,18 +131,18 @@ pub struct ProxySink {
 }
 
 impl ProxySink {
-    async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
-        let remote = self
-            .try_connect(&stream.metadata.dst, stream.metadata.protocol.clone())
-            .await?;
-        forwarder.forward(stream.inner, remote).await?;
-        Ok(())
-    }
-
-    /// 尝试建立到目标地址的代理连接（不消费 inbound stream）
-    /// 用于支持 fallback 重试：只有连接成功后才消费 stream
-    pub async fn try_connect(&self, dst: &Address, protocol: crate::common::Protocol) -> std::io::Result<TrStream> {
-        self.outbounder.connect(dst, protocol, None).await
+    pub async fn handle(&self, stream: ProxyStream) -> std::io::Result<Option<ProxyStream>> {
+        match self
+            .outbounder
+            .connect(&stream.metadata.dst, stream.metadata.protocol.clone(), None)
+            .await
+        {
+            Ok(remote) => {
+                forward::forward(stream.inner, remote).await?;
+                Ok(None)
+            }
+            Err(_) => Ok(Some(stream)),
+        }
     }
 }
 
