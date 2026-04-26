@@ -8,7 +8,6 @@ use crate::{common::*, proxy, route::DnsResolver, transport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::common::stats::SharedStats;
 use crate::route::SharedRouter;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -31,14 +30,13 @@ impl InboundSettings {
         dns: Arc<DnsResolver>,
         sinks: Option<Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>>,
     ) -> std::io::Result<ConnectionSource> {
-        self.build_source_with_deps(dns, None, None, sinks)
+        self.build_source_with_deps(dns, None, sinks)
     }
 
     /// Build source with additional dependencies for special inbounds like API
     pub fn build_source_with_deps(
         self,
         dns: Arc<DnsResolver>,
-        stats: Option<SharedStats>,
         router: Option<SharedRouter>,
         sinks: Option<Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>>,
     ) -> std::io::Result<ConnectionSource> {
@@ -51,7 +49,6 @@ impl InboundSettings {
                     self.settings.as_ref(),
                     self.stream_settings.as_ref(),
                     dns,
-                    stats,
                     router,
                     sinks,
                 )?;

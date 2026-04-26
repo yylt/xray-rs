@@ -1,8 +1,9 @@
 use ahash::RandomState;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
+
 /// Traffic statistics for a single outbound
 #[derive(Debug, Default)]
 pub struct TrafficStats {
@@ -99,6 +100,10 @@ impl StatsCollector {
 /// Thread-safe shared stats collector
 pub type SharedStats = Arc<RwLock<StatsCollector>>;
 
-pub fn create_shared_stats() -> SharedStats {
-    Arc::new(RwLock::new(StatsCollector::new()))
+static SHARED_STATS: OnceLock<SharedStats> = OnceLock::new();
+
+pub fn shared_stats() -> SharedStats {
+    SHARED_STATS
+        .get_or_init(|| Arc::new(RwLock::new(StatsCollector::new())))
+        .clone()
 }

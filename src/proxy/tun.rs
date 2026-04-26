@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -210,7 +210,7 @@ pub fn parse_packet(data: &[u8]) -> std::io::Result<(FlowKey, Bytes)> {
             IpAddr::V6(std::net::Ipv6Addr::from(h.destination)),
         ),
         Some(NetHeaders::Arp(_)) => {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unsupported ARP packet"))
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unsupported ARP packet"));
         }
         None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "No IP header")),
     };

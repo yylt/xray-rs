@@ -240,12 +240,7 @@ impl Proxy {
         }
     }
 
-    pub async fn connect(
-        &self,
-        target: &Address,
-        protocol: Protocol,
-        pre_data: Option<bytes::Bytes>,
-    ) -> std::io::Result<transport::TrStream> {
+    pub async fn connect(&self, target: &Address, protocol: Protocol) -> std::io::Result<transport::TrStream> {
         debug!(
             "[Trojan][connect] dialing server={:?}, target={:?}, protocol={:?}",
             self.server, target, protocol
@@ -256,17 +251,10 @@ impl Proxy {
         };
 
         let request = build_trojan_request(&self.password_hash, cmd, target)?;
-        let merged_pre_data = match pre_data {
-            Some(pre_data) => {
-                let mut merged = Vec::with_capacity(request.len() + pre_data.len());
-                merged.extend_from_slice(&request);
-                merged.extend_from_slice(&pre_data);
-                Some(bytes::Bytes::from(merged))
-            }
-            None => Some(bytes::Bytes::from(request)),
-        };
-
-        let stream = self.tr.connect(&self.server, Protocol::Tcp, merged_pre_data).await?;
+        let stream = self
+            .tr
+            .connect(&self.server, Protocol::Tcp, Some(bytes::Bytes::from(request)))
+            .await?;
         debug!(
             "[Trojan][connect] request sent via pre_data cmd=0x{:02x}, target={:?}",
             cmd, target

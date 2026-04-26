@@ -6,7 +6,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     app::{self, ConnectionSink},
-    common::{forward::StreamForwarder, stats},
+    common::stats,
     proxy::{self},
     route::{DnsResolver, DnsSettings, Router, RoutingSettings},
 };
@@ -43,8 +43,7 @@ impl Run {
             _ => return Err(io::Error::new(io::ErrorKind::Other, "unsupported config format")),
         };
 
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_io().build()?;
         rt.block_on(run_proxy(config))
     }
 }
@@ -60,30 +59,19 @@ async fn run_proxy(config: Config) -> io::Result<()> {
         dns,
     } = config;
 
-    // Phase 1: 初始化 DNS resolver
     let dns = init_dns_resolver(dns).await?;
 
-    // Phase 2: 初始化 stats collector
-    let stats = stats::create_shared_stats();
-
-    // Phase 3: 构建 outbound sinks
-    let (sinks, _outbound_tags, mut handles, first_tag) =
-        build_outbound_sinks(outbounds, dns.clone(), stats.clone()).await?;
-
-    // Phase 4: 构建 router
+    let (sinks, _outbound_tags, mut handles, first_tag) = build_outbound_sinks(outbounds, dns.clone()).await?;
     let router = build_router(routing, first_tag, dns.clone()).await?;
 
-    // Phase 5: 构建并启动 inbounds
     if let Some(inbounds) = inbounds {
-        start_inbounds(inbounds, sinks, router, stats, dns, &mut handles).await?;
+        start_inbounds(inbounds, sinks, router, dns, &mut handles).await?;
     }
 
-    // Phase 6: 等待所有任务完成
     wait_for_completion(handles).await;
     Ok(())
 }
 
-/// Phase 1: 初始化 DNS resolver
 async fn init_dns_resolver(dns: Option<DnsSettings>) -> io::Result<Arc<DnsResolver>> {
     let (dns_settings, has_dns_config) = match dns {
         Some(dns_settings) => (dns_settings, true),
@@ -99,12 +87,9 @@ async fn init_dns_resolver(dns: Option<DnsSettings>) -> io::Result<Arc<DnsResolv
     Ok(Arc::new(DnsResolver::new(dns_settings)?))
 }
 
-/// Phase 3: 构建 outbound sinks
-/// 返回: (sinks, outbound_tags, daemon_handles, first_tag)
 async fn build_outbound_sinks(
     outbounds: Option<Vec<app::OutboundSettings>>,
     dns: Arc<DnsResolver>,
-    stats: stats::SharedStats,
 ) -> io::Result<(
     Arc<HashMap<String, Arc<ConnectionSink>>>,
     Vec<String>,
@@ -124,9 +109,9 @@ async fn build_outbound_sinks(
                 Some(proxy::OutboundSettings::Freedom) | None => "freedom".to_string(),
                 Some(proxy::OutboundSettings::Black) => "black".to_string(),
                 _ => {
-                    let t = format!("proxy-{}", proxy_counter);
+                    let tag = format!("proxy-{}", proxy_counter);
                     proxy_counter += 1;
-                    t
+                    tag
                 }
             });
 
@@ -135,17 +120,15 @@ async fn build_outbound_sinks(
                 first_tag = Some(tag.clone());
             }
 
-            // Register outbound for stats tracking (skip blackhole and direct)
             let needs_stats = !matches!(ob_set.settings.as_ref(), Some(proxy::OutboundSettings::Black));
-
             if needs_stats {
                 outbound_tags.push(tag.clone());
+                let stats = stats::shared_stats();
                 let mut stats_guard = stats.write().await;
                 stats_guard.register_outbound(&tag);
             }
 
             let sink = ob_set.build_sink(dns.clone())?;
-
             if sink.is_daemon() {
                 log::info!("[{}] Starting daemon outbound", tag);
                 let handle = tokio::spawn(async move {
@@ -162,11 +145,9 @@ async fn build_outbound_sinks(
         }
     }
 
-    let sinks: Arc<HashMap<String, Arc<ConnectionSink>>> = Arc::new(sinks_builder);
-    Ok((sinks, outbound_tags, handles, first_tag))
+    Ok((Arc::new(sinks_builder), outbound_tags, handles, first_tag))
 }
 
-/// Phase 4: 构建 router
 async fn build_router(
     routing: Option<RoutingSettings>,
     first_tag: Option<String>,
@@ -192,12 +173,10 @@ async fn build_router(
     Ok(Arc::new(router))
 }
 
-/// Phase 5: 启动 inbound 服务
 async fn start_inbounds(
     inbounds: Vec<app::InboundSettings>,
     sinks: Arc<HashMap<String, Arc<ConnectionSink>>>,
     router: Arc<tokio::sync::RwLock<Router>>,
-    stats: stats::SharedStats,
     dns: Arc<DnsResolver>,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> io::Result<()> {
@@ -208,12 +187,7 @@ async fn start_inbounds(
         let is_api = matches!(ib_set.settings.as_ref(), Some(proxy::InboundSettings::Api(_)));
 
         let source = if is_api {
-            ib_set.build_source_with_deps(
-                dns.clone(),
-                Some(stats.clone()),
-                Some(router.clone()),
-                Some(sinks.clone()),
-            )?
+            ib_set.build_source_with_deps(dns.clone(), Some(router.clone()), Some(sinks.clone()))?
         } else {
             ib_set.build_source(dns.clone(), Some(sinks.clone()))?
         };
@@ -229,9 +203,6 @@ async fn start_inbounds(
         } else {
             let sinks = sinks.clone();
             let router = router.clone();
-            let stats = stats.clone();
-            let forwarder = Arc::new(StreamForwarder::new());
-
             let handle = tokio::spawn(async move {
                 let mut stream = source.run_listen().await.unwrap();
                 while let Some(result) = stream.next().await {
@@ -240,9 +211,7 @@ async fn start_inbounds(
                         Ok(proxy_stream) => {
                             let sinks = sinks.clone();
                             let router = router.clone();
-                            let stats = stats.clone();
-                            let forwarder = forwarder.clone();
-                            tokio::spawn(handle_proxy_stream(proxy_stream, sinks, router, stats, forwarder));
+                            tokio::spawn(handle_proxy_stream(proxy_stream, sinks, router));
                         }
                     }
                 }
@@ -254,15 +223,11 @@ async fn start_inbounds(
     Ok(())
 }
 
-/// 处理单个代理连接流
 async fn handle_proxy_stream(
     proxy_stream: crate::proxy::ProxyStream,
     sinks: Arc<HashMap<String, Arc<ConnectionSink>>>,
     router: Arc<tokio::sync::RwLock<Router>>,
-    stats: stats::SharedStats,
-    forwarder: Arc<StreamForwarder>,
 ) {
-    // Perform routing
     let routing_result = router.read().await.route(&proxy_stream).await;
 
     if let Some(result) = routing_result {
@@ -274,51 +239,48 @@ async fn handle_proxy_stream(
             result.primary_tag
         );
 
-        let dst = &proxy_stream.metadata.dst;
-
         let tags_to_try = std::iter::once(&result.primary_tag).chain(result.fallback_tags.iter());
+        let mut stream = Some(proxy_stream);
 
         for tag in tags_to_try {
-            if let Some(sink) = sinks.get(tag) {
-                match sink.as_ref() {
-                    app::ConnectionSink::Proxy(proxy_sink) => {
-                        match proxy_sink
-                            .try_connect(&dst, proxy_stream.metadata.protocol.clone())
-                            .await
-                        {
-                            Ok(connected) => {
-                                // Perform forwarding with stats tracking
-                                let stats_for_tag = stats.read().await.get_outbound_stats(tag);
+            let current_stream = match stream.take() {
+                Some(stream) => stream,
+                None => return,
+            };
 
-                                let _ = if let Some(stats_ref) = stats_for_tag {
-                                    forwarder
-                                        .forward_with_stats(proxy_stream.inner, connected, stats_ref)
-                                        .await
-                                } else {
-                                    forwarder.forward(proxy_stream.inner, connected).await
-                                };
-                                return;
-                            }
-                            Err(_e) => {
-                                continue;
-                            }
-                        }
+            let Some(sink) = sinks.get(tag) else {
+                stream = Some(current_stream);
+                continue;
+            };
+
+            match sink.as_ref() {
+                app::ConnectionSink::Proxy(proxy_sink) => match proxy_sink.handle(current_stream).await {
+                    Ok(Some(next_stream)) => {
+                        stream = Some(next_stream);
                     }
-                    _ => {
-                        let _ = sink.handle(proxy_stream, forwarder.as_ref()).await;
+                    Ok(None) => return,
+                    Err(e) => {
+                        log::error!("handler failed: {:?}", e);
                         return;
                     }
+                },
+                _ => {
+                    let _ = sink.handle(current_stream).await;
+                    return;
                 }
             }
+        }
+
+        if stream.is_some() {
+            log::error!("[Routing] All outbound tags failed");
         }
     } else {
         log::error!("[Routing] No route found");
     }
 }
 
-/// Phase 6: 等待所有任务完成
 async fn wait_for_completion(handles: Vec<tokio::task::JoinHandle<()>>) {
-    for h in handles {
-        let _ = h.await;
+    for handle in handles {
+        let _ = handle.await;
     }
 }

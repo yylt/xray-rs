@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::app::ConnectionSink;
-use crate::common::stats::SharedStats;
+use crate::common::stats;
 use crate::common::{Address, BoxStream, Protocol};
 use crate::route::SharedRouter;
 
@@ -202,7 +202,6 @@ pub struct InSetting {
 #[derive(Debug)]
 pub struct ApiInbound {
     settings: InSetting,
-    stats: SharedStats,
     router: SharedRouter,
     sinks: Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>, // outbound sinks for probing
 }
@@ -210,13 +209,11 @@ pub struct ApiInbound {
 impl ApiInbound {
     pub fn new(
         settings: &InSetting,
-        stats: SharedStats,
         router: SharedRouter,
         sinks: Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>,
     ) -> io::Result<Self> {
         Ok(Self {
             settings: settings.clone(),
-            stats,
             router,
             sinks,
         })
@@ -233,17 +230,15 @@ impl ApiInbound {
 
             // Create service function for this connection
             let settings = self.settings.clone();
-            let stats = self.stats.clone();
             let router = self.router.clone();
             let sinks = self.sinks.clone();
 
             tokio::spawn(async move {
                 let service_fn = service_fn(move |req| {
                     let settings = settings.clone();
-                    let stats = stats.clone();
                     let router = router.clone();
                     let sinks = sinks.clone();
-                    async move { handle_request(req, settings, stats, router, sinks).await }
+                    async move { handle_request(req, settings, router, sinks).await }
                 });
                 if let Err(err) = http1::Builder::new()
                     .keep_alive(true)
@@ -265,7 +260,6 @@ impl ApiInbound {
 async fn handle_request(
     req: Request<Incoming>,
     settings: InSetting,
-    stats: SharedStats,
     router: SharedRouter,
     sinks: Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -286,7 +280,7 @@ async fn handle_request(
     let path = req.uri().path();
 
     match (method.as_str(), path) {
-        ("GET", "/stats") => handle_get_stats(req, stats).await,
+        ("GET", "/stats") => handle_get_stats(req).await,
         ("POST", "/handler") => handle_post_handler(req, router, sinks).await,
         ("GET", "/check") => handle_get_check(req, sinks).await,
         // Profiling endpoints - Linux only
@@ -303,7 +297,8 @@ async fn handle_request(
     }
 }
 
-async fn handle_get_stats(req: Request<Incoming>, stats: SharedStats) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_get_stats(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let stats = stats::shared_stats();
     let name: Option<String> = req.uri().query().and_then(|q| {
         url::form_urlencoded::parse(q.as_bytes())
             .find(|(k, _)| k == "name")
@@ -505,7 +500,8 @@ async fn probe_outbound_latency(sink: &ConnectionSink, target: &Address) -> io::
         ConnectionSink::Proxy(proxy_sink) => {
             // Use the outbound proxy to connect
             let mut stream = proxy_sink
-                .try_connect(target, Protocol::Tcp)
+                .outbounder
+                .connect(target, Protocol::Tcp)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connect failed: {}", e)))?;
 
