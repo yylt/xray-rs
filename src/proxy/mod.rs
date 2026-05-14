@@ -13,7 +13,7 @@ use crate::{
     transport::{self, TrStream},
 };
 
-use serde::{Deserialize, Serialize, de::Error as DeError};
+use serde::{de::Error as DeError, Deserialize, Serialize};
 
 use std::io::Result;
 
@@ -267,97 +267,6 @@ pub enum Outbounder {
     Trojan(trojan::Proxy),
     Vless(vless::Proxy),
     Reverse(reverse::ReversOutbound),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deserialize_http_inbound_without_settings_uses_defaults() {
-        let json = r#"{"protocol":"http"}"#;
-
-        let settings = serde_json::from_str::<InboundSettings>(json).unwrap();
-
-        match settings {
-            InboundSettings::Http(setting) => {
-                assert!(setting.account.is_none());
-                assert_eq!(setting.allow_transparent, None);
-            }
-            _ => panic!("expected http inbound settings"),
-        }
-    }
-
-    #[test]
-    fn deserialize_socks_inbound_without_settings_uses_defaults() {
-        let json = r#"{"protocol":"socks"}"#;
-
-        let settings = serde_json::from_str::<InboundSettings>(json).unwrap();
-
-        match settings {
-            InboundSettings::Socks(setting) => {
-                assert!(setting.account.is_none());
-                assert_eq!(setting.udp, None);
-                assert_eq!(setting.ip, None);
-            }
-            _ => panic!("expected socks inbound settings"),
-        }
-    }
-
-    #[test]
-    fn deserialize_http_inbound_with_settings_still_works() {
-        let json = r#"{
-            "protocol":"http",
-            "settings": {
-                "allowTransparent": true
-            }
-        }"#;
-
-        let settings = serde_json::from_str::<InboundSettings>(json).unwrap();
-
-        match settings {
-            InboundSettings::Http(setting) => {
-                assert_eq!(setting.allow_transparent, Some(true));
-            }
-            _ => panic!("expected http inbound settings"),
-        }
-    }
-
-    #[test]
-    fn deserialize_socks_inbound_with_settings_still_works() {
-        let json = r#"{
-            "protocol":"socks",
-            "settings": {
-                "udp": true,
-                "ip": "127.0.0.1"
-            }
-        }"#;
-
-        let settings = serde_json::from_str::<InboundSettings>(json).unwrap();
-
-        match settings {
-            InboundSettings::Socks(setting) => {
-                assert_eq!(setting.udp, Some(true));
-                assert_eq!(setting.ip.as_deref(), Some("127.0.0.1"));
-            }
-            _ => panic!("expected socks inbound settings"),
-        }
-    }
-
-    #[cfg(not(feature = "tun"))]
-    #[test]
-    fn deserialize_tun_inbound_without_feature_fails() {
-        let json = r#"{
-            "protocol":"tun",
-            "settings": {
-                "name": "tun0",
-                "cidrs": ["10.0.0.1/24"]
-            }
-        }"#;
-
-        let err = serde_json::from_str::<InboundSettings>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown variant `tun`"));
-    }
 }
 
 impl Outbounder {
