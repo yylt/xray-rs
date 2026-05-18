@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 pub struct UdpState {
@@ -561,11 +561,7 @@ impl Proxy {
 
         Box::pin(proxy_stream)
     }
-}
 
-// --- 连接处理 ---
-
-impl Proxy {
     /// 处理单个 SOCKS5 入站连接：握手 + 解析请求 + 返回 ProxyStream
     async fn handle_connection(
         stream: transport::TrStream,

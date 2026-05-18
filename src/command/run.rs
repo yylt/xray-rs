@@ -43,7 +43,7 @@ impl Run {
             _ => return Err(io::Error::new(io::ErrorKind::Other, "unsupported config format")),
         };
 
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_io().build()?;
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         rt.block_on(run_proxy(config))
     }
 }

@@ -82,11 +82,7 @@ pub struct DomainSuffixTrie {
 
 impl DomainSuffixTrie {
     pub fn new() -> Self {
-        let empty_map = Map::new(Vec::new()).unwrap();
-        Self {
-            map: empty_map,
-            id_to_tag: Box::new([]),
-        }
+        DomainSuffixTrieBuilder::new().build().expect("empty FST build failed")
     }
     fn lookup_big(&self, domain: &str) -> Option<&str> {
         // 预处理

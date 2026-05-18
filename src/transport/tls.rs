@@ -141,7 +141,7 @@ fn create_server_config(settings: &TlsSettings) -> Result<ServerConfig> {
     Ok(config)
 }
 
-fn create_client_config(settings: &TlsSettings) -> Result<ClientConfig> {
+pub(crate) fn create_client_config(settings: &TlsSettings) -> Result<ClientConfig> {
     let mut root_cert_store = RootCertStore::empty();
     let cert_result = rustls_native_certs::load_native_certs();
 

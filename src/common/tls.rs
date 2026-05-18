@@ -21,6 +21,36 @@ use x509_parser::prelude::*;
 use rand;
 use ring::aead;
 
+pub fn install_default_crypto_provider() -> IoResult<()> {
+    if CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    #[cfg(feature = "aws-lc-rs")]
+    {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|_| Error::new(ErrorKind::Other, "Failed to install aws-lc-rs crypto provider"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(not(feature = "aws-lc-rs"), feature = "ring"))]
+    {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .map_err(|_| Error::new(ErrorKind::Other, "Failed to install ring crypto provider"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+    {
+        Err(Error::new(
+            ErrorKind::Other,
+            "No rustls crypto provider feature enabled; enable `aws-lc-rs` or `ring`",
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SecureTicketGenerator {
     current_key: aead::LessSafeKey,

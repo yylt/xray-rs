@@ -252,6 +252,7 @@ fn parse_upstream(addr: &str) -> Option<UpstreamClient> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    xray_rs::common::tls::install_default_crypto_provider()?;
     env_logger::init();
 
     let args = Args::parse();

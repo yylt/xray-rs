@@ -34,16 +34,17 @@ pub mod tunnel_client {
     #[derive(Debug, Clone)]
     pub struct TunnelClient<T> {
         inner: tonic::client::Grpc<T>,
+        service_name: String,
     }
     impl TunnelClient<tonic::transport::Channel> {
         /// Attempt to create a new client by connecting to a given endpoint.
-        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        pub async fn connect<D>(dst: D, service_name: String) -> Result<Self, tonic::transport::Error>
         where
             D: TryInto<tonic::transport::Endpoint>,
             D::Error: Into<StdError>,
         {
             let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
-            Ok(Self::new(conn))
+            Ok(Self::new(conn, service_name))
         }
     }
     impl<T> TunnelClient<T>
@@ -53,15 +54,19 @@ pub mod tunnel_client {
         T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
         <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
     {
-        pub fn new(inner: T) -> Self {
+        pub fn new(inner: T, service_name: String) -> Self {
             let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
+            Self { inner, service_name }
         }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
+        pub fn with_origin(inner: T, origin: Uri, service_name: String) -> Self {
             let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
+            Self { inner, service_name }
         }
-        pub fn with_interceptor<F>(inner: T, interceptor: F) -> TunnelClient<InterceptedService<T, F>>
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+            service_name: String,
+        ) -> TunnelClient<InterceptedService<T, F>>
         where
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
@@ -72,7 +77,7 @@ pub mod tunnel_client {
             <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
                 Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            TunnelClient::new(InterceptedService::new(inner, interceptor))
+            TunnelClient::new(InterceptedService::new(inner, interceptor), service_name)
         }
         /// Compress requests with the given encoding.
         ///
@@ -116,10 +121,10 @@ pub mod tunnel_client {
                 .ready()
                 .await
                 .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/rsray.grpc.Tunnel/Tun");
-            let mut req = request.into_streaming_request();
-            req.extensions_mut().insert(GrpcMethod::new("rsray.grpc.Tunnel", "Tun"));
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::try_from(format!("/{}/Tun", self.service_name))
+                .map_err(|e| tonic::Status::internal(format!("invalid gRPC service name: {e}")))?;
+            let req = request.into_streaming_request();
             self.inner.streaming(req, path, codec).await
         }
         /** TunMulti establishes a bidirectional stream with support for multiplexing multiple
@@ -134,11 +139,10 @@ pub mod tunnel_client {
                 .ready()
                 .await
                 .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/rsray.grpc.Tunnel/TunMulti");
-            let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("rsray.grpc.Tunnel", "TunMulti"));
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::try_from(format!("/{}/TunMulti", self.service_name))
+                .map_err(|e| tonic::Status::internal(format!("invalid gRPC service name: {e}")))?;
+            let req = request.into_streaming_request();
             self.inner.streaming(req, path, codec).await
         }
     }
@@ -186,29 +190,31 @@ pub mod tunnel_server {
     #[derive(Debug)]
     pub struct TunnelServer<T> {
         inner: Arc<T>,
+        service_name: String,
         accept_compression_encodings: EnabledCompressionEncodings,
         send_compression_encodings: EnabledCompressionEncodings,
         max_decoding_message_size: Option<usize>,
         max_encoding_message_size: Option<usize>,
     }
     impl<T> TunnelServer<T> {
-        pub fn new(inner: T) -> Self {
-            Self::from_arc(Arc::new(inner))
+        pub fn new(inner: T, service_name: String) -> Self {
+            Self::from_arc(Arc::new(inner), service_name)
         }
-        pub fn from_arc(inner: Arc<T>) -> Self {
+        pub fn from_arc(inner: Arc<T>, service_name: String) -> Self {
             Self {
                 inner,
+                service_name,
                 accept_compression_encodings: Default::default(),
                 send_compression_encodings: Default::default(),
                 max_decoding_message_size: None,
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F, service_name: String) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
-            InterceptedService::new(Self::new(inner), interceptor)
+            InterceptedService::new(Self::new(inner, service_name), interceptor)
         }
         /// Enable decompressing requests with the given encoding.
         #[must_use]
@@ -252,8 +258,10 @@ pub mod tunnel_server {
             Poll::Ready(Ok(()))
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            let tun_path = format!("/{}/Tun", self.service_name);
+            let tun_multi_path = format!("/{}/TunMulti", self.service_name);
             match req.uri().path() {
-                "/rsray.grpc.Tunnel/Tun" => {
+                path if path == tun_path => {
                     #[allow(non_camel_case_types)]
                     struct TunSvc<T: Tunnel>(pub Arc<T>);
                     impl<T: Tunnel> tonic::server::StreamingService<super::Hunk> for TunSvc<T> {
@@ -273,7 +281,7 @@ pub mod tunnel_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = TunSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
+                        let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
                             .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
@@ -282,7 +290,7 @@ pub mod tunnel_server {
                     };
                     Box::pin(fut)
                 }
-                "/rsray.grpc.Tunnel/TunMulti" => {
+                path if path == tun_multi_path => {
                     #[allow(non_camel_case_types)]
                     struct TunMultiSvc<T: Tunnel>(pub Arc<T>);
                     impl<T: Tunnel> tonic::server::StreamingService<super::MultiHunk> for TunMultiSvc<T> {
@@ -305,7 +313,7 @@ pub mod tunnel_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = TunMultiSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
+                        let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
                             .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
@@ -329,6 +337,7 @@ pub mod tunnel_server {
             let inner = self.inner.clone();
             Self {
                 inner,
+                service_name: self.service_name.clone(),
                 accept_compression_encodings: self.accept_compression_encodings,
                 send_compression_encodings: self.send_compression_encodings,
                 max_decoding_message_size: self.max_decoding_message_size,
@@ -337,7 +346,7 @@ pub mod tunnel_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "rsray.grpc.Tunnel";
+    pub const SERVICE_NAME: &str = "dynamic.grpc.Tunnel";
     impl<T> tonic::server::NamedService for TunnelServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }

@@ -42,6 +42,11 @@ fn format_log_prefix(level: log::Level, target: &str, message: &str) -> String {
 }
 
 fn main() {
+    if let Err(err) = xray_rs::common::tls::install_default_crypto_provider() {
+        eprintln!("failed to initialize TLS crypto provider: {err}");
+        std::process::exit(1);
+    }
+
     // Initialize logging
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
