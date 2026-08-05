@@ -32,7 +32,7 @@ rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std
 x509-parser = { version = "0.18.1", default-features = false }
 tun = { version = "0.8.6", default-features = false, features = ["async"], optional = true }
 etherparse = { version = "0.21.0", default-features = false, features = ["std"] }
-pprof = { version = "0.14", default-features = false, optional = true, features = ["prost-codec", "flamegraph"] }
+pprof = { version = "0.15", default-features = false, optional = true, features = ["prost-codec", "flamegraph"] }
 socket2 = { version = "0.6", default-features = false }
 hyper-util = { version = "0.1", default-features = false, features = ["http1", "http2", "server-auto", "client-legacy", "tokio"] }
 http-body-util = { version = "0.1", default-features = false }
