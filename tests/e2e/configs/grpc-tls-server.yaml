@@ -1,0 +1,23 @@
+inbounds:
+  - listen: 127.0.0.1
+    port: 11002
+    protocol: trojan
+    tag: trojan-grpc-tls-in
+    settings:
+      password: test-password-123
+    streamSettings:
+      network: grpc
+      security: tls
+      tlsSettings:
+        alpn:
+          - h2
+          - http/1.1
+      grpcSettings:
+        serviceName: grpc
+        multiMode: false
+      sockopt:
+        tcpNoDelay: true
+
+outbounds:
+  - tag: direct
+    protocol: freedom

@@ -1,0 +1,27 @@
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "tests/e2e/go.mod"
+
+      - name: Build xray-rs
+        run: cargo build
+
+      - name: Run E2E tests
+        run: ./tests/e2e/run_tests.sh

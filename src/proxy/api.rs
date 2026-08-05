@@ -126,70 +126,13 @@ mod profiling {
         }
     }
 
-    /// Memory profile handler using jemalloc
-    /// MALLOC_CONF="prof:true,prof_active:true" ./binary start
+    /// Memory profile handler — jemalloc removed
     pub async fn handle_prof_mem(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        #[cfg(all(feature = "jemalloc", feature = "profiling"))]
-        {
-            use std::ffi::CString;
-
-            // Get query parameters
-            let query = match ProfilingQuery::from_query(req.uri().query()) {
-                Ok(q) => q,
-                Err(e) => {
-                    return Ok(super::json_response(StatusCode::BAD_REQUEST, json!({"error": e})));
-                }
-            };
-
-            // Wait for sampling window
-            tokio::time::sleep(Duration::from_secs(query.seconds)).await;
-
-            // Trigger memory profiling dump
-            let temp_path = format!("/tmp/jemalloc_profile_{}.prof", std::process::id());
-
-            // Use raw mallctl to dump the heap profile
-            let cmd = CString::new(format!("prof.dump,{}", temp_path)).unwrap();
-
-            unsafe {
-                let ret = tikv_jemalloc_sys::mallctl(
-                    cmd.as_ptr() as *const i8,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
-                );
-                if ret != 0 {
-                    return Ok(super::json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({"error": format!("jemalloc dump failed with code: {}", ret)}),
-                    ));
-                }
-            }
-
-            // Read the dump file
-            match tokio::fs::read(&temp_path).await {
-                Ok(data) => {
-                    // Clean up temp file
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    Ok(binary_response(StatusCode::OK, Bytes::from(data), "profile.pb"))
-                }
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    Ok(super::json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({"error": format!("failed to read profile: {}", e)}),
-                    ))
-                }
-            }
-        }
-
-        #[cfg(not(all(feature = "jemalloc", feature = "profiling")))]
-        {
-            Ok(super::json_response(
-                StatusCode::NOT_IMPLEMENTED,
-                json!({"error": "jemalloc and profiling features required"}),
-            ))
-        }
+        let _ = req;
+        Ok(super::json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            json!({"error": "memory profiling unavailable"}),
+        ))
     }
 }
 

@@ -1,0 +1,32 @@
+inbounds:
+  - listen: 127.0.0.1
+    port: 12001
+    protocol: http
+    tag: http-in
+    settings:
+      allowTransparent: false
+  - listen: 127.0.0.1
+    port: 12002
+    protocol: socks
+    tag: socks-in
+
+outbounds:
+  - tag: proxy
+    protocol: trojan
+    settings:
+      address: 127.0.0.1
+      port: 11001
+      password: test-password-123
+    streamSettings:
+      network: ws
+      security: tls
+      tlsSettings:
+        serverName: localhost
+        allowInsecure: true
+        alpn:
+          - http/1.1
+      wsSettings:
+        path: /ws
+        headers: {}
+      sockopt:
+        tcpNoDelay: true

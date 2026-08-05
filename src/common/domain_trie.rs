@@ -82,7 +82,7 @@ pub struct DomainSuffixTrie {
 
 impl DomainSuffixTrie {
     pub fn new() -> Self {
-        let empty_map = Map::new(Vec::new()).unwrap();
+        let empty_map = Map::default();
         Self {
             map: empty_map,
             id_to_tag: Box::new([]),

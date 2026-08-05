@@ -4,10 +4,6 @@ use xray_rs::{build_info, root};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 fn level_letter(level: log::Level) -> char {
     match level {
         log::Level::Error => 'E',
