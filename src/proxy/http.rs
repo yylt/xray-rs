@@ -118,10 +118,10 @@ impl Proxy {
 
         if method.eq_ignore_ascii_case("CONNECT") {
             log::debug!("[HTTP] Handling CONNECT request to {}", path);
-            handle_connect(stream, peer_addr, path, remainder).await
+            handle_connect(stream, peer_addr, &path, remainder).await
         } else {
             log::debug!("[HTTP] Handling plain HTTP request");
-            handle_plain_http(stream, peer_addr, buf).await
+            handle_plain_http(stream, peer_addr, buf, &path, header_len).await
         }
     }
 }
@@ -249,7 +249,7 @@ async fn check_proxy_auth(data: &[u8], account: &Account, stream: &mut transport
 async fn handle_connect(
     mut stream: transport::TrStream,
     peer_addr: Address,
-    path: String,
+    path: &str,
     remainder: Option<Bytes>,
 ) -> std::io::Result<ProxyStream> {
     log::debug!("[HTTP] Parsing CONNECT destination: {}", path);
@@ -279,6 +279,8 @@ async fn handle_plain_http(
     stream: transport::TrStream,
     peer_addr: Address,
     raw_request: Bytes,
+    path: &str,
+    header_len: usize,
 ) -> std::io::Result<ProxyStream> {
     log::debug!("[HTTP] Extracting Host header");
     let host = extract_header(&raw_request, "Host").ok_or_else(|| {
@@ -290,8 +292,33 @@ async fn handle_plain_http(
     let dest = parse::parse_host_with_default_port(&host, 80);
     log::debug!("[HTTP] Destination: {:?}", dest);
 
-    let wrapped = wrap_stream_with_prefix(stream, Some(raw_request));
-    Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped))
+    if let Some(rewritten) = rewrite_request_line(&raw_request, path, header_len) {
+        let wrapped = wrap_stream_with_prefix(stream, Some(Bytes::from(rewritten)));
+        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped))
+    } else {
+        let wrapped = wrap_stream_with_prefix(stream, Some(raw_request));
+        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped))
+    }
+}
+
+fn rewrite_request_line(raw: &[u8], absolute_uri: &str, header_len: usize) -> Option<Vec<u8>> {
+    if !absolute_uri.starts_with("http://") && !absolute_uri.starts_with("https://") {
+        return None;
+    }
+
+    let uri_start = raw.windows(absolute_uri.len()).position(|w| w == absolute_uri.as_bytes())?;
+
+    let scheme_end = absolute_uri.find("://")? + 3;
+    let path_start = absolute_uri[scheme_end..].find('/')? + scheme_end;
+    let origin_path = &absolute_uri[path_start..];
+
+    let header_part = &raw[header_len..];
+    let mut result = Vec::with_capacity(header_part.len() + origin_path.len() + 64);
+    result.extend_from_slice(&raw[..uri_start]);
+    result.extend_from_slice(origin_path.as_bytes());
+    result.extend_from_slice(&raw[uri_start + absolute_uri.len()..]);
+
+    Some(result)
 }
 
 #[cfg(test)]
@@ -347,10 +374,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_http_replays_original_request() {
+    async fn plain_http_rewrites_absolute_uri_to_origin_form() {
         let (mut client, server) = tcp_pair().await;
 
         let request = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
+        let expected = b"GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
 
         let writer = tokio::spawn(async move {
             client.write_all(request).await.unwrap();
@@ -376,8 +404,8 @@ mod tests {
         }
 
         let mut inner = proxy_stream.inner;
-        let mut buf = vec![0u8; request.len()];
+        let mut buf = vec![0u8; expected.len()];
         inner.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, request);
+        assert_eq!(&buf, expected);
     }
 }

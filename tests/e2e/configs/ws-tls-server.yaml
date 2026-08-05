@@ -1,0 +1,22 @@
+inbounds:
+  - listen: 127.0.0.1
+    port: 11001
+    protocol: trojan
+    tag: trojan-ws-tls-in
+    settings:
+      password: test-password-123
+    streamSettings:
+      network: ws
+      security: tls
+      tlsSettings:
+        alpn:
+          - http/1.1
+      wsSettings:
+        path: /ws
+        headers: {}
+      sockopt:
+        tcpNoDelay: true
+
+outbounds:
+  - tag: direct
+    protocol: freedom

@@ -21,19 +21,19 @@ jobs:
             target: x86_64-unknown-linux-musl
             builder: cargo
             artifact-dir: release
-            build-args: "--release --features=jemalloc"
+            build-args: "--release"
 
           - name: Linux aarch64
             target: aarch64-unknown-linux-musl
             builder: cross
             artifact-dir: release
-            build-args: "--release --features=jemalloc -vv"
+            build-args: "--release -vv"
 
           - name: Android aarch64
             target: aarch64-linux-android
             builder: cross
             artifact-dir: release
-            build-args: "--release --features=jemalloc"
+            build-args: "--release"
 
           - name: Windows x86_64
             os: windows-latest
@@ -65,14 +65,10 @@ jobs:
 
       - name: Build with cargo
         if: matrix.platform.builder == 'cargo'
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
         run: cargo build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
 
       - name: Build with cross
         if: matrix.platform.builder == 'cross'
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
         run: cross build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
 
       - name: Store artifact

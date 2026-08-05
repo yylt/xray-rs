@@ -4,59 +4,57 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-futures = "0.3.32"
-bytes = "1.10.1"
-clap = { version = "4.6", features = ["derive"] }
-sha2 = "0.11.0"
-serde = { version = "1.0.227", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = { version = "0.9.34", features = [] }
-uuid = { version = "1.22", features = ["std", "v4"] }
-mimalloc = { version = "0.1.48", optional = true }
-parking_lot = { version = "0.12.5" }
-base64 = { version = "0.22.1" }
-fst = { version = "0.4.7" }
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
+bytes = { version = "1.10.1", default-features = false, features = ["std"] }
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+sha2 = { version = "0.11.0", default-features = false }
+serde = { version = "1.0.227", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+serde_yaml = { version = "0.9.34", default-features = false }
+uuid = { version = "1.22", default-features = false, features = ["std", "v4"] }
+mimalloc = { version = "0.1.48", default-features = false, optional = true }
+parking_lot = { version = "0.12.5", default-features = false }
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+fst = { version = "0.4.7", default-features = false }
 # runtime
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
-hickory-resolver = { version = "0.26.0" }
-aws-lc-rs = { version = "*", optional = true }
-tokio = { version = "1.49.0", features = ["io-std", "net", "signal", "sync", "time", "fs"] }
+hickory-resolver = { version = "0.26.0", default-features = false, features = ["system-config"] }
+aws-lc-rs = { version = "*", optional = true, default-features = false }
+tokio = { version = "1.49.0", default-features = false, features = ["io-std", "net", "signal", "sync", "time", "fs", "rt-multi-thread", "macros"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
-tokio-stream = "0.1.18"
-tokio-util = { version = "0.7.18" }
+tokio-stream = { version = "0.1.18", default-features = false, features = ["sync"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["io"] }
 async-stream = "0.3.6"
-ahash = "0.8.12"
-rustls = "0.23.37"
-rustls-native-certs = { version = "0.8.3", features = [] }
-rustls-pemfile = { version = "2.2.0", features = [] }
-x509-parser= "0.18.1"
-tun = { version = "0.8.6", features = ["async"], optional = true }
-etherparse = "0.19.0"
-tikv-jemallocator = { version = "0.6", optional = true, features = ["profiling"] }
-tikv-jemalloc-sys = { version = "0.6", optional = true, features = ["profiling"] }
-pprof = { version = "0.14", optional = true, features = ["prost-codec", "flamegraph"] }
-socket2 = "0.6"
-hyper-util = "0.1"
-http-body-util = "0.1"
-http = "1.4"
-hyper = { version = "1.8", features = ["server", "http1"] }
-tonic = { version = "0.14.2", features = ["gzip"] }
-tonic-prost = "0.14"
-prost = "0.14"
-tower = "0.5"
-env_logger = "0.11"
-log = "0.4"
-ring = "0.17.14"
-rand = "0.10"
-tokio-tungstenite = "0.29"
-httparse = "1.10.1"
-thiserror = "2.0"
-hickory-proto = "0.25"
-lru = "0.16"
-ipnet = "2.12"
-url = "2.5"
-time = { version = "0.3", features = ["formatting", "local-offset"] }
-pin-project-lite = "0.2.17"
+ahash = { version = "0.8.12", default-features = false, features = ["std", "runtime-rng"] }
+rustls = { version = "0.23.37", default-features = false, features = ["std", "tls12"] }
+rustls-native-certs = { version = "0.8.3", default-features = false }
+rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"] }
+x509-parser = { version = "0.18.1", default-features = false }
+tun = { version = "0.8.6", default-features = false, features = ["async"], optional = true }
+etherparse = { version = "0.19.0", default-features = false, features = ["std"] }
+pprof = { version = "0.14", default-features = false, optional = true, features = ["prost-codec", "flamegraph"] }
+socket2 = { version = "0.6", default-features = false }
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "http2", "server-auto", "client-legacy", "tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+http = { version = "1.4", default-features = false }
+hyper = { version = "1.8", default-features = false, features = ["server", "http1"] }
+tonic = { version = "0.14.2", default-features = false, features = ["gzip", "channel", "server", "codegen"] }
+tonic-prost = { version = "0.14", default-features = false }
+prost = { version = "0.14", default-features = false, features = ["std"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+log = { version = "0.4", default-features = false }
+ring = { version = "0.17.14", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+httparse = { version = "1.10.1", default-features = false, features = ["std"] }
+thiserror = { version = "2.0", default-features = false }
+hickory-proto = { version = "0.25", default-features = false }
+lru = { version = "0.16", default-features = false }
+ipnet = { version = "2.12", default-features = false }
+url = { version = "2.5", default-features = false }
+time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "std"] }
+pin-project-lite = { version = "0.2.17", default-features = false }
 
 [[bin]]
 name = "rsdns"
@@ -75,10 +73,9 @@ inherits = "release"
 strip = false
 
 [features]
-default = ["aws-lc-rs", "jemalloc", "tun"]
+default = ["aws-lc-rs", "mimalloc", "tun"]
 tun = ["dep:tun"]
 mimalloc = ["dep:mimalloc"]
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 profiling = ["dep:pprof"]
 aws-lc-rs = [
   "dep:aws-lc-rs",
