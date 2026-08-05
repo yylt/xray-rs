@@ -29,7 +29,7 @@ echo ""
 
 echo "开始运行测试..."
 echo "=========================================="
-./test_runner -v
+./test_runner -suite xray -v
 
 EXIT_CODE=$?
 

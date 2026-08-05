@@ -5,8 +5,8 @@ on:
     branches: ["main"]
 
 jobs:
-  e2e:
-    name: E2E Tests
+  e2e-xray:
+    name: E2E xray-rs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,5 +23,30 @@ jobs:
       - name: Build xray-rs
         run: cargo build
 
-      - name: Run E2E tests
-        run: ./tests/e2e/run_tests.sh
+      - name: Run xray-rs E2E tests
+        run: ./tests/e2e/run_xray_tests.sh
+
+  e2e-rsdns:
+    name: E2E rsdns
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "tests/e2e/go.mod"
+
+      - name: Build rsdns
+        run: cargo build --bin rsdns
+
+      - name: Run rsdns E2E tests
+        env:
+          RSDNS_UPSTREAM_DOT: "1.1.1.1:853"
+          RSDNS_UPSTREAM_DOH: "https://1.1.1.1/dns-query"
+          RSDNS_UPSTREAM_DOH3: "h3://1.1.1.1/dns-query"
+        run: ./tests/e2e/run_rsdns_tests.sh

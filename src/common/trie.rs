@@ -77,7 +77,7 @@ pub struct DomainMarisaBuilder {
     root: BuildNode,
     tags: TagPoolBuilder,
 }
-#[deprecated(since = "0.1.0", note = "请使用 common::domain_trie 代替")]
+
 impl DomainMarisaBuilder {
     pub fn new() -> Self {
         Self {

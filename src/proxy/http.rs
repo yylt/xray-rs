@@ -306,7 +306,9 @@ fn rewrite_request_line(raw: &[u8], absolute_uri: &str, header_len: usize) -> Op
         return None;
     }
 
-    let uri_start = raw.windows(absolute_uri.len()).position(|w| w == absolute_uri.as_bytes())?;
+    let uri_start = raw
+        .windows(absolute_uri.len())
+        .position(|w| w == absolute_uri.as_bytes())?;
 
     let scheme_end = absolute_uri.find("://")? + 3;
     let path_start = absolute_uri[scheme_end..].find('/')? + scheme_end;
