@@ -29,6 +29,8 @@ const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = true;
 const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 300;
+const DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD: usize = 1024 * 1024;
+const DEFAULT_GRPC_MULTI_BATCH_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,7 +137,7 @@ impl Grpc {
         let route_config = RouteConfig::from(grpc_settings);
 
         let strategy_str = grpc_settings.load_balancer.as_deref().unwrap_or("least_connection");
-        let strategy = super::balancer::Strategy::from_str(strategy_str);
+        let strategy = super::balancer::Strategy::from_strategy_str(strategy_str);
 
         let balancer = Arc::new(super::balancer::GrpcBalancer::new(strategy));
 
@@ -303,8 +305,8 @@ impl Grpc {
     ) {
         let path_for_log = path.clone();
         let req = tonic::Request::new(async_stream::stream! {
-            while let Some(bytes) = outgoing_rx.recv().await {
-                yield MultiHunk { data: vec![bytes] };
+            while let Some(chunks) = recv_batch(&mut outgoing_rx, DEFAULT_GRPC_MULTI_BATCH_LIMIT).await {
+                yield MultiHunk { data: chunks };
             }
         });
 
@@ -592,6 +594,7 @@ struct TunGrpcService<M> {
     peer_addr: Address,
     stream_tx: mpsc::Sender<(GrpcStream, Address)>,
     buf_byte_size: usize,
+    batch_limit: usize,
     _marker: PhantomData<M>,
 }
 
@@ -601,6 +604,7 @@ impl<M> Clone for TunGrpcService<M> {
             peer_addr: self.peer_addr.clone(),
             stream_tx: self.stream_tx.clone(),
             buf_byte_size: self.buf_byte_size,
+            batch_limit: self.batch_limit,
             _marker: PhantomData,
         }
     }
@@ -608,7 +612,7 @@ impl<M> Clone for TunGrpcService<M> {
 
 trait TunMessage: prost::Message + Default + Send + 'static {
     fn into_chunks(self) -> TunChunks;
-    fn from_bytes(bytes: Bytes) -> Self;
+    fn from_many_bytes(chunks: Vec<Bytes>) -> Self;
 }
 
 enum TunChunks {
@@ -632,8 +636,10 @@ impl TunMessage for Hunk {
         TunChunks::One(Some(self.data))
     }
 
-    fn from_bytes(bytes: Bytes) -> Self {
-        Self { data: bytes }
+    fn from_many_bytes(mut chunks: Vec<Bytes>) -> Self {
+        Self {
+            data: chunks.pop().unwrap_or_default(),
+        }
     }
 }
 
@@ -642,9 +648,25 @@ impl TunMessage for MultiHunk {
         TunChunks::Many(self.data.into_iter())
     }
 
-    fn from_bytes(bytes: Bytes) -> Self {
-        Self { data: vec![bytes] }
+    fn from_many_bytes(chunks: Vec<Bytes>) -> Self {
+        Self { data: chunks }
     }
+}
+
+async fn recv_batch(rx: &mut mpsc::Receiver<Bytes>, limit: usize) -> Option<Vec<Bytes>> {
+    let first = rx.recv().await?;
+    let mut batch = Vec::with_capacity(limit.clamp(1, DEFAULT_GRPC_MULTI_BATCH_LIMIT));
+    batch.push(first);
+
+    while batch.len() < limit {
+        match rx.try_recv() {
+            Ok(bytes) => batch.push(bytes),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    Some(batch)
 }
 
 impl<M> TunGrpcService<M>
@@ -682,6 +704,17 @@ where
         });
     }
 
+    fn response_stream(
+        mut outgoing_rx: mpsc::Receiver<Bytes>,
+        batch_limit: usize,
+    ) -> Pin<Box<dyn tokio_stream::Stream<Item = Result<M, tonic::Status>> + Send + 'static>> {
+        Box::pin(async_stream::stream! {
+            while let Some(chunks) = recv_batch(&mut outgoing_rx, batch_limit).await {
+                yield Ok(M::from_many_bytes(chunks));
+            }
+        })
+    }
+
     async fn handle<B>(&self, req: http::Request<B>) -> http::Response<tonic::body::Body>
     where
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
@@ -707,14 +740,12 @@ where
 
             fn call(&mut self, request: tonic::Request<tonic::Streaming<M>>) -> Self::Future {
                 let service = self.0.clone();
+                let batch_limit = service.batch_limit;
                 Box::pin(async move {
-                    let (incoming_tx, mut outgoing_rx) = service.start_stream().await?;
+                    let (incoming_tx, outgoing_rx) = service.start_stream().await?;
                     service.spawn_reader(request.into_inner(), incoming_tx);
-                    let response_stream: Self::ResponseStream = Box::pin(async_stream::stream! {
-                        while let Some(bytes) = outgoing_rx.recv().await {
-                            yield Ok(M::from_bytes(bytes));
-                        }
-                    });
+                    let response_stream: Self::ResponseStream =
+                        TunGrpcService::<M>::response_stream(outgoing_rx, batch_limit);
                     Ok(tonic::Response::new(response_stream))
                 })
             }
@@ -762,6 +793,7 @@ where
                         peer_addr,
                         stream_tx,
                         buf_byte_size,
+                        batch_limit: 1,
                         _marker: PhantomData,
                     };
                     Ok::<_, std::convert::Infallible>(service.handle(req).await)
@@ -771,6 +803,7 @@ where
                         peer_addr,
                         stream_tx,
                         buf_byte_size,
+                        batch_limit: DEFAULT_GRPC_MULTI_BATCH_LIMIT,
                         _marker: PhantomData,
                     };
                     Ok::<_, std::convert::Infallible>(service.handle(req).await)
@@ -789,7 +822,7 @@ where
 
                 if let Err(e) = conn.await {
                     error!("HTTP/2 connection error for {:?}: {}", peer_addr, e);
-                    return Err(Error::new(ErrorKind::Other, e.to_string()));
+                    return Err(Error::other(e.to_string()));
                 }
             }
             Err(e) => {
@@ -805,20 +838,25 @@ where
 
         if let Err(e) = conn.await {
             error!("HTTP/2 connection error for {:?}: {}", peer_addr, e);
-            return Err(Error::new(ErrorKind::Other, e.to_string()));
+            return Err(Error::other(e.to_string()));
         }
     }
 
     Ok(())
 }
 
-fn make_service(_buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+fn make_service(buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
+    let write_buf_capacity = buf_byte_size.clamp(8192, DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD);
+    let flush_threshold = buf_byte_size
+        .max(write_buf_capacity)
+        .min(DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD);
 
     let stream_service = GrpcStream {
         read_buf: Bytes::new(),
-        write_buf: BytesMut::with_capacity(8192),
+        write_buf: BytesMut::with_capacity(write_buf_capacity),
+        write_flush_threshold: flush_threshold,
         incoming_rx: Some(incoming_rx),
         outgoing_tx: Some(PollSender::new(outgoing_tx)),
         task: None,
@@ -874,7 +912,7 @@ impl RouteConfig {
                     .get(http::header::HOST)
                     .or_else(|| _req.headers().get(":authority"))
                 {
-                    Some(req_host) => req_host.to_str().map_or(false, |s| s == local),
+                    Some(req_host) => req_host.to_str().unwrap_or("") == local,
                     None => false,
                 }
             }
@@ -926,6 +964,7 @@ impl From<&GrpcSettings> for RouteConfig {
 pub struct GrpcStream {
     read_buf: Bytes,
     write_buf: BytesMut,
+    write_flush_threshold: usize,
     incoming_rx: Option<mpsc::Receiver<Bytes>>,
     outgoing_tx: Option<PollSender<Bytes>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -976,10 +1015,8 @@ impl AsyncRead for GrpcStream {
 
 impl AsyncWrite for GrpcStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
-        if self.write_buf.len() >= 1048576 {
-            if self.as_mut().poll_flush(cx)?.is_pending() {
-                return Poll::Pending;
-            }
+        if self.write_buf.len() >= self.write_flush_threshold && self.as_mut().poll_flush(cx)?.is_pending() {
+            return Poll::Pending;
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));

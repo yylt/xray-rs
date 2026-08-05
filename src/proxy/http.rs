@@ -7,22 +7,13 @@ const MAX_HEADERS: usize = 64;
 const BUFFER_SIZE: usize = 8192;
 const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct InSetting {
     #[serde(rename = "account")]
     pub account: Option<Account>,
 
     #[serde(rename = "allowTransparent")]
     pub allow_transparent: Option<bool>,
-}
-
-impl Default for InSetting {
-    fn default() -> Self {
-        Self {
-            account: None,
-            allow_transparent: None,
-        }
-    }
 }
 
 pub struct Proxy {
@@ -35,7 +26,7 @@ impl Proxy {
     pub fn new_inbound(set: &InSetting, tr: transport::Transport) -> Result<Self> {
         Ok(Self {
             account: set.account.clone(),
-            allow_transparent: set.allow_transparent.map_or(false, |x| x),
+            allow_transparent: set.allow_transparent.unwrap_or(false),
             tr,
         })
     }
@@ -253,7 +244,7 @@ async fn handle_connect(
     remainder: Option<Bytes>,
 ) -> std::io::Result<ProxyStream> {
     log::debug!("[HTTP] Parsing CONNECT destination: {}", path);
-    let dest = parse::parse_host_port(&path)?;
+    let dest = parse::parse_host_port(path)?;
     log::debug!("[HTTP] CONNECT destination: {:?}", dest);
 
     let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";

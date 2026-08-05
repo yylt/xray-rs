@@ -541,7 +541,7 @@ impl ReversInbound {
             };
 
             send_socks5_error(&mut pending_conn.socks_stream, socks_error).await?;
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Target connection failed"));
+            return Err(std::io::Error::other("Target connection failed"));
         }
 
         // Target connection successful
@@ -566,10 +566,7 @@ impl ReversInbound {
     ) -> Result<()> {
         // Parse SOCKS5 handshake
         let mut processor = Socks5Processor::new(None);
-        let (socks_stream, cmd, target_addr) = processor
-            .process(stream)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let (socks_stream, cmd, target_addr) = processor.process(stream).await.map_err(std::io::Error::other)?;
 
         if cmd != crate::common::socks::Command::Connect {
             return Err(std::io::Error::new(
@@ -716,10 +713,7 @@ impl ReversOutbound {
             control_stream.read_exact(&mut error_msg).await?;
 
             let error_str = String::from_utf8_lossy(&error_msg);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Registration failed: {}", error_str),
-            ));
+            return Err(std::io::Error::other(format!("Registration failed: {}", error_str)));
         }
 
         // Read client ID
@@ -808,10 +802,10 @@ impl ReversOutbound {
         data_stream.read_exact(&mut status).await?;
 
         if status[0] != 0x00 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Data handshake failed with status: {}", status[0]),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Data handshake failed with status: {}",
+                status[0]
+            )));
         }
 
         debug!("Data connection handshake successful for {}", conn_id);

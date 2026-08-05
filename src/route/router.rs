@@ -56,6 +56,12 @@ pub struct Router {
 /// Thread-safe shared Router
 pub type SharedRouter = Arc<RwLock<Router>>;
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Router {
     pub fn new() -> Self {
         Self::new_with_strategy(Strategy::default())

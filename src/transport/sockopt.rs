@@ -50,7 +50,7 @@ impl SocketOpt {
         }
 
         let std_stream: std::net::TcpStream = socket.into();
-        Ok(TcpStream::from_std(std_stream)?)
+        TcpStream::from_std(std_stream)
     }
 
     #[cfg(unix)]
@@ -65,6 +65,6 @@ impl SocketOpt {
         }
 
         let std_stream: std::os::unix::net::UnixStream = socket.into();
-        Ok(UnixStream::from_std(std_stream)?)
+        UnixStream::from_std(std_stream)
     }
 }

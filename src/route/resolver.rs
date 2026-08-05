@@ -6,22 +6,13 @@ use hickory_resolver::TokioResolver;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DnsSettings {
     #[serde(rename = "hosts", default)]
     pub hosts: Vec<String>,
 
     #[serde(rename = "servers", default)]
     pub servers: Vec<String>,
-}
-
-impl Default for DnsSettings {
-    fn default() -> Self {
-        Self {
-            hosts: vec![],
-            servers: vec![],
-        }
-    }
 }
 
 /// DNS 服务器配置（带 resolver 实例）
@@ -45,7 +36,7 @@ impl DnsResolver {
         // 加载 hosts
         for host_entry in &settings.hosts {
             if host_entry.starts_with("file://") {
-                let file_path = &host_entry[7..];
+                let file_path = host_entry.strip_prefix("file://").unwrap();
                 match Self::load_hosts_file(file_path) {
                     Ok(file_hosts) => {
                         log::info!("Loaded {} hosts from {}", file_hosts.len(), file_path);
@@ -93,7 +84,7 @@ impl DnsResolver {
         let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
             .with_options(ResolverOpts::default())
             .build()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         Ok(DnsServerInstance { resolver })
     }
@@ -154,7 +145,7 @@ impl DnsResolver {
         log::debug!("DNS: {} using system resolver", domain);
         let addrs: Vec<IpAddr> = tokio::net::lookup_host(format!("{}:0", domain))
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
             .map(|addr| addr.ip())
             .collect();
 
@@ -194,7 +185,7 @@ impl DnsResolver {
         }
 
         Err(last_err
-            .map(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map(std::io::Error::other)
             .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No records found")))
     }
 }

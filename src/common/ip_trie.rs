@@ -49,7 +49,6 @@ impl IpTrieBuilder {
             id_to_tag: Vec::new(),
         }
     }
-
     pub fn insert(&mut self, cidr: IpNet, tag: &str) {
         let tag_id = *self.tag_to_id.entry(tag.into()).or_insert_with(|| {
             let id = self.id_to_tag.len() as u32;
@@ -127,6 +126,12 @@ impl IpTrieBuilder {
     }
 }
 
+impl Default for IpTrieBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IpTrie {
     pub fn new() -> Self {
         Self {
@@ -176,6 +181,12 @@ impl IpTrie {
         }
 
         last_found_tag.map(|id| self.tags[id as usize].as_ref())
+    }
+}
+
+impl Default for IpTrie {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

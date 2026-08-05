@@ -1,263 +1,86 @@
+//! DNS upstream client and group types.
+//!
+//! An [`UpstreamClient`] wraps a [`ConnectionPool`] and exposes a simple
+//! `query()` interface.  An [`UpstreamGroup`] fans queries out to multiple
+//! clients concurrently, returning the first successful response.
+
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use hickory_proto::op::Message;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hickory_proto::op::{DnsRequest, DnsRequestOptions, Message};
+use hickory_proto::rr::{DNSClass, Name, RecordType};
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::timeout;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::ClientConfig;
-use tokio_rustls::TlsConnector;
 
-const DNS_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_DNS_SIZE: usize = 4096;
+use super::pool::ConnectionPool;
+use hickory_net::xfer::{DnsHandle, FirstAnswer};
 
-#[derive(Debug, Clone)]
-pub enum UpstreamProtocol {
-    Udp,
-    Tcp,
-    Tls { server_name: String },
-    Https { url: String },
-    H3 { url: String },
-}
-
+/// A single upstream DNS client backed by a connection pool.
+///
+/// Cheap to clone — all clones share the same pool via `Arc`.
 #[derive(Clone)]
 pub struct UpstreamClient {
-    pub addrs: Vec<SocketAddr>,
-    pub protocol: UpstreamProtocol,
-    tls_config: Option<Arc<ClientConfig>>,
-    pub bootstrap: bool,
-    pub is_dynamic: bool,
+    pool: Arc<ConnectionPool>,
 }
 
 impl UpstreamClient {
-    pub fn new_udp(addrs: Vec<SocketAddr>) -> Self {
-        Self {
-            addrs,
-            protocol: UpstreamProtocol::Udp,
-            tls_config: None,
-            bootstrap: false,
-            is_dynamic: false,
-        }
+    /// Creates a client that draws connections from `pool`.
+    pub fn new(pool: Arc<ConnectionPool>) -> Self {
+        Self { pool }
     }
 
-    pub fn new_tcp(addrs: Vec<SocketAddr>) -> Self {
-        Self {
-            addrs,
-            protocol: UpstreamProtocol::Tcp,
-            tls_config: None,
-            bootstrap: false,
-            is_dynamic: false,
-        }
-    }
-
-    pub fn new_tls(addrs: Vec<SocketAddr>, server_name: String, tls_config: Arc<ClientConfig>) -> Self {
-        Self {
-            addrs,
-            protocol: UpstreamProtocol::Tls { server_name },
-            tls_config: Some(tls_config),
-            bootstrap: false,
-            is_dynamic: false,
-        }
-    }
-
-    pub fn new_doh(url: String, tls_config: Arc<ClientConfig>) -> Self {
-        Self {
-            addrs: Vec::new(),
-            protocol: UpstreamProtocol::Https { url },
-            tls_config: Some(tls_config),
-            bootstrap: false,
-            is_dynamic: false,
-        }
-    }
-
-    pub fn new_doh3(url: String, tls_config: Arc<ClientConfig>) -> Self {
-        Self {
-            addrs: Vec::new(),
-            protocol: UpstreamProtocol::H3 { url },
-            tls_config: Some(tls_config),
-            bootstrap: false,
-            is_dynamic: false,
-        }
-    }
-
+    /// Sends a DNS query through the pool and returns the response.
+    ///
+    /// Internally calls `pool.checkout()` to obtain a `CloneableSender`,
+    /// then `sender.send(request).first_answer().await`.
     pub async fn query(&self, msg: &Message) -> io::Result<Message> {
-        match &self.protocol {
-            UpstreamProtocol::Udp => {
-                let addr = self
-                    .addrs
-                    .first()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no upstream address"))?;
-                self.query_udp(*addr, msg).await
+        let guard = self
+            .pool
+            .checkout()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no available connection in pool"))?;
+
+        let request = DnsRequest::new(msg.clone(), DnsRequestOptions::default());
+        let result = guard
+            .sender()
+            .send(request)
+            .first_answer()
+            .await
+            .map(|response| response.into_message())
+            .map_err(io::Error::other);
+
+        match result {
+            Ok(message) => {
+                guard.record_success();
+                Ok(message)
             }
-            UpstreamProtocol::Tcp => {
-                let addr = self
-                    .addrs
-                    .first()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no upstream address"))?;
-                self.query_tcp(*addr, msg).await
+            Err(err) => {
+                guard.record_failure();
+                Err(err)
             }
-            UpstreamProtocol::Tls { server_name } => {
-                let addr = self
-                    .addrs
-                    .first()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no upstream address"))?;
-                self.query_tls(*addr, server_name, msg).await
-            }
-            UpstreamProtocol::Https { url } => self.query_doh(url, msg).await,
-            UpstreamProtocol::H3 { url } => self.query_doh3(url, msg).await,
         }
-    }
-
-    async fn query_udp(&self, addr: SocketAddr, msg: &Message) -> io::Result<Message> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let buf = msg
-            .to_vec()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        socket.send_to(&buf, addr).await?;
-
-        let mut recv_buf = vec![0u8; MAX_DNS_SIZE];
-        let (len, _) = timeout(DNS_TIMEOUT, socket.recv_from(&mut recv_buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP timeout"))??;
-
-        Message::from_vec(&recv_buf[..len]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    async fn query_tcp(&self, addr: SocketAddr, msg: &Message) -> io::Result<Message> {
-        let mut stream = timeout(DNS_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timeout"))??;
-
-        let buf = msg
-            .to_vec()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let len = (buf.len() as u16).to_be_bytes();
-        stream.write_all(&len).await?;
-        stream.write_all(&buf).await?;
-
-        let mut len_buf = [0u8; 2];
-        timeout(DNS_TIMEOUT, stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP read timeout"))??;
-        let resp_len = u16::from_be_bytes(len_buf) as usize;
-
-        let mut recv_buf = vec![0u8; resp_len];
-        stream.read_exact(&mut recv_buf).await?;
-
-        Message::from_vec(&recv_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    async fn query_tls(&self, addr: SocketAddr, server_name: &str, msg: &Message) -> io::Result<Message> {
-        let tls_config = self
-            .tls_config
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS config not set"))?;
-
-        let connector = TlsConnector::from(tls_config.clone());
-        let tcp_stream = timeout(DNS_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS connect timeout"))??;
-
-        let server_name: ServerName<'static> = server_name
-            .to_string()
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server name"))?;
-        let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
-
-        let buf = msg
-            .to_vec()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let len = (buf.len() as u16).to_be_bytes();
-        tls_stream.write_all(&len).await?;
-        tls_stream.write_all(&buf).await?;
-
-        let mut len_buf = [0u8; 2];
-        timeout(DNS_TIMEOUT, tls_stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS read timeout"))??;
-        let resp_len = u16::from_be_bytes(len_buf) as usize;
-
-        let mut recv_buf = vec![0u8; resp_len];
-        tls_stream.read_exact(&mut recv_buf).await?;
-
-        Message::from_vec(&recv_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    async fn query_doh(&self, url: &str, msg: &Message) -> io::Result<Message> {
-        let tls_config = self
-            .tls_config
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS config not set for DoH"))?;
-
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config.as_ref().clone())
-            .https_or_http()
-            .enable_http2()
-            .build();
-
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-
-        let wire = msg
-            .to_vec()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let body = Full::new(Bytes::from(wire));
-
-        let uri: hyper::Uri = url
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid DoH URL: {}", e)))?;
-
-        let req = hyper::Request::post(uri)
-            .header("Content-Type", "application/dns-message")
-            .header("Accept", "application/dns-message")
-            .body(body)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build request: {}", e)))?;
-
-        let resp = timeout(DNS_TIMEOUT, client.request(req))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DoH timeout"))?
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("DoH request: {}", e)))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("DoH HTTP error: {}", status)));
-        }
-
-        let body_bytes = timeout(DNS_TIMEOUT, resp.collect())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DoH body timeout"))?
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("DoH body: {}", e)))?
-            .to_bytes();
-
-        Message::from_vec(&body_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    async fn query_doh3(&self, _url: &str, _msg: &Message) -> io::Result<Message> {
-        Err(io::Error::new(io::ErrorKind::Other, "DoH3 not implemented yet"))
     }
 }
 
+/// A group of upstream clients queried concurrently.
+///
+/// All clients in the group are queried in parallel via `FuturesUnordered`;
+/// the first successful response wins.  If all clients fail, the last
+/// error is returned.
+///
+/// This is the top-level type stored in `DnsServer::upstreams`, keyed by
+/// the upstream pool name from the config.
 pub struct UpstreamGroup {
-    clients: Vec<Arc<UpstreamClient>>,
+    clients: Vec<UpstreamClient>,
 }
 
 impl UpstreamGroup {
+    /// Creates a group from a list of clients.
     pub fn new(clients: Vec<UpstreamClient>) -> Self {
-        Self {
-            clients: clients.into_iter().map(Arc::new).collect(),
-        }
+        Self { clients }
     }
 
+    /// Sends `msg` to all clients in parallel; returns the first successful
+    /// response, or the last failure if all fail.
     pub async fn query(&self, msg: &Message) -> io::Result<Message> {
         let mut futs: FuturesUnordered<_> = self
             .clients
@@ -281,26 +104,24 @@ impl UpstreamGroup {
             }
         }
 
-        Err(first_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "no upstream servers configured")))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_upstream_client_new_udp() {
-        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let client = UpstreamClient::new_udp(vec![addr]);
-        assert_eq!(client.addrs.len(), 1);
-        assert!(matches!(client.protocol, UpstreamProtocol::Udp));
+        Err(first_err.unwrap_or_else(|| io::Error::other("no upstream servers configured")))
     }
 
-    #[test]
-    fn test_upstream_group_new() {
-        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let group = UpstreamGroup::new(vec![UpstreamClient::new_udp(vec![addr])]);
-        assert_eq!(group.clients.len(), 1);
+    /// Builds a query message from a cache key and sends it.
+    ///
+    /// Used by the serve-expired background refresh path.
+    pub async fn query_bg(&self, cache_key: &super::cache::CacheKey) -> io::Result<Message> {
+        let mut msg = Message::new(0, hickory_proto::op::MessageType::Query, hickory_proto::op::OpCode::Query);
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_utf8(&cache_key.name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
+        q.set_query_type(match cache_key.qtype {
+            28 => RecordType::AAAA,
+            1 => RecordType::A,
+            _ => RecordType::A,
+        });
+        q.set_query_class(DNSClass::IN);
+        msg.queries.push(q);
+        msg.metadata.recursion_desired = true;
+        self.query(&msg).await
     }
 }

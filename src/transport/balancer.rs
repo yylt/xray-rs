@@ -7,24 +7,19 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// gRPC 负载均衡策略
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
     /// round-robin
     RoundRobin,
     /// Power-of-two choices with least-loaded score
+    #[default]
     LeastLoadedP2c,
     /// Least Connections
     LeastConnections,
 }
 
-impl Default for Strategy {
-    fn default() -> Self {
-        Strategy::LeastLoadedP2c
-    }
-}
-
 impl Strategy {
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_strategy_str(s: &str) -> Self {
         match s {
             "round_robin" => Strategy::RoundRobin,
             "least_loaded" => Strategy::LeastLoadedP2c,

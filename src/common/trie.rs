@@ -114,12 +114,18 @@ impl DomainMarisaBuilder {
         let mut flattener = DomainFlattener::default();
         flattener.flatten_node(self.root);
 
-        let trie = DomainMarisa {
+        let mut trie = DomainMarisa {
             nodes: flattener.nodes,
             edges: flattener.edges,
             labels: flattener.labels.finish(),
             tags: self.tags.finish(),
         };
+
+        // 释放 Vec 尾部未使用容量
+        trie.nodes.shrink_to_fit();
+        trie.edges.shrink_to_fit();
+        trie.labels.shrink_to_fit();
+        trie.tags.shrink_to_fit();
 
         log::debug!(
             target: "route::trie",
@@ -203,6 +209,12 @@ impl DomainFlattener {
     }
 }
 
+impl Default for DomainMarisa {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DomainMarisa {
     pub fn new() -> Self {
         Self {
@@ -283,7 +295,12 @@ pub struct IpTrieBuilder {
     tags: TagPoolBuilder,
 }
 
-#[deprecated(since = "0.1.0", note = "请使用 common::domain_trie 代替")]
+impl Default for IpTrieBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IpTrieBuilder {
     pub fn new() -> Self {
         Self {
@@ -326,6 +343,14 @@ impl IpTrieBuilder {
         self.active_v4_prefixes.sort_unstable_by(|left, right| right.cmp(left));
         self.active_v6_prefixes.sort_unstable_by(|left, right| right.cmp(left));
 
+        // 主动收缩各前缀表的 hashmap 容量，减少内存浪费
+        for i in &self.active_v4_prefixes {
+            self.v4[*i as usize].shrink_to_fit();
+        }
+        for i in &self.active_v6_prefixes {
+            self.v6[*i as usize].shrink_to_fit();
+        }
+
         let v4_prefixes_desc = self
             .active_v4_prefixes
             .into_iter()
@@ -343,6 +368,9 @@ impl IpTrieBuilder {
             })
             .collect();
 
+        let mut tags = self.tags.finish();
+        tags.shrink_to_fit();
+
         IpTrie {
             v4: Ipv4PrefixTable {
                 prefixes_desc: v4_prefixes_desc,
@@ -350,7 +378,7 @@ impl IpTrieBuilder {
             v6: Ipv6PrefixTable {
                 prefixes_desc: v6_prefixes_desc,
             },
-            tags: self.tags.finish(),
+            tags,
         }
     }
 }
@@ -382,6 +410,12 @@ struct Ipv4PrefixMap {
 struct Ipv6PrefixMap {
     prefix_len: u8,
     networks: AHashMap<u128, TagId>,
+}
+
+impl Default for IpTrie {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IpTrie {
@@ -530,6 +564,15 @@ mod tests {
     fn test_domain_marisa_normalizes_case_and_trailing_dot() {
         let trie = build_domain_marisa(&[("google.com", "proxy")]);
         assert_eq!(trie.lookup("WWW.Google.COM."), Some("proxy"));
+    }
+
+    #[test]
+    fn test_domain_marisa_subdomain_boundary() {
+        // "foo.bar" 规则不应匹配 "foofoo.bar"，因为 foo 是完整标签，不是前缀
+        let trie = build_domain_marisa(&[("foo.bar", "x")]);
+        assert_eq!(trie.lookup("foo.bar"), Some("x"));
+        assert_eq!(trie.lookup("sub.foo.bar"), Some("x"));
+        assert_eq!(trie.lookup("foofoo.bar"), None);
     }
 
     #[test]

@@ -157,7 +157,15 @@ impl ConnectionPool {
             udp_timeout: Duration::from_secs(30),  // 30 seconds
         }
     }
+}
 
+impl Default for ConnectionPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnectionPool {
     pub async fn get_or_create(
         &self,
         key: FlowKey,
@@ -253,15 +261,15 @@ pub fn build_packet(flow_key: &FlowKey, payload: &[u8]) -> std::io::Result<Bytes
                         0, // sequence number
                         0, // window size
                     );
-                    builder.write(&mut packet, payload).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("Write TCP packet error: {}", e))
-                    })?;
+                    builder
+                        .write(&mut packet, payload)
+                        .map_err(|e| std::io::Error::other(format!("Write TCP packet error: {}", e)))?;
                 }
                 Protocol::Udp => {
                     let builder = builder.udp(flow_key.dst_port, flow_key.src_port);
-                    builder.write(&mut packet, payload).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("Write UDP packet error: {}", e))
-                    })?;
+                    builder
+                        .write(&mut packet, payload)
+                        .map_err(|e| std::io::Error::other(format!("Write UDP packet error: {}", e)))?;
                 }
             }
         }
@@ -276,15 +284,15 @@ pub fn build_packet(flow_key: &FlowKey, payload: &[u8]) -> std::io::Result<Bytes
                         0, // sequence number
                         0, // window size
                     );
-                    builder.write(&mut packet, payload).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("Write TCP packet error: {}", e))
-                    })?;
+                    builder
+                        .write(&mut packet, payload)
+                        .map_err(|e| std::io::Error::other(format!("Write TCP packet error: {}", e)))?;
                 }
                 Protocol::Udp => {
                     let builder = builder.udp(flow_key.dst_port, flow_key.src_port);
-                    builder.write(&mut packet, payload).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("Write UDP packet error: {}", e))
-                    })?;
+                    builder
+                        .write(&mut packet, payload)
+                        .map_err(|e| std::io::Error::other(format!("Write UDP packet error: {}", e)))?;
                 }
             }
         }
@@ -346,7 +354,7 @@ impl Proxy {
         }
 
         ::tun::create_as_async(&config)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create TUN device: {}", e)))
+            .map_err(|e| std::io::Error::other(format!("Failed to create TUN device: {}", e)))
     }
 
     pub async fn listen(self, _addr: Address) -> BoxStream<ProxyStream, std::io::Error> {

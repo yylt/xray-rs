@@ -333,7 +333,7 @@ impl Xhttp {
         let post_response = post_client
             .send_request(post_req)
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("POST request failed: {}", e)))?;
+            .map_err(|e| Error::other(format!("POST request failed: {}", e)))?;
 
         warn!(
             "[xhttp][client] POST established path={} status={}",
@@ -378,7 +378,7 @@ impl Xhttp {
         let get_response = get_client
             .send_request(get_req)
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("GET request failed: {}", e)))?;
+            .map_err(|e| Error::other(format!("GET request failed: {}", e)))?;
 
         warn!("[xhttp][client] GET established path={} status={}", path, get_response.status());
 
@@ -858,7 +858,7 @@ impl Stream for IncomingStream {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     error!("[xhttp][stream] incoming body frame error: {}", e);
-                    return Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+                    return Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))));
                 }
                 Poll::Ready(None) => {
                     warn!("[xhttp][stream] incoming body EOF - hyper Incoming closed");

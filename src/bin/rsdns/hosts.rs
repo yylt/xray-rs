@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::collections::HashMap;
 use std::net::IpAddr;
 use xray_rs::common::trie::{DomainMarisa, DomainMarisaBuilder};
@@ -63,8 +61,6 @@ impl Default for HostsTrieBuilder {
 
 #[cfg(test)]
 mod tests {
-    #![allow(deprecated)]
-
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 

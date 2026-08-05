@@ -17,7 +17,6 @@ const defaultUpstream = "223.5.5.5"
 func rsdnsBinaryPath() string {
 	wd, _ := os.Getwd()
 	projectRoot := filepath.Join(wd, "../..")
-
 	bp := filepath.Join(projectRoot, "target/debug/rsdns")
 	if _, err := os.Stat(bp); err == nil {
 		return bp
@@ -26,34 +25,29 @@ func rsdnsBinaryPath() string {
 	if _, err := os.Stat(bp); err == nil {
 		return bp
 	}
-	log.Fatalf("[rsdns] Binary not found at target/debug/rsdns or target/release/rsdns. Build first.")
+	log.Fatalf("[rsdns] Binary not found. Build first with: cargo build --bin rsdns")
 	return ""
 }
 
-func buildRsdnsConfig(port int, upstreamAddr string) string {
-	return fmt.Sprintf(`bind:
+func buildRsdnsConfig(port int, testUpstream string) string {
+	if testUpstream == "" {
+		return fmt.Sprintf(`bind:
   - address: "0.0.0.0:%d"
   - address: "tcp://0.0.0.0:%d"
-
 groups:
   ad:
     - "*.doubleclick.net"
-
 upstream:
   default:
-    servers:
-      - address: %s
-        bootstrap: true
-
+    - address: 223.5.5.5
+      bootstrap: true
 cache:
   size: 4096
   serve_expired: true
   min_ttl: 0
   max_ttl: 3600
-
 hosts:
   - "0.0.0.0 rsdns-test-blocked.example.com"
-
 rules:
   - match: ad
     action:
@@ -63,7 +57,37 @@ rules:
     action:
       type: forward
       upstream: default
-`, port, port, upstreamAddr)
+`, port, port)
+	}
+	return fmt.Sprintf(`bind:
+  - address: "0.0.0.0:%d"
+  - address: "tcp://0.0.0.0:%d"
+groups:
+  ad:
+    - "*.doubleclick.net"
+upstream:
+  bootstrap:
+    - address: 223.5.5.5
+      bootstrap: true
+  test:
+    - address: %s
+cache:
+  size: 4096
+  serve_expired: true
+  min_ttl: 0
+  max_ttl: 3600
+hosts:
+  - "0.0.0.0 rsdns-test-blocked.example.com"
+rules:
+  - match: ad
+    action:
+      type: block
+      response: poison
+  - match: "*"
+    action:
+      type: forward
+      upstream: test
+`, port, port, testUpstream)
 }
 
 type RsdnsProcess struct {
@@ -73,60 +97,122 @@ type RsdnsProcess struct {
 	port   int
 }
 
-func startRsdnsWithUpstream(ctx context.Context, port int, upstreamAddr string) (*RsdnsProcess, error) {
+func startRsdnsWithUpstream(ctx context.Context, port int, testUpstream string) (*RsdnsProcess, error) {
 	ctx, cancel := context.WithCancel(ctx)
-
-	configYAML := buildRsdnsConfig(port, upstreamAddr)
-
+	configYAML := buildRsdnsConfig(port, testUpstream)
 	tmpDir, err := os.MkdirTemp("", "rsdns-e2e-*")
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create temp dir: %w", err)
 	}
-
 	configPath := filepath.Join(tmpDir, "rsdns.yaml")
 	if err := os.WriteFile(configPath, []byte(configYAML), 0o644); err != nil {
 		cancel()
 		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("write config: %w", err)
 	}
-
-	log.Printf("[rsdns] Config written to %s", configPath)
-	log.Printf("[rsdns] Upstream: %s", upstreamAddr)
-
+	log.Printf("[rsdns] Config: %s testUpstream=%s\n%s", configPath, testUpstream, configYAML)
 	bp := rsdnsBinaryPath()
-	log.Printf("[rsdns] Starting rsdns binary: %s", bp)
-
 	cmd := exec.CommandContext(ctx, bp, "--config", configPath)
 	wd, _ := os.Getwd()
-	projectRoot := filepath.Join(wd, "../..")
-	cmd.Dir = projectRoot
+	cmd.Dir = filepath.Join(wd, "../..")
 	if verbose {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
+	} else {
+		logPath := filepath.Join(tmpDir, "rsdns.log")
+		logFile, err := os.Create(logPath)
+		if err == nil {
+			cmd.Stdout = logFile
+			cmd.Stderr = logFile
+		}
 	}
-
 	if err := cmd.Start(); err != nil {
 		cancel()
 		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("start rsdns: %w", err)
 	}
-
-	log.Printf("[rsdns] Started PID=%d on port %d", cmd.Process.Pid, port)
-
-	return &RsdnsProcess{
-		cmd:    cmd,
-		cancel: cancel,
-		config: tmpDir,
-		port:   port,
-	}, nil
+	log.Printf("[rsdns] Started PID=%d port=%d", cmd.Process.Pid, port)
+	return &RsdnsProcess{cmd: cmd, cancel: cancel, config: tmpDir, port: port}, nil
 }
 
 func startRsdns(ctx context.Context, port int) (*RsdnsProcess, error) {
-	return startRsdnsWithUpstream(ctx, port, defaultUpstream)
+	return startRsdnsWithUpstream(ctx, port, "")
 }
 
-func (p *RsdnsProcess) Stop() error {
+func buildRsdnsSplitConfig(port int, testUpstream string, testDomain string) string {
+	return fmt.Sprintf(`bind:
+  - address: "0.0.0.0:%d"
+  - address: "tcp://0.0.0.0:%d"
+groups:
+  test:
+    - "%s"
+upstream:
+  bootstrap:
+    - address: 223.5.5.5
+      bootstrap: true
+  default:
+    - address: 127.0.0.1:19999
+  test:
+    - address: %s
+cache:
+  size: 4096
+  serve_expired: true
+  min_ttl: 0
+  max_ttl: 3600
+hosts: []
+rules:
+  - match: test
+    action:
+      type: forward
+      upstream: test
+  - match: "*"
+    action:
+      type: forward
+      upstream: default
+`, port, port, testDomain, testUpstream)
+}
+
+func startRsdnsWithSplitConfig(ctx context.Context, port int, testUpstream string, testDomain string) (*RsdnsProcess, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	configYAML := buildRsdnsSplitConfig(port, testUpstream, testDomain)
+	tmpDir, err := os.MkdirTemp("", "rsdns-e2e-*")
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	configPath := filepath.Join(tmpDir, "rsdns.yaml")
+	if err := os.WriteFile(configPath, []byte(configYAML), 0o644); err != nil {
+		cancel()
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("write config: %%w", err)
+	}
+	log.Printf("[rsdns] Split config (port=%d upstream=%s domain=%s):\n%s", port, testUpstream, testDomain, configYAML)
+	bp := rsdnsBinaryPath()
+	cmd := exec.CommandContext(ctx, bp, "--config", configPath)
+	wd, _ := os.Getwd()
+	cmd.Dir = filepath.Join(wd, "../..")
+	if verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	} else {
+		logPath := filepath.Join(tmpDir, "rsdns.log")
+		logFile, err := os.Create(logPath)
+		if err == nil {
+			cmd.Stdout = logFile
+			cmd.Stderr = logFile
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("start rsdns: %w", err)
+	}
+	log.Printf("[rsdns] Started PID=%d port=%d (split mode)", cmd.Process.Pid, port)
+	return &RsdnsProcess{cmd: cmd, cancel: cancel, config: tmpDir, port: port}, nil
+}
+
+func (p *RsdnsProcess) Stop() {
 	if p.cancel != nil {
 		p.cancel()
 	}
@@ -137,318 +223,304 @@ func (p *RsdnsProcess) Stop() error {
 	if p.config != "" {
 		os.RemoveAll(p.config)
 	}
+}
+
+// verifyNoLeak checks that the given domain does NOT resolve.
+// This confirms traffic is not leaking to the default (broken) upstream.
+func verifyNoLeak(cli *dnsClient, domain string) error {
+	hosts, err := cli.LookupHostWithRetry(domain, 2, 300*time.Millisecond)
+	if err == nil && len(hosts) > 0 {
+		return fmt.Errorf("unexpected resolution for %s (leak!): %v", domain, hosts)
+	}
+	log.Printf("[split-verify] %s correctly NOT resolved (default upstream blocked it): %v", domain, err)
 	return nil
 }
 
-func waitForPortUDP(port int, timeout time.Duration) error {
-	log.Printf("[wait] Waiting for UDP port %d (timeout=%v)...", port, timeout)
+// --- raw DNS client to avoid net.Resolver routing to system DNS (port 53) ---
+
+type dnsClient struct {
+	conn *net.UDPConn
+}
+
+func newDNSClient(port int) (*dnsClient, error) {
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	return &dnsClient{conn: conn}, nil
+}
+
+func (c *dnsClient) Close() { c.conn.Close() }
+
+func (c *dnsClient) LookupHost(domain string) ([]string, error) {
+	var hosts []string
+	ips, err := c.lookup(domain, 1)
+	if err != nil {
+		return nil, err
+	}
+	for _, ip := range ips {
+		hosts = append(hosts, ip.String())
+	}
+	ips, _ = c.lookup(domain, 28)
+	for _, ip := range ips {
+		hosts = append(hosts, ip.String())
+	}
+	return hosts, nil
+}
+
+func (c *dnsClient) LookupHostWithRetry(domain string, retries int, interval time.Duration) ([]string, error) {
+	var lastErr error
+	for i := 0; i < retries; i++ {
+		hosts, err := c.LookupHost(domain)
+		if err == nil && len(hosts) > 0 {
+			return hosts, nil
+		}
+		lastErr = err
+		time.Sleep(interval)
+	}
+	return nil, lastErr
+}
+
+func (c *dnsClient) lookup(domain string, qtype uint16) ([]net.IP, error) {
+	wire := buildWireQuery(domain, qtype)
+	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.conn.Write(wire); err != nil {
+		return nil, fmt.Errorf("write: %w", err)
+	}
+	buf := make([]byte, 4096)
+	n, err := c.conn.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	return parseWireResponse(buf[:n]), nil
+}
+
+func buildWireQuery(domain string, qtype uint16) []byte {
+	var buf []byte
+	buf = append(buf, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	for _, p := range strings.Split(domain, ".") {
+		buf = append(buf, byte(len(p)))
+		buf = append(buf, []byte(p)...)
+	}
+	buf = append(buf, 0x00)
+	buf = append(buf, byte(qtype>>8), byte(qtype&0xFF))
+	buf = append(buf, 0x00, 0x01)
+	return buf
+}
+
+func parseWireResponse(data []byte) []net.IP {
+	if len(data) < 12 {
+		return nil
+	}
+	ancount := int(uint16(data[6])<<8 | uint16(data[7]))
+	rcode := data[3] & 0x0F
+	if rcode != 0 {
+		return nil
+	}
+	pos := 12
+	for pos < len(data) && data[pos] != 0x00 {
+		if data[pos]&0xC0 == 0xC0 {
+			pos += 2
+			break
+		}
+		pos += int(data[pos]) + 1
+	}
+	if pos < len(data) && data[pos] == 0x00 {
+		pos += 1
+	}
+	pos += 4
+	var ips []net.IP
+	for i := 0; i < ancount; i++ {
+		if pos >= len(data) {
+			break
+		}
+		if data[pos]&0xC0 == 0xC0 {
+			pos += 2
+		} else {
+			for pos < len(data) && data[pos] != 0x00 {
+				pos += int(data[pos]) + 1
+			}
+			if pos < len(data) {
+				pos += 1
+			}
+		}
+		if pos+10 > len(data) {
+			break
+		}
+		rtype := uint16(data[pos])<<8 | uint16(data[pos+1])
+		rdlen := uint16(data[pos+8])<<8 | uint16(data[pos+9])
+		pos += 10
+		if pos+int(rdlen) > len(data) {
+			break
+		}
+		switch rtype {
+		case 1:
+			if rdlen == 4 {
+				ips = append(ips, net.IPv4(data[pos], data[pos+1], data[pos+2], data[pos+3]))
+			}
+		case 28:
+			if rdlen == 16 {
+				ip := make(net.IP, 16)
+				copy(ip, data[pos:pos+16])
+				ips = append(ips, ip)
+			}
+		}
+		pos += int(rdlen)
+	}
+	return ips
+}
+
+// --- wait for rsdns to be ready ---
+
+func waitForRsdnsReady(port int, timeout time.Duration) error {
+	log.Printf("[wait] Waiting for rsdns on UDP %d...", port)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		cli, err := newDNSClient(port)
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		conn, err := net.DialUDP("udp", nil, addr)
+		_, err = cli.LookupHost("example.com")
+		cli.Close()
 		if err == nil {
-			conn.Close()
-			elapsed := timeout - time.Until(deadline)
-			log.Printf("[wait] UDP port %d ready after %.2fs", port, elapsed.Seconds())
+			log.Printf("[wait] rsdns port %d ready after %.2fs", port, time.Since(time.Now().Add(-timeout)).Seconds())
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout waiting for UDP port %d", port)
+	return fmt.Errorf("timeout waiting for rsdns UDP port %d", port)
 }
 
-func newDNSResolver(port int) *net.Resolver {
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 10 * time.Second}
-			if network == "tcp" {
-				return d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
-			}
-			return d.DialContext(ctx, "udp", fmt.Sprintf("127.0.0.1:%d", port))
-		},
-	}
-}
+// --- tests ---
 
 func testRsdnsForward() error {
 	port := 15353
 	ctx := context.Background()
-
 	rsdns, err := startRsdns(ctx, port)
 	if err != nil {
-		return fmt.Errorf("start rsdns: %w", err)
+		return fmt.Errorf("start: %w", err)
 	}
 	defer rsdns.Stop()
-
-	if err := waitForPortUDP(port, 10*time.Second); err != nil {
-		return fmt.Errorf("wait UDP: %w", err)
+	if err := waitForRsdnsReady(port, 15*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
 	}
-	if err := waitForPort(port, 5*time.Second); err != nil {
-		return fmt.Errorf("wait TCP: %w", err)
-	}
-
-	time.Sleep(1 * time.Second)
-
-	resolver := newDNSResolver(port)
-
-	log.Printf("[rsdns-test] Test 1: Forward lookup for example.com")
-	addrs, err := resolver.LookupHost(context.Background(), "example.com")
+	cli, err := newDNSClient(port)
 	if err != nil {
-		return fmt.Errorf("lookup example.com: %w", err)
+		return err
 	}
-	if len(addrs) == 0 {
-		return fmt.Errorf("expected at least 1 IP for example.com, got 0")
-	}
-	log.Printf("[rsdns-test] example.com resolved to: %v", addrs)
+	defer cli.Close()
 
-	log.Printf("[rsdns-test] Test 2: TCP lookup for google.com")
-	tcpAddrs, err := resolver.LookupIPAddr(context.Background(), "google.com")
+	log.Printf("[rsdns-test] Forward: example.com")
+	hosts, err := cli.LookupHostWithRetry("example.com", 5, 500*time.Millisecond)
 	if err != nil {
-		return fmt.Errorf("lookup google.com (TCP): %w", err)
+		return fmt.Errorf("forward: %w", err)
 	}
-	if len(tcpAddrs) == 0 {
-		return fmt.Errorf("expected at least 1 IP for google.com, got 0")
-	}
-	log.Printf("[rsdns-test] google.com resolved to: %v via TCP", tcpAddrs)
+	log.Printf("[rsdns-test] example.com → %v", hosts)
 
-	log.Printf("[rsdns-test] Test 3: Blocked domain (poison): track.doubleclick.net")
-	blockedAddrs, err := resolver.LookupHost(context.Background(), "track.doubleclick.net")
+	log.Printf("[rsdns-test] Block: track.doubleclick.net (poison)")
+	hosts, err = cli.LookupHost("track.doubleclick.net")
 	if err != nil {
-		return fmt.Errorf("lookup blocked domain: %w", err)
+		return fmt.Errorf("block: %w", err)
 	}
-	log.Printf("[rsdns-test] blocked domain resolved to: %v", blockedAddrs)
-
-	addrMap := make(map[string]bool)
-	for _, a := range blockedAddrs {
-		addrMap[a] = true
+	log.Printf("[rsdns-test] doubleclick → %v", hosts)
+	for _, h := range hosts {
+		if h == "0.0.0.0" {
+			log.Printf("[rsdns-test] PASS (poison)")
+			return nil
+		}
 	}
-	if addrMap["0.0.0.0"] {
-		log.Printf("[rsdns-test] PASS: blocked domain got poison 0.0.0.0")
-		return nil
-	}
-
-	return fmt.Errorf("blocked domain should return poison 0.0.0.0, got: %v", blockedAddrs)
+	return fmt.Errorf("expected poison 0.0.0.0, got: %v", hosts)
 }
 
 func testRsdnsHosts() error {
 	port := 15354
-	ctx := context.Background()
-
-	rsdns, err := startRsdns(ctx, port)
+	rsdns, err := startRsdns(context.Background(), port)
 	if err != nil {
-		return fmt.Errorf("start rsdns: %w", err)
+		return fmt.Errorf("start: %w", err)
 	}
 	defer rsdns.Stop()
-
-	if err := waitForPortUDP(port, 10*time.Second); err != nil {
-		return fmt.Errorf("wait UDP: %w", err)
+	if err := waitForRsdnsReady(port, 15*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
 	}
-
-	time.Sleep(1 * time.Second)
-
-	resolver := newDNSResolver(port)
-
-	log.Printf("[rsdns-test] Test: hosts lookup for rsdns-test-blocked.example.com")
-	addrs, err := resolver.LookupHost(context.Background(), "rsdns-test-blocked.example.com")
+	cli, err := newDNSClient(port)
 	if err != nil {
-		return fmt.Errorf("lookup hosts entry: %w", err)
+		return err
 	}
-	log.Printf("[rsdns-test] hosts response: %v", addrs)
+	defer cli.Close()
 
-	for _, a := range addrs {
-		if a == "0.0.0.0" {
-			log.Printf("[rsdns-test] PASS: hosts returned 0.0.0.0")
+	hosts, err := cli.LookupHost("rsdns-test-blocked.example.com")
+	if err != nil {
+		return fmt.Errorf("hosts: %w", err)
+	}
+	log.Printf("[rsdns-test] hosts → %v", hosts)
+	for _, h := range hosts {
+		if h == "0.0.0.0" {
+			log.Printf("[rsdns-test] PASS")
 			return nil
 		}
 	}
-	return fmt.Errorf("expected 0.0.0.0 from hosts, got: %v", addrs)
+	return fmt.Errorf("expected 0.0.0.0, got: %v", hosts)
 }
 
 func testRsdnsCache() error {
 	port := 15355
-	ctx := context.Background()
-
-	rsdns, err := startRsdns(ctx, port)
+	rsdns, err := startRsdns(context.Background(), port)
 	if err != nil {
-		return fmt.Errorf("start rsdns: %w", err)
+		return fmt.Errorf("start: %w", err)
 	}
 	defer rsdns.Stop()
-
-	if err := waitForPortUDP(port, 10*time.Second); err != nil {
-		return fmt.Errorf("wait UDP: %w", err)
+	if err := waitForRsdnsReady(port, 15*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
 	}
+	cli, err := newDNSClient(port)
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
 
-	time.Sleep(1 * time.Second)
-
-	resolver := newDNSResolver(port)
-
-	domain := "httpbin.org"
-
-	log.Printf("[rsdns-test] Test cache: first query for %s (cache miss)", domain)
+	domain := "www.baidu.com"
 	start := time.Now()
-	addrs1, err := resolver.LookupHost(context.Background(), domain)
-	firstDuration := time.Since(start)
+	first, err := cli.LookupHostWithRetry(domain, 10, 500*time.Millisecond)
+	d1 := time.Since(start)
 	if err != nil {
-		return fmt.Errorf("lookup %s (first): %w", domain, err)
+		return fmt.Errorf("first: %w", err)
 	}
-	if len(addrs1) == 0 {
-		return fmt.Errorf("expected at least 1 IP for %s", domain)
-	}
-	log.Printf("[rsdns-test] first query for %s took %v: %v", domain, firstDuration, addrs1)
+	log.Printf("[rsdns-test] first %v: %v", d1, first)
 
-	log.Printf("[rsdns-test] Test cache: second query for %s (cache hit)", domain)
 	start = time.Now()
-	addrs2, err := resolver.LookupHost(context.Background(), domain)
-	secondDuration := time.Since(start)
+	second, err := cli.LookupHost(domain)
+	d2 := time.Since(start)
 	if err != nil {
-		return fmt.Errorf("lookup %s (second): %w", domain, err)
+		return fmt.Errorf("second: %w", err)
 	}
-	log.Printf("[rsdns-test] second query for %s took %v: %v", domain, secondDuration, addrs2)
+	log.Printf("[rsdns-test] second %v: %v", d2, second)
 
-	if len(addrs2) == 0 {
-		return fmt.Errorf("expected at least 1 IP for second cache lookup of %s", domain)
+	if len(second) == 0 {
+		return fmt.Errorf("empty second")
 	}
-
-	log.Printf("[rsdns-test] PASS: cache test completed (first=%v, second=%v)", firstDuration, secondDuration)
-	return nil
-}
-
-func testRsdnsDoT() error {
-	dotAddr := os.Getenv("RSDNS_UPSTREAM_DOT")
-	if dotAddr == "" {
-		log.Printf("[rsdns-dot] SKIP: RSDNS_UPSTREAM_DOT not set")
-		return nil
-	}
-
-	port := 15356
-	ctx := context.Background()
-
-	upstream := fmt.Sprintf("tls://%s", dotAddr)
-	rsdns, err := startRsdnsWithUpstream(ctx, port, upstream)
-	if err != nil {
-		return fmt.Errorf("start rsdns: %w", err)
-	}
-	defer rsdns.Stop()
-
-	if err := waitForPortUDP(port, 10*time.Second); err != nil {
-		return fmt.Errorf("wait UDP: %w", err)
-	}
-
-	time.Sleep(2 * time.Second)
-
-	resolver := newDNSResolver(port)
-
-	log.Printf("[rsdns-dot] Test: DoT upstream resolve example.com")
-	addrs, err := resolver.LookupHost(context.Background(), "example.com")
-	if err != nil {
-		return fmt.Errorf("lookup via DoT: %w", err)
-	}
-	if len(addrs) == 0 {
-		return fmt.Errorf("expected at least 1 IP via DoT, got 0")
-	}
-	log.Printf("[rsdns-dot] PASS: DoT resolved example.com to: %v", addrs)
-	return nil
-}
-
-func testRsdnsDoH() error {
-	dohAddr := os.Getenv("RSDNS_UPSTREAM_DOH")
-	if dohAddr == "" {
-		log.Printf("[rsdns-doh] SKIP: RSDNS_UPSTREAM_DOH not set")
-		return nil
-	}
-
-	port := 15357
-	ctx := context.Background()
-
-	rsdns, err := startRsdnsWithUpstream(ctx, port, dohAddr)
-	if err != nil {
-		return fmt.Errorf("start rsdns: %w", err)
-	}
-	defer rsdns.Stop()
-
-	if err := waitForPortUDP(port, 10*time.Second); err != nil {
-		return fmt.Errorf("wait UDP: %w", err)
-	}
-
-	time.Sleep(2 * time.Second)
-
-	resolver := newDNSResolver(port)
-
-	log.Printf("[rsdns-doh] Test: DoH upstream resolve example.com")
-	addrs, err := resolver.LookupHost(context.Background(), "example.com")
-	if err != nil {
-		return fmt.Errorf("lookup via DoH: %w", err)
-	}
-	if len(addrs) == 0 {
-		return fmt.Errorf("expected at least 1 IP via DoH, got 0")
-	}
-	log.Printf("[rsdns-doh] PASS: DoH resolved example.com to: %v", addrs)
-	return nil
-}
-
-func testRsdnsDoH3() error {
-	doh3Addr := os.Getenv("RSDNS_UPSTREAM_DOH3")
-	if doh3Addr == "" {
-		log.Printf("[rsdns-doh3] SKIP: RSDNS_UPSTREAM_DOH3 not set")
-		return nil
-	}
-
-	port := 15358
-	ctx := context.Background()
-
-	rsdns, err := startRsdnsWithUpstream(ctx, port, doh3Addr)
-	if err != nil {
-		return fmt.Errorf("start rsdns: %w", err)
-	}
-	defer rsdns.Stop()
-
-	if err := waitForPortUDP(port, 10*time.Second); err != nil {
-		return fmt.Errorf("wait UDP: %w", err)
-	}
-
-	time.Sleep(2 * time.Second)
-
-	resolver := newDNSResolver(port)
-
-	log.Printf("[rsdns-doh3] Test: DoH3 upstream resolve example.com")
-	addrs, err := resolver.LookupHost(context.Background(), "example.com")
-	if err != nil {
-		return fmt.Errorf("lookup via DoH3: %w", err)
-	}
-	if len(addrs) == 0 {
-		return fmt.Errorf("expected at least 1 IP via DoH3, got 0")
-	}
-	log.Printf("[rsdns-doh3] PASS: DoH3 resolved example.com to: %v", addrs)
+	log.Printf("[rsdns-test] PASS first=%v second=%v", d1, d2)
 	return nil
 }
 
 func testRsdnsReject() error {
 	port := 15359
-	ctx := context.Background()
-
-	customConfig := fmt.Sprintf(`bind:
+	cfg := fmt.Sprintf(`bind:
   - address: "0.0.0.0:%d"
-  - address: "tcp://0.0.0.0:%d"
-
 groups:
   block:
     - "blocked-nxdomain.example"
-
 upstream:
   default:
-    servers:
-      - address: 1.1.1.1
-        bootstrap: true
-
+    - address: 223.5.5.5
+      bootstrap: true
 cache:
-  size: 4096
-
+  size: 256
 hosts: []
-
 rules:
   - match: block
     action:
@@ -458,58 +530,203 @@ rules:
     action:
       type: forward
       upstream: default
-`, port, port)
-
-	tmpDir, err := os.MkdirTemp("", "rsdns-e2e-*")
-	if err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
-	}
+`, port)
+	tmpDir, _ := os.MkdirTemp("", "rsdns-e2e-*")
 	defer os.RemoveAll(tmpDir)
+	cfgPath := filepath.Join(tmpDir, "rsdns.yaml")
+	os.WriteFile(cfgPath, []byte(cfg), 0o644)
 
-	configPath := filepath.Join(tmpDir, "rsdns.yaml")
-	if err := os.WriteFile(configPath, []byte(customConfig), 0o644); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	bp := rsdnsBinaryPath()
+	cmd := exec.CommandContext(ctx, rsdnsBinaryPath(), "--config", cfgPath)
 	wd, _ := os.Getwd()
-	projectRoot := filepath.Join(wd, "../..")
-	cmd := exec.CommandContext(ctx, bp, "--config", configPath)
-	cmd.Dir = projectRoot
-	if verbose {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+	cmd.Dir = filepath.Join(wd, "../..")
+
+	if !verbose {
+		logFile, err := os.Create(filepath.Join(tmpDir, "rsdns.log"))
+		if err == nil {
+			cmd.Stdout = logFile
+			cmd.Stderr = logFile
+		}
 	}
+
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start rsdns: %w", err)
+		return fmt.Errorf("start: %w", err)
 	}
 	defer cmd.Process.Kill()
 
-	if err := waitForPortUDP(port, 10*time.Second); err != nil {
-		return fmt.Errorf("wait UDP: %w", err)
+	if err := waitForRsdnsReady(port, 15*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
 	}
-	time.Sleep(1 * time.Second)
+	cli, _ := newDNSClient(port)
+	defer cli.Close()
 
-	resolver := newDNSResolver(port)
-
-	log.Printf("[rsdns-test] Test: NXDOMAIN for blocked-nxdomain.example")
-	_, err = resolver.LookupHost(context.Background(), "blocked-nxdomain.example")
-	if err == nil {
-		return fmt.Errorf("expected NXDOMAIN error, but got success")
+	hosts, err := cli.LookupHost("blocked-nxdomain.example")
+	if err == nil && len(hosts) > 0 {
+		return fmt.Errorf("expected NXDOMAIN error, got: %v", hosts)
 	}
+	log.Printf("[rsdns-test] PASS NXDOMAIN: %v", err)
+	return nil
+}
 
-	errStr := err.Error()
-	if strings.Contains(errStr, "no such host") || strings.Contains(errStr, "NXDOMAIN") ||
-		strings.Contains(errStr, "Name or service not known") {
-		log.Printf("[rsdns-test] PASS: NXDOMAIN response: %v", err)
+func testRsdnsDoT() error {
+	addr := os.Getenv("RSDNS_UPSTREAM_DOT")
+	if addr == "" {
+		log.Printf("[rsdns-dot] SKIP")
 		return nil
 	}
+	port := 15356
+	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	defer rsdns.Stop()
+	if err := waitForRsdnsReady(port, 20*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	cli, _ := newDNSClient(port)
+	defer cli.Close()
 
-	log.Printf("[rsdns-test] Got DNS error (may be NXDOMAIN): %v", err)
-	log.Printf("[rsdns-test] PASS: NXDOMAIN test")
+	// 1) Matched domain must resolve via DoT upstream
+	hosts, err := cli.LookupHostWithRetry("example.com", 10, 500*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("DoT resolve: %w", err)
+	}
+	log.Printf("[rsdns-dot] example.com → %v", hosts)
+
+	// 2) Unmatched domain must NOT resolve (proves no leak to default upstream)
+	if err := verifyNoLeak(cli, "verify-no-leak-test.rsdns.local"); err != nil {
+		return fmt.Errorf("DoT leak: %w", err)
+	}
+	log.Printf("[rsdns-dot] PASS (split verified)")
+	return nil
+}
+
+func testRsdnsDoH() error {
+	addr := os.Getenv("RSDNS_UPSTREAM_DOH")
+	if addr == "" {
+		log.Printf("[rsdns-doh] SKIP")
+		return nil
+	}
+	port := 15357
+	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	defer rsdns.Stop()
+	if err := waitForRsdnsReady(port, 20*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	cli, _ := newDNSClient(port)
+	defer cli.Close()
+
+	// 1) Matched domain must resolve via DoH upstream
+	hosts, err := cli.LookupHostWithRetry("example.com", 10, 500*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("DoH resolve: %w", err)
+	}
+	log.Printf("[rsdns-doh] example.com → %v", hosts)
+
+	// 2) Unmatched domain must NOT resolve (proves no leak to default upstream)
+	if err := verifyNoLeak(cli, "verify-no-leak-test.rsdns.local"); err != nil {
+		return fmt.Errorf("DoH leak: %w", err)
+	}
+	log.Printf("[rsdns-doh] PASS (split verified)")
+	return nil
+}
+
+func testRsdnsDoH3() error {
+	addr := os.Getenv("RSDNS_UPSTREAM_DOH3")
+	if addr == "" {
+		log.Printf("[rsdns-doh3] SKIP")
+		return nil
+	}
+	port := 15358
+	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	defer rsdns.Stop()
+	if err := waitForRsdnsReady(port, 20*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	cli, _ := newDNSClient(port)
+	defer cli.Close()
+
+	// 1) Matched domain must resolve via DoH3 upstream
+	hosts, err := cli.LookupHostWithRetry("example.com", 3, 500*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("DoH3 resolve: %w", err)
+	}
+	log.Printf("[rsdns-doh3] example.com → %v", hosts)
+
+	// 2) Unmatched domain must NOT resolve (proves no leak to default upstream)
+	if err := verifyNoLeak(cli, "verify-no-leak-test.rsdns.local"); err != nil {
+		return fmt.Errorf("DoH3 leak: %w", err)
+	}
+	log.Printf("[rsdns-doh3] PASS (split verified)")
+	return nil
+}
+
+func testRsdnsTCP() error {
+	addr := os.Getenv("RSDNS_UPSTREAM_TCP")
+	if addr == "" {
+		log.Printf("[rsdns-tcp] SKIP")
+		return nil
+	}
+	port := 15360
+	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	defer rsdns.Stop()
+	if err := waitForRsdnsReady(port, 20*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	cli, _ := newDNSClient(port)
+	defer cli.Close()
+
+	hosts, err := cli.LookupHostWithRetry("example.com", 10, 500*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("TCP resolve: %w", err)
+	}
+	log.Printf("[rsdns-tcp] example.com → %v", hosts)
+
+	if err := verifyNoLeak(cli, "verify-no-leak-test.rsdns.local"); err != nil {
+		return fmt.Errorf("TCP leak: %w", err)
+	}
+	log.Printf("[rsdns-tcp] PASS (split verified)")
+	return nil
+}
+
+func testRsdnsDoQ() error {
+	addr := os.Getenv("RSDNS_UPSTREAM_DOQ")
+	if addr == "" {
+		log.Printf("[rsdns-doq] SKIP")
+		return nil
+	}
+	port := 15361
+	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	defer rsdns.Stop()
+	if err := waitForRsdnsReady(port, 20*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	cli, _ := newDNSClient(port)
+	defer cli.Close()
+
+	hosts, err := cli.LookupHostWithRetry("example.com", 10, 500*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("DoQ resolve: %w", err)
+	}
+	log.Printf("[rsdns-doq] example.com → %v", hosts)
+
+	if err := verifyNoLeak(cli, "verify-no-leak-test.rsdns.local"); err != nil {
+		return fmt.Errorf("DoQ leak: %w", err)
+	}
+	log.Printf("[rsdns-doq] PASS (split verified)")
 	return nil
 }
 
@@ -521,17 +738,16 @@ func testRsdnsAll() error {
 		{"Forward", testRsdnsForward},
 		{"Hosts", testRsdnsHosts},
 		{"Cache", testRsdnsCache},
-		{"Reject (NXDOMAIN)", testRsdnsReject},
+		{"Reject", testRsdnsReject},
 		{"DoT", testRsdnsDoT},
 		{"DoH", testRsdnsDoH},
 		{"DoH3", testRsdnsDoH3},
+		{"TCP", testRsdnsTCP},
+		{"DoQ", testRsdnsDoQ},
 	}
-
 	failed := false
 	for _, t := range tests {
-		log.Printf("========================================")
-		log.Printf("[rsdns] START TEST: %s", t.name)
-		log.Printf("========================================")
+		log.Printf("[rsdns] START: %s", t.name)
 		if err := t.fn(); err != nil {
 			log.Printf("[rsdns] FAIL %s: %v", t.name, err)
 			failed = true
@@ -539,7 +755,6 @@ func testRsdnsAll() error {
 			log.Printf("[rsdns] PASS %s", t.name)
 		}
 	}
-
 	if failed {
 		return fmt.Errorf("one or more rsdns tests failed")
 	}

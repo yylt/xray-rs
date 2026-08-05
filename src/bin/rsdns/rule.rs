@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use xray_rs::common::trie::DomainMarisa;
 
 #[derive(Debug, Clone)]
@@ -15,7 +13,6 @@ pub enum RuleAction {
         upstream: String,
         cache: bool,
         ttl: Option<u32>,
-        keep_ttl: Option<bool>,
     },
 }
 
