@@ -61,7 +61,7 @@ impl Proxy {
 
         match stream_result {
             Ok(transport_stream) => {
-                let user_id = self.user_id.clone();
+                let user_id = self.user_id;
 
                 let proxy_stream = async_stream::stream! {
                     tokio::pin!(transport_stream);
@@ -230,7 +230,7 @@ fn write_target_address(addr: &Address, buf: &mut BytesMut) -> std::io::Result<(
             Ok(())
         }
         Address::Domain(domain, port) => {
-            if domain.as_bytes().len() > 255 {
+            if domain.len() > 255 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Domain name too long for VLESS",

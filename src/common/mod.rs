@@ -2,6 +2,7 @@ pub mod domain_trie;
 pub mod forward;
 pub mod ip_trie;
 pub mod parse;
+pub mod rslog;
 pub mod sniff;
 pub mod socks;
 pub mod stats;

@@ -38,9 +38,9 @@ impl Run {
         let config: Config = match &self.config {
             s if s.ends_with(".json") => serde_json::from_reader(f)?,
             s if s.ends_with(".yaml") || s.ends_with(".yml") => {
-                serde_yaml::from_reader(f).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                serde_yaml::from_reader(f).map_err(|e| io::Error::other(e.to_string()))?
             }
-            _ => return Err(io::Error::new(io::ErrorKind::Other, "unsupported config format")),
+            _ => return Err(io::Error::other("unsupported config format")),
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -283,7 +283,7 @@ async fn handle_proxy_stream(
                 match sink.as_ref() {
                     app::ConnectionSink::Proxy(proxy_sink) => {
                         match proxy_sink
-                            .try_connect(&dst, proxy_stream.metadata.protocol.clone())
+                            .try_connect(dst, proxy_stream.metadata.protocol.clone())
                             .await
                         {
                             Ok(connected) => {

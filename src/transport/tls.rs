@@ -135,7 +135,7 @@ fn create_server_config(settings: &TlsSettings) -> Result<ServerConfig> {
 
     config.ticketer = Arc::new(
         TicketRotator::new(3600, ticket_generator)
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to create ticket rotator: {:?}", e)))?,
+            .map_err(|e| Error::other(format!("Failed to create ticket rotator: {:?}", e)))?,
     );
 
     Ok(config)
@@ -146,16 +146,16 @@ fn create_client_config(settings: &TlsSettings) -> Result<ClientConfig> {
     let cert_result = rustls_native_certs::load_native_certs();
 
     if !cert_result.errors.is_empty() {
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!("Failed to load some native certs: {:?}", cert_result.errors),
-        ));
+        return Err(Error::other(format!(
+            "Failed to load some native certs: {:?}",
+            cert_result.errors
+        )));
     }
 
     for cert in cert_result.certs {
         root_cert_store
             .add(cert)
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to add cert: {:?}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to add cert: {:?}", e)))?;
     }
 
     let builder = if let Some(provider) = create_crypto_provider(settings)? {
@@ -171,7 +171,7 @@ fn create_client_config(settings: &TlsSettings) -> Result<ClientConfig> {
         ClientConfig::builder()
     };
 
-    let mut config = if settings.allow_insecure.map_or(false, |v| v) {
+    let mut config = if settings.allow_insecure.unwrap_or(false) {
         let builder = builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(common::tls::NoCertificateVerification));
@@ -229,7 +229,7 @@ pub mod client {
             };
             let tls_server_name = pki_types::ServerName::try_from(server_name)
                 .map_err(|_| Error::new(ErrorKind::AddrNotAvailable, "not invalid server name"))?;
-            Ok(self.connector.connect(tls_server_name, stream).await?)
+            self.connector.connect(tls_server_name, stream).await
         }
     }
 }

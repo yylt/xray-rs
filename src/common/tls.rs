@@ -6,6 +6,7 @@ use rustls::{
     pki_types::*,
     server::{ClientHello, ProducesTickets, ResolvesServerCert},
     sign::CertifiedKey,
+    ClientConfig, RootCertStore,
 };
 use std::{
     collections::HashMap,
@@ -91,11 +92,10 @@ impl ProducesTickets for SecureTicketGenerator {
             .current_key
             .open_in_place(aead::Nonce::try_assume_unique_for_key(nonce).ok()?, aad, &mut data)
             .is_ok()
+            && data.len() >= 4
         {
-            if data.len() >= 4 {
-                let _version = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                return Some(data[4..].to_vec());
-            }
+            let _version = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+            return Some(data[4..].to_vec());
         }
 
         if let Some(prev_key) = &self.previous_key {
@@ -103,11 +103,10 @@ impl ProducesTickets for SecureTicketGenerator {
             if prev_key
                 .open_in_place(aead::Nonce::try_assume_unique_for_key(nonce).ok()?, aad, &mut data)
                 .is_ok()
+                && data.len() >= 4
             {
-                if data.len() >= 4 {
-                    let _version = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                    return Some(data[4..].to_vec());
-                }
+                let _version = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                return Some(data[4..].to_vec());
             }
         }
 
@@ -183,6 +182,29 @@ pub fn read_private_key<P: AsRef<Path>>(path: P) -> IoResult<PrivateKeyDer<'stat
     })
 }
 
+pub fn install_crypto_provider() {
+    #[cfg(feature = "ring")]
+    rustls::crypto::ring::default_provider().install_default().ok();
+
+    #[cfg(feature = "aws-lc-rs")]
+    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+}
+
+pub fn default_tls_client_config() -> Arc<ClientConfig> {
+    install_crypto_provider();
+
+    let native_certs = rustls_native_certs::load_native_certs().expect("load native certs");
+
+    let mut root_store = RootCertStore::empty();
+    for cert in native_certs {
+        root_store.add(cert).ok();
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
 #[derive(Debug, Clone)]
 pub struct CertificateResolver {
     // 精确域名匹配: domain -> certificate
@@ -201,19 +223,27 @@ impl CertificateResolver {
             default: None,
         }
     }
+}
 
+impl Default for CertificateResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CertificateResolver {
     pub fn add_certificate(&mut self, cert_file: &str, key_file: &str) -> IoResult<()> {
         // 读取证书和密钥
         let certs = read_certificates(cert_file)?;
         let key = read_private_key(key_file)?;
 
         // 使用默认的 CryptoProvider 创建 CertifiedKey
-        let provider = CryptoProvider::get_default()
-            .ok_or_else(|| Error::new(ErrorKind::Other, "No default crypto provider available"))?;
+        let provider =
+            CryptoProvider::get_default().ok_or_else(|| Error::other("No default crypto provider available"))?;
 
         let certified_key = Arc::new(
             CertifiedKey::from_der(certs.clone(), key, provider)
-                .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to create certified key: {:?}", e)))?,
+                .map_err(|e| Error::other(format!("Failed to create certified key: {:?}", e)))?,
         );
 
         // 解析证书中的域名

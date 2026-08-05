@@ -74,7 +74,7 @@ pub enum ProxyMode {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct InSetting {
     #[serde(rename = "account")]
     pub account: Option<common::Account>,
@@ -84,16 +84,6 @@ pub struct InSetting {
 
     #[serde(rename = "ip")]
     pub ip: Option<String>,
-}
-
-impl Default for InSetting {
-    fn default() -> Self {
-        Self {
-            account: None,
-            udp: None,
-            ip: None,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -416,7 +406,7 @@ impl Proxy {
             processor
                 .handshake(&mut stream)
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Handshake failed: {}", e)))?;
+                .map_err(|e| std::io::Error::other(format!("Handshake failed: {}", e)))?;
 
             match protocol {
                 Protocol::Tcp => {
@@ -585,7 +575,7 @@ impl Proxy {
         let (stream, _cmd, target_addr) = processor
             .process(stream)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("SOCKS5 handshake failed: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("SOCKS5 handshake failed: {}", e)))?;
         log::debug!("SOCKS5 connection to {}", target_addr);
         Ok(ProxyStream::new(Protocol::Tcp, peer_addr, target_addr, stream))
     }
@@ -603,12 +593,12 @@ impl Proxy {
         processor
             .handshake(&mut stream)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("SOCKS5 handshake failed: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("SOCKS5 handshake failed: {}", e)))?;
 
         let (cmd, target_addr) = processor
             .get_request(&mut stream)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("SOCKS5 request failed: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("SOCKS5 request failed: {}", e)))?;
 
         match cmd {
             common::socks::Command::UdpAssociate => {
@@ -626,9 +616,7 @@ impl Proxy {
                 processor
                     .send_reply(&mut stream, common::socks::Reply::Succeeded, &target)
                     .await
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("SOCKS5 reply failed: {}", e))
-                    })?;
+                    .map_err(|e| std::io::Error::other(format!("SOCKS5 reply failed: {}", e)))?;
 
                 let (tx, rx) = mpsc::channel(128);
                 {
@@ -655,9 +643,7 @@ impl Proxy {
                 processor
                     .send_reply(&mut stream, common::socks::Reply::Succeeded, &target_addr)
                     .await
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("SOCKS5 reply failed: {}", e))
-                    })?;
+                    .map_err(|e| std::io::Error::other(format!("SOCKS5 reply failed: {}", e)))?;
 
                 Ok(Some(ProxyStream::new(Protocol::Tcp, peer_addr, target_addr, stream)))
             }
@@ -1075,16 +1061,13 @@ where
     }
 
     if header[1] != 0x00 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("CONNECT failed: reply code {}", header[1]),
-        ));
+        return Err(std::io::Error::other(format!("CONNECT failed: reply code {}", header[1])));
     }
 
     // Read and discard BND.ADDR and BND.PORT
     let _addr = Address::read_from_with_type(stream, header[3])
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to parse address: {}", e)))?;
+        .map_err(|e| std::io::Error::other(format!("Failed to parse address: {}", e)))?;
 
     Ok(())
 }

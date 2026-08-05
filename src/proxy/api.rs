@@ -1,8 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-#[cfg(all(target_os = "linux", feature = "profiling"))]
-use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -20,121 +18,6 @@ use crate::app::ConnectionSink;
 use crate::common::stats::SharedStats;
 use crate::common::{Address, BoxStream, Protocol};
 use crate::route::SharedRouter;
-
-// Profiling handlers - only on Linux
-#[cfg(all(target_os = "linux", feature = "profiling"))]
-mod profiling {
-    use super::*;
-
-    /// Query parameters for profiling endpoints
-    #[derive(Debug, Deserialize)]
-    pub struct ProfilingQuery {
-        #[serde(default = "default_seconds")]
-        pub seconds: u64,
-    }
-
-    fn default_seconds() -> u64 {
-        10
-    }
-
-    impl ProfilingQuery {
-        /// Parse query string and validate seconds parameter
-        pub fn from_query(query: Option<&str>) -> Result<Self, String> {
-            let query_str = query.unwrap_or("");
-            let params: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query_str.as_bytes())
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-
-            let seconds = params
-                .get("seconds")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or_else(default_seconds);
-
-            // Validate bounds: 0 < seconds <= 300 (5 minutes max)
-            if seconds == 0 {
-                return Err("seconds must be greater than 0".to_string());
-            }
-            if seconds > 300 {
-                return Err("seconds must not exceed 300".to_string());
-            }
-
-            Ok(Self { seconds })
-        }
-    }
-
-    /// Binary response helper for profile data
-    fn binary_response(status: StatusCode, body: Bytes, filename: &str) -> Response<Full<Bytes>> {
-        Response::builder()
-            .status(status)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
-            .body(Full::new(body))
-            .unwrap()
-    }
-
-    fn encode_profile(profile: pprof::protos::Profile) -> Vec<u8> {
-        use pprof::protos::Message;
-        let mut buf = Vec::new();
-        profile.encode(&mut buf).unwrap_or_default();
-        buf
-    }
-
-    /// CPU profile handler using pprof
-    pub async fn handle_pprof_cpu(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let query = match ProfilingQuery::from_query(req.uri().query()) {
-            Ok(q) => q,
-            Err(e) => {
-                return Ok(super::json_response(StatusCode::BAD_REQUEST, json!({"error": e})));
-            }
-        };
-
-        // Create pprof profiler
-        let guard = pprof::ProfilerGuardBuilder::default()
-            .frequency(100) // 100 Hz sampling
-            .blocklist(&["libc", "libgcc", "ld-linux"])
-            .build();
-
-        let guard = match guard {
-            Ok(g) => g,
-            Err(e) => {
-                return Ok(super::json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error": format!("failed to start profiler: {}", e)}),
-                ));
-            }
-        };
-
-        // Wait for sampling duration
-        tokio::time::sleep(Duration::from_secs(query.seconds)).await;
-
-        // Generate protobuf profile
-        match guard.report().build() {
-            Ok(report) => match report.pprof() {
-                Ok(profile) => {
-                    let profile_bytes = encode_profile(profile);
-                    Ok(binary_response(StatusCode::OK, Bytes::from(profile_bytes), "profile.pb"))
-                }
-                Err(e) => Ok(super::json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error": format!("failed to generate profile: {}", e)}),
-                )),
-            },
-            Err(e) => Ok(super::json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": format!("failed to build report: {}", e)}),
-            )),
-        }
-    }
-
-    /// Memory profile handler — jemalloc removed
-    pub async fn handle_prof_mem(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let _ = req;
-        Ok(super::json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            json!({"error": "memory profiling unavailable"}),
-        ))
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InSetting {
@@ -232,16 +115,6 @@ async fn handle_request(
         ("GET", "/stats") => handle_get_stats(req, stats).await,
         ("POST", "/handler") => handle_post_handler(req, router, sinks).await,
         ("GET", "/check") => handle_get_check(req, sinks).await,
-        // Profiling endpoints - Linux only
-        #[cfg(all(target_os = "linux", feature = "profiling"))]
-        ("GET", "/pprof/cpu") => profiling::handle_pprof_cpu(req).await,
-        #[cfg(all(target_os = "linux", feature = "profiling"))]
-        ("GET", "/prof/mem") => profiling::handle_prof_mem(req).await,
-        #[cfg(not(all(target_os = "linux", feature = "profiling")))]
-        ("GET", "/pprof/cpu") | ("GET", "/prof/mem") => Ok(json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            json!({"error": "profiling only supported on Linux with profiling feature enabled"}),
-        )),
         _ => Ok(json_response(StatusCode::NOT_FOUND, json!({"error": "not found"}))),
     }
 }
@@ -306,8 +179,10 @@ async fn handle_post_handler(
         }
     };
 
-    let _sink = match sinks.get(&request.tag) {
-        Some(_sink) => (),
+    match sinks.get(&request.tag) {
+        Some(_) => {
+            // tag exists, proceed
+        }
         None => {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
@@ -345,10 +220,7 @@ async fn read_body(req: Request<Incoming>) -> io::Result<Bytes> {
     use http_body_util::BodyExt;
     let body = req.into_body();
 
-    let collected = body
-        .collect()
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let collected = body.collect().await.map_err(io::Error::other)?;
     Ok(collected.to_bytes())
 }
 
@@ -450,7 +322,7 @@ async fn probe_outbound_latency(sink: &ConnectionSink, target: &Address) -> io::
             let mut stream = proxy_sink
                 .try_connect(target, Protocol::Tcp)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connect failed: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("connect failed: {}", e)))?;
 
             // Send a simple HTTP request to get latency
             let http_req = format!("HEAD /generate_204 HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", target);
@@ -458,7 +330,7 @@ async fn probe_outbound_latency(sink: &ConnectionSink, target: &Address) -> io::
             stream
                 .write_all(http_req.as_bytes())
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("write failed: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("write failed: {}", e)))?;
 
             // Read response to ensure connection works
             let mut buf = [0u8; 1];
@@ -473,10 +345,10 @@ async fn probe_outbound_latency(sink: &ConnectionSink, target: &Address) -> io::
                         .dns
                         .resolve(domain)
                         .await
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("dns resolve failed: {}", e)))?;
+                        .map_err(|e| io::Error::other(format!("dns resolve failed: {}", e)))?;
                     let ip = ips
                         .first()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no address for {}", domain)))?;
+                        .ok_or_else(|| io::Error::other(format!("no address for {}", domain)))?;
                     Address::Inet(std::net::SocketAddr::new(*ip, *port))
                 }
                 _ => dst.clone(),
@@ -485,19 +357,16 @@ async fn probe_outbound_latency(sink: &ConnectionSink, target: &Address) -> io::
                 .transport
                 .connect(&resolved, Protocol::Tcp, None)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connect failed: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("connect failed: {}", e)))?;
 
             // Note: DirectSink connects directly, so we just measure connection time
             // For a more accurate measurement, we'd need to send data
         }
         ConnectionSink::Block => {
-            return Err(io::Error::new(io::ErrorKind::Other, "blackhole outbound cannot probe"));
+            return Err(io::Error::other("blackhole outbound cannot probe"));
         }
         ConnectionSink::Daemon(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "daemon outbound not supported for probing",
-            ));
+            return Err(io::Error::other("daemon outbound not supported for probing"));
         }
     }
 

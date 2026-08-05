@@ -85,7 +85,7 @@ impl Raw {
                 Ok(TrStream::Udp(socket))
             }
 
-            _ => Err(io::Error::new(io::ErrorKind::Other, "不支持的地址类型和协议组合")),
+            _ => Err(io::Error::other("不支持的地址类型和协议组合")),
         }
     }
 
@@ -111,14 +111,14 @@ impl Raw {
             #[cfg(unix)]
             Address::Unix(path) => self.listen_unix(path).await,
             #[cfg(not(unix))]
-            Address::Unix(_) => {
-                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, super::UNIX_SOCKET_UNSUPPORTED).into())
-            }
+            Address::Unix(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                super::UNIX_SOCKET_UNSUPPORTED,
+            )),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "listen only supports TCP and Unix addresses",
-            )
-            .into()),
+            )),
         }
     }
 

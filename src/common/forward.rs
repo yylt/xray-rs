@@ -1,5 +1,9 @@
 use crate::common::stats::TrafficStats;
 use crate::transport::TrStream;
+
+/// Alias for the forwarding future result
+pub type ForwardFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(u64, u64)>> + Send + 'a>>;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -17,11 +21,7 @@ impl StreamForwarder {
         Self
     }
 
-    pub fn forward<'a>(
-        &'a self,
-        mut local: TrStream,
-        mut remote: TrStream,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(u64, u64)>> + Send + 'a>> {
+    pub fn forward<'a>(&'a self, mut local: TrStream, mut remote: TrStream) -> ForwardFuture<'a> {
         Box::pin(async move {
             let result =
                 tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, DEFAULT_BUF_SIZE, DEFAULT_BUF_SIZE)
@@ -40,7 +40,7 @@ impl StreamForwarder {
         mut local: TrStream,
         mut remote: TrStream,
         stats: Arc<TrafficStats>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(u64, u64)>> + Send + 'a>> {
+    ) -> ForwardFuture<'a> {
         Box::pin(async move {
             // Use copy_bidirectional to transfer data between streams
             let result =
@@ -66,6 +66,7 @@ impl StreamForwarder {
 mod tests {
     use super::*;
     use crate::transport::TrStream;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 

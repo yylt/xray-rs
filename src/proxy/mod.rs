@@ -179,7 +179,6 @@ impl Inbounder {
         Self::new_with_deps(set, sset, dns, None, None, None)
     }
 
-    /// Create Inbounder with additional dependencies for special inbounds like API
     pub fn new_with_deps(
         set: Option<&InboundSettings>,
         sset: Option<&transport::StreamSettings>,
@@ -194,23 +193,12 @@ impl Inbounder {
         };
         let tr = transport::Transport::new(trset, None, dns.clone())?;
         let inb = match set {
-            None => {
-                return Err(tokio::io::Error::new(
-                    tokio::io::ErrorKind::Other,
-                    "no inbound settings".to_string(),
-                ))
-            }
+            None => return Err(std::io::Error::other("no inbound settings")),
             Some(settings) => match settings {
                 InboundSettings::Api(a) => {
-                    let stats = stats.ok_or_else(|| {
-                        tokio::io::Error::new(tokio::io::ErrorKind::Other, "api inbound requires stats")
-                    })?;
-                    let router = router.ok_or_else(|| {
-                        tokio::io::Error::new(tokio::io::ErrorKind::Other, "api inbound requires router")
-                    })?;
-                    let sinks = sinks.ok_or_else(|| {
-                        tokio::io::Error::new(tokio::io::ErrorKind::Other, "api inbound requires sinks")
-                    })?;
+                    let stats = stats.ok_or_else(|| std::io::Error::other("api inbound requires stats"))?;
+                    let router = router.ok_or_else(|| std::io::Error::other("api inbound requires router"))?;
+                    let sinks = sinks.ok_or_else(|| std::io::Error::other("api inbound requires sinks"))?;
                     Inbounder::Api(api::ApiInbound::new(a, stats, router, sinks)?)
                 }
                 InboundSettings::Socks(s) => Inbounder::Socks(socks::Proxy::new_inbound(s, tr)?),
@@ -218,10 +206,7 @@ impl Inbounder {
                 InboundSettings::Trojan(t) => Inbounder::Trojan(trojan::Proxy::new_inbound(t, tr)?),
                 InboundSettings::Vless(v) => Inbounder::Vless(vless::Proxy::new_inbound(v, tr)?),
                 #[cfg(feature = "tun")]
-                InboundSettings::Tun(t) => {
-                    // TUN doesn't use transport layer
-                    Inbounder::Tun(tun::Proxy::new_inbound(t, dns)?)
-                }
+                InboundSettings::Tun(t) => Inbounder::Tun(tun::Proxy::new_inbound(t, dns)?),
                 InboundSettings::Reverse(f) => Inbounder::Reverse(reverse::ReversInbound::new(f, tr)?),
             },
         };
@@ -250,7 +235,6 @@ impl Inbounder {
         }
     }
 
-    // start listening
     pub async fn listen(self, addr: Address) -> BoxStream<ProxyStream, std::io::Error> {
         match self {
             Inbounder::Http(proxy) => proxy.listen(addr).await,
@@ -272,6 +256,71 @@ pub enum Outbounder {
     Trojan(trojan::Proxy),
     Vless(vless::Proxy),
     Reverse(reverse::ReversOutbound),
+}
+
+impl Outbounder {
+    pub fn new(
+        set: Option<&OutboundSettings>,
+        sset: Option<&transport::StreamSettings>,
+        dns: std::sync::Arc<crate::route::DnsResolver>,
+    ) -> std::io::Result<Self> {
+        let trset = match sset {
+            None => &transport::StreamSettings::default(),
+            Some(settings) => settings,
+        };
+
+        let ob = match set {
+            None => return Err(std::io::Error::other("no outbound settings")),
+            Some(OutboundSettings::Black) | Some(OutboundSettings::Freedom) => {
+                return Err(std::io::Error::other("black|free protocol should be handled at app layer"))
+            }
+            Some(OutboundSettings::Socks(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Socks(socks::Proxy::new_outbound(s, tr)?)
+            }
+            Some(OutboundSettings::Trojan(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Trojan(trojan::Proxy::new_outbound(s, tr, dns)?)
+            }
+            Some(OutboundSettings::Vless(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Vless(vless::Proxy::new_outbound(s, tr, dns)?)
+            }
+            Some(OutboundSettings::Reverse(s)) => {
+                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
+                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
+                Outbounder::Reverse(reverse::ReversOutbound::new(s, tr)?)
+            }
+        };
+        Ok(ob)
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        match self {
+            Outbounder::Reverse(proxy) => proxy.run().await,
+            _ => Err(std::io::Error::other("protocol not support")),
+        }
+    }
+
+    pub async fn connect(
+        &self,
+        dst: &Address,
+        protocol: Protocol,
+        pre_data: Option<Bytes>,
+    ) -> std::io::Result<TrStream> {
+        match self {
+            Outbounder::Socks(proxy) => proxy.connect(dst, protocol, pre_data).await,
+            Outbounder::Trojan(proxy) => proxy.connect(dst, protocol, pre_data).await,
+            Outbounder::Vless(proxy) => proxy.connect(dst, protocol, pre_data).await,
+            Outbounder::Reverse(_proxy) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Reverse outbound uses run() method, not direct connect",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -362,86 +411,5 @@ mod tests {
 
         let err = serde_json::from_str::<InboundSettings>(json).unwrap_err();
         assert!(err.to_string().contains("unknown variant `tun`"));
-    }
-}
-
-impl Outbounder {
-    pub fn new(
-        set: Option<&OutboundSettings>,
-        sset: Option<&transport::StreamSettings>,
-        dns: std::sync::Arc<crate::route::DnsResolver>,
-    ) -> std::io::Result<Self> {
-        let trset = match sset {
-            None => &transport::StreamSettings::default(),
-            Some(settings) => settings,
-        };
-
-        let ob = match set {
-            None => {
-                return Err(tokio::io::Error::new(
-                    tokio::io::ErrorKind::Other,
-                    "no outbound settings".to_string(),
-                ))
-            }
-            Some(OutboundSettings::Black) | Some(OutboundSettings::Freedom) => {
-                return Err(tokio::io::Error::new(
-                    tokio::io::ErrorKind::Other,
-                    "black|free protocol should be handled at app layer".to_string(),
-                ))
-            }
-            Some(OutboundSettings::Socks(s)) => {
-                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
-                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
-                Outbounder::Socks(socks::Proxy::new_outbound(s, tr)?)
-            }
-            Some(OutboundSettings::Trojan(s)) => {
-                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
-                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
-                Outbounder::Trojan(trojan::Proxy::new_outbound(s, tr, dns)?)
-            }
-            Some(OutboundSettings::Vless(s)) => {
-                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
-                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
-                Outbounder::Vless(vless::Proxy::new_outbound(s, tr, dns)?)
-            }
-            Some(OutboundSettings::Reverse(s)) => {
-                let server = Address::try_from((&s.address.as_str(), Some(s.port)))?;
-                let tr = transport::Transport::new(trset, Some(server), dns.clone())?;
-                Outbounder::Reverse(reverse::ReversOutbound::new(s, tr)?)
-            }
-        };
-        Ok(ob)
-    }
-
-    // start outbound, some daemon need
-    pub async fn run(&mut self) -> Result<()> {
-        match self {
-            Outbounder::Reverse(proxy) => proxy.run().await,
-            _ => Err(tokio::io::Error::new(
-                tokio::io::ErrorKind::Other,
-                "protocol not support".to_string(),
-            )),
-        }
-    }
-
-    /// 建立出站连接，返回已就绪的 TrStream
-    pub async fn connect(
-        &self,
-        dst: &Address,
-        protocol: Protocol,
-        pre_data: Option<Bytes>,
-    ) -> std::io::Result<TrStream> {
-        match self {
-            Outbounder::Socks(proxy) => proxy.connect(dst, protocol, pre_data).await,
-            Outbounder::Trojan(proxy) => proxy.connect(dst, protocol, pre_data).await,
-            Outbounder::Vless(proxy) => proxy.connect(dst, protocol, pre_data).await,
-            Outbounder::Reverse(_proxy) => {
-                // Reverse outbound uses gRPC tunneling, not direct connect
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Reverse outbound uses run() method, not direct connect",
-                ))
-            }
-        }
     }
 }

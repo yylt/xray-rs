@@ -1,0 +1,123 @@
+# rsdns example config — full feature set
+# Usage: rsdns --config example/rsdns-all-example.yaml
+
+# Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP
+bind:
+  - address: "0.0.0.0:14453"          # UDP
+  - address: "tcp://0.0.0.0:14453"    # TCP
+
+# Domain groups: name → list of suffixes (supports file: prefix)
+groups:
+  ad:
+    - "*.doubleclick.net"
+    - "*.googlesyndication.com"
+    - "*.googleadservices.com"
+    #- "file:/etc/rsdns/ad-block.txt"
+  intranet:
+    - "*.corp.internal"
+    - "*.lan"
+  foo:
+    - foo.com
+    - "*.foo.org"
+
+# Upstream pools: name → servers
+# Each pool's servers are queried concurrently, first response wins.
+# bootstrap=true servers are used only for resolving domain-based upstreams.
+# pool section enables connection pooling with adaptive address selection.
+upstream:
+  bootstrap:
+    - address: 223.5.5.5
+      bootstrap: true
+  default:
+    - address: tls://dot.pub           # TLS — domain resolved via bootstrap, all A+AAAA IPs used
+      pool:
+        max_size: 8
+        min_idle: 2
+        prefer_family: ipv4
+        connect_timeout: 3
+        health_check_timeout: 3
+        max_consecutive_fail: 3
+        cool_down_secs: 30
+    - address: https://dns.quad9.net/dns-query  # DoH — domain resolved via bootstrap
+      pool:
+        max_size: 4
+    - address: tls://1.1.1.1           # TLS with static IP
+  overseas:
+    - address: tls://8.8.8.8
+    - address: https://cloudflare-dns.com/dns-query
+      pool:
+        max_size: 4
+    - address: h3://mozilla.cloudflare-dns.com/dns-query  # DNS-over-HTTP/3
+      pool:
+        max_size: 4
+    - address: quic://dns.adguard.com  # DNS-over-QUIC (new protocol support)
+      pool:
+        max_size: 4
+
+# Cache configuration
+cache:
+  size: 4096                       # LRU capacity
+  min_ttl: 60                      # clamp TTL lower bound (seconds)
+  max_ttl: 3600                    # clamp TTL upper bound (seconds)
+  serve_expired: true              # serve stale cache when upstream fails
+  keep_ttl: false                  # global default: clamp TTL
+
+# Hosts: suffix-matched static IP mapping (supports file: prefix and wildcard)
+hosts:
+  - "127.0.0.1 localhost"
+  - "::1       localhost"
+  - "192.168.1.1 router.lan"
+  - "0.0.0.0 *.ad-domain.com"     # wildcard: all subdomains → 0.0.0.0
+  - "file:/etc/hosts"
+
+# Rules: matched in order, first hit stops
+rules:
+  # Block ad group with poison (A=0.0.0.0, AAAA=::)
+  - match: ad
+    action:
+      type: block
+      response: poison
+
+  # Block with NXDOMAIN
+  - match: "*.banned.example"
+    qtype: A
+    action:
+      type: block
+      response: nxdomain
+
+  # CNAME rewrite: resolve target and return its IP
+  - match: foo
+    qtype: ANY
+    action:
+      type: cname
+      target: site.182682.xyz
+      ttl: 600
+
+  # Forward intranet to default upstream, skip cache
+  - match: intranet
+    action:
+      type: forward
+      upstream: default
+      cache: false
+
+  # Forward to overseas upstream with custom TTL
+  - match: "*.google.com"
+    qtype: A
+    action:
+      type: forward
+      upstream: overseas
+      ttl: 60       # rewrite response TTL to 60s
+
+  # Forward with upstream-original TTL (keep_ttl overrides ttl)
+  - match: "*.github.com"
+    action:
+      type: forward
+      upstream: default
+      keep_ttl: true
+
+  # Default catch-all
+  - match: "*"
+    action:
+      type: forward
+      upstream: default
+      keep_ttl: true
