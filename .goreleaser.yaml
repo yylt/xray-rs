@@ -7,6 +7,7 @@ builds:
       - amd64
       - arm64
     binary: xray-rs
+    id: xray-rs
     ignore:
       - goos: windows
         goarch: arm64
@@ -25,6 +26,7 @@ builds:
       - amd64
       - arm64
     binary: rsdns
+    id: rsdns
     ignore:
       - goos: windows
         goarch: arm64
