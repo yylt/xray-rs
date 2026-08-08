@@ -267,6 +267,7 @@ pub enum WebSocketConnectionType {
     TlsClient, // 客户端 TLS WebSocket
 }
 
+#[allow(clippy::result_large_err)]
 async fn perform_websocket_handshake<S>(stream: S) -> std::io::Result<TrStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -289,7 +290,7 @@ where
         Ok(res)
     })
     .await
-    .map_err(|e| std::io::Error::other(e))?;
+    .map_err(std::io::Error::other)?;
 
     let early_data = early_data_cell.lock().take();
     Ok(ws_stream.into_tr_stream(early_data))

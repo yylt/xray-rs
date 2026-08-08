@@ -54,3 +54,12 @@ CI (`release.yaml`) builds 4 targets: x86_64-linux-musl, aarch64-linux-musl, aar
 ## Config Reference
 
 See `example/` directory for working configs: TCP/Trojan, gRPC/Trojan, gRPC+TLS/Trojan, WebSocket/Trojan, load-balancer with fallback.
+
+## Testing
+
+- Unit tests: `cargo test` (Rust native, spread across `src/`).
+- E2E tests: live under `tests/e2e/`, require **Go** + a pre-built `xray-rs` binary at `target/release/xray-rs`. Run: `./tests/e2e/run_tests.sh`.
+
+## Rules
+
+- **No annotation bypasses**: Do not suppress warnings/errors with `#[allow(...)]`, `#[cfg(...)]` hacks, or other annotation-based workarounds. Fix the root cause instead.

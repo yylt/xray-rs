@@ -16,6 +16,16 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    // `ring` and `aws-lc-rs` are mutually exclusive
+    let ring = env::var("CARGO_FEATURE_RING").is_ok();
+    let aws_lc_rs = env::var("CARGO_FEATURE_AWS_LC_RS").is_ok();
+    if ring && aws_lc_rs {
+        panic!("Features `ring` and `aws-lc-rs` are mutually exclusive. Enable only one.");
+    }
+    if !ring && !aws_lc_rs {
+        panic!("Either `ring` or `aws-lc-rs` feature must be enabled.");
+    }
+
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-env-changed=TARGET");

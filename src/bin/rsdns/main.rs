@@ -1,333 +1,647 @@
-// bin/rsdns/main.rs
+mod cache;
 mod config;
+mod conn;
+mod factory;
+mod hosts;
+mod pool;
+mod rule;
 mod server;
 mod upstream;
 
-use config::{Config, DomainMatch};
-
 use ahash::AHashMap;
 use clap::Parser;
-use log::{error, info};
-use lru::LruCache;
-use std::hash::Hash;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroUsize;
+use log::{error, info, warn};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::time::Duration;
 
-use xray_rs::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
-use xray_rs::route::dns::{Action, DnsRule};
-use xray_rs::route::matcher::RecordType;
+use xray_rs::build_info;
+use xray_rs::common::{
+    rslog,
+    tls::default_tls_client_config,
+    trie::{DomainMarisa, DomainMarisaBuilder},
+};
 
-use server::DnsServer;
-use upstream::UpstreamClient;
+use cache::DnsCache;
+use config::Config;
+use hosts::HostsTrieBuilder;
+use rule::{BlockResponse, Rule, RuleAction};
+use server::{DnsServer, QueryLogger};
+use upstream::{UpstreamClient, UpstreamGroup};
 
-/// rsdns - DNS server with rule-based routing
+type TlsConfig = Arc<rustls::ClientConfig>;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "rsdns")]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Path to the configuration file
     #[arg(short = 'c', long = "config", default_value = "rsdns.yaml")]
     config: PathBuf,
 }
 
-/// 缓存键
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CacheKey {
-    name: String,
-    qtype: u16,
-}
+fn build_groups_trie(groups: &std::collections::HashMap<String, Vec<String>>) -> DomainMarisa {
+    let mut builder = DomainMarisaBuilder::new();
 
-/// 缓存记录
-#[derive(Debug, Clone)]
-enum CacheRecord {
-    A(Ipv4Addr),
-    AAAA(Ipv6Addr),
-    Other(Vec<u8>),
-}
-
-/// 缓存条目
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    records: Vec<CacheRecord>,
-    expires_at: Instant,
-}
-
-/// 使用 LRU 的 DNS 缓存
-#[derive(Clone)]
-struct DnsCache {
-    inner: Arc<Mutex<LruCache<CacheKey, CacheEntry>>>,
-    min_ttl: Duration,
-    max_ttl: Duration,
-}
-
-impl DnsCache {
-    fn new(size: usize, min_ttl: u32, max_ttl: u32) -> Self {
-        let cap = NonZeroUsize::new(size).unwrap_or(NonZeroUsize::new(1024).unwrap());
-        Self {
-            inner: Arc::new(Mutex::new(LruCache::new(cap))),
-            min_ttl: Duration::from_secs(min_ttl as u64),
-            max_ttl: Duration::from_secs(max_ttl as u64),
-        }
-    }
-
-    async fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
-        let mut cache = self.inner.lock().await;
-        if let Some(entry) = cache.get(key) {
-            if entry.expires_at > Instant::now() {
-                return Some(entry.clone());
-            }
-            cache.pop(key);
-        }
-        None
-    }
-
-    fn clamp_ttl(&self, ttl: u32) -> Duration {
-        let secs = ttl.clamp(self.min_ttl.as_secs() as u32, self.max_ttl.as_secs() as u32);
-        Duration::from_secs(secs as u64)
-    }
-}
-
-/// 从 YAML 文件加载配置
-fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    Config::from_file(path)
-}
-
-/// 构建域名后缀 trie
-fn build_groups_trie(config: &[std::collections::HashMap<String, Vec<String>>]) -> DomainSuffixTrie {
-    let mut builder = DomainSuffixTrieBuilder::new();
-
-    for group_map in config {
-        for (tag, items) in group_map {
-            for item in items {
-                if item.starts_with("file:") {
-                    let path = PathBuf::from(&item[5..]);
-                    match std::fs::read_to_string(&path) {
-                        Ok(content) => {
-                            for line in content.lines() {
-                                let line = line.trim();
-                                if !line.is_empty() && !line.starts_with('#') {
-                                    // 支持通配符格式: *.example.com 或 example.com
-                                    let domain = line.trim_start_matches("*.");
-                                    builder.insert(domain, tag);
-                                }
-                            }
-                            info!("Loaded group file {:?} for tag '{}'", path, tag);
-                        }
-                        Err(e) => error!("Failed to load group file {:?}: {}", path, e),
-                    }
-                } else {
-                    // 直接插入域名
-                    builder.insert(item, tag);
-                }
-            }
-        }
-    }
-
-    builder.build().expect("fst build failed")
-}
-
-/// 构建 hosts 表 (domain -> IpAddr)
-fn build_hosts(config: &[String]) -> AHashMap<String, Vec<IpAddr>> {
-    let mut hosts: AHashMap<String, Vec<IpAddr>> = AHashMap::default();
-
-    for item in config {
-        if item.starts_with("file:") {
-            let path = PathBuf::from(&item[5..]);
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    for line in content.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') {
-                            continue;
-                        }
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 {
-                            if let Ok(ip) = parts[0].parse::<IpAddr>() {
-                                for domain in &parts[1..] {
-                                    hosts.entry(domain.to_string()).or_default().push(ip);
-                                }
+    for (tag, items) in groups {
+        for item in items {
+            if let Some(file_path) = item.strip_prefix("file:") {
+                match std::fs::read_to_string(file_path) {
+                    Ok(content) => {
+                        for line in content.lines() {
+                            let line = line.trim();
+                            if !line.is_empty() && !line.starts_with('#') {
+                                let domain = line.trim_start_matches("*.");
+                                builder.insert(domain, tag);
                             }
                         }
+                        info!("Loaded group file {} for tag '{}'", file_path, tag);
                     }
-                    info!("Loaded hosts from {:?}", path);
-                }
-                Err(e) => error!("Failed to load hosts {:?}: {}", path, e),
-            }
-        } else {
-            // 解析 inline host: "1.1.1.1 xx.yy"
-            let parts: Vec<&str> = item.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(ip) = parts[0].parse::<IpAddr>() {
-                    hosts.entry(parts[1].to_string()).or_default().push(ip);
-                }
-            }
-        }
-    }
-    hosts
-}
-
-/// 构建规则列表
-fn build_rules(config: &[config::RuleConfig], _trie: &DomainSuffixTrie) -> Vec<DnsRule> {
-    config
-        .iter()
-        .map(|rc| {
-            let matchers = vec![];
-
-            // 客户端 IP 匹配
-            if let Some(ref client_ip) = rc.r#match.client_ip {
-                info!("Client IP match {} not fully implemented", client_ip);
-            }
-
-            // 确定动作类型
-            let action = if let Some(ref upstream) = rc.upstream {
-                Action::Forward {
-                    upstream: upstream.clone(),
-                    outbound_tag: None,
-                }
-            } else if let Some(ref cname) = rc.cname {
-                Action::Rewrite {
-                    ip: cname.parse().unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
-                }
-            } else if let Some(ref ip) = rc.ip {
-                Action::Rewrite {
-                    ip: ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+                    Err(e) => error!("Failed to load group file {}: {}", file_path, e),
                 }
             } else {
-                Action::Block
-            };
+                let domain = item.trim_start_matches("*.");
+                builder.insert(domain, tag);
+            }
+        }
+    }
 
-            DnsRule { matchers, action }
+    builder.build()
+}
+
+fn build_hosts_trie(entries: &[String]) -> hosts::HostsTrie {
+    let mut builder = HostsTrieBuilder::new();
+
+    for entry in entries {
+        if let Some(file_path) = entry.strip_prefix("file:") {
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        parse_hosts_line(&mut builder, line);
+                    }
+                    info!("Loaded hosts from {}", file_path);
+                }
+                Err(e) => error!("Failed to load hosts {}: {}", file_path, e),
+            }
+        } else {
+            parse_hosts_line(&mut builder, entry);
+        }
+    }
+
+    builder.build()
+}
+
+fn parse_hosts_line(builder: &mut HostsTrieBuilder, line: &str) {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return;
+    }
+    if let Ok(ip) = parts[0].parse::<IpAddr>() {
+        for domain in &parts[1..] {
+            builder.insert(domain, ip);
+        }
+    }
+}
+
+fn build_rules(config_rules: &[config::RuleConfig]) -> Vec<Rule> {
+    config_rules
+        .iter()
+        .map(|rc| {
+            let group = match &rc.r#match {
+                config::MatchTarget::Group(g) => g.clone(),
+                config::MatchTarget::Wildcard(w) => w.clone(),
+            };
+            let qtype = rc.qtype.as_ref().map(|qt| parse_qtype(qt));
+            let action = match &rc.action {
+                config::RuleActionConfig::Block { response } => RuleAction::Block {
+                    response: match response {
+                        config::BlockResponse::Nxdomain => BlockResponse::NXDomain,
+                        config::BlockResponse::Poison => BlockResponse::Poison,
+                    },
+                },
+                config::RuleActionConfig::Cname { target, ttl } => RuleAction::Cname {
+                    target: target.clone(),
+                    ttl: ttl.unwrap_or(600),
+                },
+                config::RuleActionConfig::Forward { upstream, cache, ttl } => RuleAction::Forward {
+                    upstream: upstream.clone(),
+                    cache: *cache,
+                    ttl: *ttl,
+                },
+            };
+            Rule { group, qtype, action }
         })
         .collect()
 }
 
-/// 构建上游客户端
-fn build_upstreams(
-    config: &[std::collections::HashMap<String, config::UpstreamDetail>],
-) -> AHashMap<String, UpstreamClient> {
-    let mut upstreams = AHashMap::default();
-    for upstream_map in config {
-        for (name, detail) in upstream_map {
-            if let Some(first_server) = detail.server.first() {
-                if let Some(client) = parse_upstream(first_server) {
-                    upstreams.insert(name.clone(), client);
-                }
+fn parse_qtype(s: &str) -> u16 {
+    match s.to_uppercase().as_str() {
+        "A" => 1,
+        "AAAA" => 28,
+        "ANY" => 255,
+        "CNAME" => 5,
+        "MX" => 15,
+        "TXT" => 16,
+        "NS" => 2,
+        "SOA" => 6,
+        "PTR" => 12,
+        "SRV" => 33,
+        _ => s.parse::<u16>().unwrap_or_default(),
+    }
+}
+
+fn parse_host_port(s: &str) -> Option<(String, u16)> {
+    if let Some((host, port_str)) = s.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        Some((s.to_string(), 853))
+    }
+}
+
+#[derive(Clone)]
+enum UpstreamConfig {
+    Pool {
+        pool: Arc<pool::ConnectionPool>,
+        bootstrap: bool,
+    },
+    NeedResolve {
+        server_name: String,
+        port: u16,
+        tls_config: TlsConfig,
+        raw_pool: Option<config::RawPoolConfig>,
+        bootstrap: bool,
+        protocol: ResolveProtocol,
+    },
+    Tcp {
+        addr: SocketAddr,
+        bootstrap: bool,
+        raw_pool: Option<config::RawPoolConfig>,
+    },
+}
+
+#[derive(Clone)]
+enum ResolveProtocol {
+    Tls,
+    Doh { host: Arc<str>, path: Arc<str> },
+    Doh3 { host: Arc<str>, path: Arc<str> },
+    Doq { host: Arc<str> },
+}
+
+impl UpstreamConfig {
+    fn is_bootstrap(&self) -> bool {
+        match self {
+            Self::Pool { bootstrap, .. } | Self::Tcp { bootstrap, .. } | Self::NeedResolve { bootstrap, .. } => {
+                *bootstrap
             }
         }
     }
-    upstreams
+
+    fn needs_resolve(&self) -> bool {
+        matches!(self, Self::NeedResolve { .. })
+    }
 }
 
-fn parse_upstream(addr: &str) -> Option<UpstreamClient> {
-    if addr.starts_with("udp://") {
-        let addr = addr.trim_start_matches("udp://");
-        if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
-            return Some(UpstreamClient::new_udp(vec![sock_addr]));
-        }
-    } else if addr.starts_with("tcp://") {
-        let addr = addr.trim_start_matches("tcp://");
-        if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
-            return Some(UpstreamClient::new_tcp(vec![sock_addr]));
-        }
-    } else if addr.starts_with("tls://") {
-        let addr = addr.trim_start_matches("tls://");
-        // TODO: 实现 TLS upstream
-        if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
-            return Some(UpstreamClient::new_tcp(vec![sock_addr]));
-        }
-    } else if addr.starts_with("https://") {
-        // TODO: 实现 DoH upstream
-        return None;
+fn build_tcp_pool(addr: SocketAddr, raw_pool: Option<config::RawPoolConfig>) -> Arc<pool::ConnectionPool> {
+    let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
+    pool::ConnectionPool::new(vec![addr], factory::tcp_factory(), pool_cfg)
+}
+
+fn build_udp_pool(addr: SocketAddr, raw_pool: Option<config::RawPoolConfig>) -> Arc<pool::ConnectionPool> {
+    let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(true);
+    pool::ConnectionPool::new(vec![addr], factory::udp_factory(), pool_cfg)
+}
+
+fn parse_upstream(addr: &str, bootstrap: bool, raw_pool: Option<config::RawPoolConfig>) -> Option<UpstreamConfig> {
+    if let Some(rest) = addr.strip_prefix("udp://") {
+        let sock_addr: SocketAddr = rest.parse().ok()?;
+        let pool = build_udp_pool(sock_addr, raw_pool);
+        return Some(UpstreamConfig::Pool { pool, bootstrap });
     }
-    // 默认使用 UDP
-    if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
-        return Some(UpstreamClient::new_udp(vec![sock_addr]));
+    if let Some(rest) = addr.strip_prefix("tcp://") {
+        let sock_addr: SocketAddr = rest
+            .parse::<SocketAddr>()
+            .or_else(|_| format!("{}:53", rest).parse())
+            .ok()?;
+        return Some(UpstreamConfig::Tcp {
+            addr: sock_addr,
+            bootstrap,
+            raw_pool,
+        });
     }
-    None
+    if let Some(rest) = addr.strip_prefix("tls://") {
+        let (host, port) = parse_host_port(rest)?;
+        let tls_config = default_tls_client_config();
+        match host.parse::<IpAddr>() {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port);
+                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
+                let pool = pool::ConnectionPool::new(vec![addr], factory::tls_factory(host, tls_config), pool_cfg);
+                return Some(UpstreamConfig::Pool { pool, bootstrap });
+            }
+            Err(_) => {
+                return Some(UpstreamConfig::NeedResolve {
+                    server_name: host,
+                    port,
+                    tls_config,
+                    raw_pool,
+                    bootstrap,
+                    protocol: ResolveProtocol::Tls,
+                });
+            }
+        }
+    }
+    if let Some(_rest) = addr.strip_prefix("https://") {
+        let tls_config = default_tls_client_config();
+        let parsed: url::Url = addr.parse().ok()?;
+        let host: Arc<str> = parsed.host_str()?.to_string().into();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let path: Arc<str> = match parsed.query() {
+            Some(q) => format!("{}?{}", parsed.path(), q),
+            None => parsed.path().to_string(),
+        }
+        .into();
+
+        match host.parse::<IpAddr>() {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port);
+                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
+                let pool = pool::ConnectionPool::new(
+                    vec![addr],
+                    factory::doh_factory(host.clone(), path, tls_config),
+                    pool_cfg,
+                );
+                return Some(UpstreamConfig::Pool { pool, bootstrap });
+            }
+            Err(_) => {
+                return Some(UpstreamConfig::NeedResolve {
+                    server_name: host.to_string(),
+                    port,
+                    tls_config,
+                    raw_pool,
+                    bootstrap,
+                    protocol: ResolveProtocol::Doh { host, path },
+                });
+            }
+        }
+    }
+    if let Some(_rest) = addr.strip_prefix("h3://") {
+        let tls_config = default_tls_client_config();
+        let parsed: url::Url = addr.parse().ok()?;
+        let host: Arc<str> = parsed.host_str()?.to_string().into();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let path: Arc<str> = match parsed.query() {
+            Some(q) => format!("{}?{}", parsed.path(), q),
+            None => parsed.path().to_string(),
+        }
+        .into();
+
+        match host.parse::<IpAddr>() {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port);
+                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
+                let pool = pool::ConnectionPool::new(
+                    vec![addr],
+                    factory::doh3_factory(host.clone(), path, tls_config),
+                    pool_cfg,
+                );
+                return Some(UpstreamConfig::Pool { pool, bootstrap });
+            }
+            Err(_) => {
+                return Some(UpstreamConfig::NeedResolve {
+                    server_name: host.to_string(),
+                    port,
+                    tls_config,
+                    raw_pool,
+                    bootstrap,
+                    protocol: ResolveProtocol::Doh3 { host, path },
+                });
+            }
+        }
+    }
+    if let Some(rest) = addr.strip_prefix("quic://") {
+        let (host, port) = parse_host_port(rest)?;
+        let tls_config = default_tls_client_config();
+
+        match host.parse::<IpAddr>() {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port);
+                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
+                let host_arc: Arc<str> = host.into();
+                let pool = pool::ConnectionPool::new(vec![addr], factory::doq_factory(host_arc, tls_config), pool_cfg);
+                return Some(UpstreamConfig::Pool { pool, bootstrap });
+            }
+            Err(_) => {
+                let host_arc: Arc<str> = host.clone().into();
+                return Some(UpstreamConfig::NeedResolve {
+                    server_name: host,
+                    port,
+                    tls_config,
+                    raw_pool,
+                    bootstrap,
+                    protocol: ResolveProtocol::Doq { host: host_arc },
+                });
+            }
+        }
+    }
+
+    let sock_addr: SocketAddr = addr
+        .parse::<SocketAddr>()
+        .or_else(|_| format!("{}:53", addr).parse())
+        .ok()?;
+    let pool = build_udp_pool(sock_addr, raw_pool);
+    Some(UpstreamConfig::Pool { pool, bootstrap })
+}
+
+async fn bootstrap_resolve_all(
+    bootstrap_clients: &[UpstreamClient],
+    targets: &[(usize, UpstreamConfig)],
+) -> Vec<(usize, Vec<SocketAddr>)> {
+    use hickory_proto::op::{Message, MessageType, OpCode};
+    use hickory_proto::rr::{Name, RData, RecordType};
+
+    async fn resolve_host_all(bootstrap_clients: &[UpstreamClient], host: &str, port: u16) -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+
+        for qtype in [RecordType::A, RecordType::AAAA] {
+            let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+            let mut q = hickory_proto::op::Query::new();
+            if let Ok(name) = Name::from_utf8(host) {
+                q.set_name(name);
+            } else {
+                continue;
+            }
+            q.set_query_type(qtype);
+            q.set_query_class(hickory_proto::rr::DNSClass::IN);
+            msg.queries.push(q);
+            msg.metadata.recursion_desired = true;
+
+            for client in bootstrap_clients {
+                match client.query(&msg).await {
+                    Ok(resp) => {
+                        for answer in &resp.answers {
+                            match answer.data {
+                                RData::A(ip) => {
+                                    addrs.push(SocketAddr::new(IpAddr::V4(ip.0), port));
+                                }
+                                RData::AAAA(ip) => {
+                                    addrs.push(SocketAddr::new(IpAddr::V6(ip.0), port));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Bootstrap query failed for {} ({}): {}", host, qtype, e);
+                    }
+                }
+            }
+        }
+        addrs
+    }
+
+    let mut results = Vec::new();
+    for (idx, cfg) in targets {
+        let (host_str, port) = match cfg {
+            UpstreamConfig::NeedResolve { server_name, port, .. } => (server_name.clone(), *port),
+            _ => continue,
+        };
+        let addrs = resolve_host_all(bootstrap_clients, &host_str, port).await;
+        results.push((*idx, addrs));
+    }
+    results
+}
+
+fn materialize_static_pool(cfg: &mut UpstreamConfig) {
+    if let UpstreamConfig::Tcp {
+        addr,
+        bootstrap,
+        raw_pool,
+    } = cfg
+    {
+        let pool = build_tcp_pool(*addr, raw_pool.clone());
+        *cfg = UpstreamConfig::Pool {
+            pool,
+            bootstrap: *bootstrap,
+        };
+    }
+}
+
+async fn build_bootstrap_pools(configs: &mut [UpstreamConfig]) -> Vec<UpstreamClient> {
+    let mut clients = Vec::new();
+    for cfg in configs {
+        if matches!(cfg, UpstreamConfig::Tcp { bootstrap: true, .. }) {
+            materialize_static_pool(cfg);
+        }
+        if cfg.is_bootstrap() {
+            if let UpstreamConfig::Pool { pool, bootstrap: _ } = cfg {
+                clients.push(UpstreamClient::new(pool.clone()));
+            }
+        }
+    }
+    clients
+}
+
+fn build_resolved_pool(cfg: &UpstreamConfig, addrs: Vec<SocketAddr>) -> io::Result<Arc<pool::ConnectionPool>> {
+    match cfg {
+        UpstreamConfig::NeedResolve {
+            server_name,
+            tls_config,
+            raw_pool,
+            protocol,
+            ..
+        } => {
+            let pool_cfg = raw_pool.clone().unwrap_or_default().into_pool_config(false);
+            let factory: conn::ConnFactory = match protocol {
+                ResolveProtocol::Tls => factory::tls_factory(server_name.clone(), tls_config.clone()),
+                ResolveProtocol::Doh { host, path } => {
+                    factory::doh_factory(host.clone(), path.clone(), tls_config.clone())
+                }
+                ResolveProtocol::Doh3 { host, path } => {
+                    factory::doh3_factory(host.clone(), path.clone(), tls_config.clone())
+                }
+                ResolveProtocol::Doq { host } => factory::doq_factory(host.clone(), tls_config.clone()),
+            };
+            Ok(pool::ConnectionPool::new(addrs, factory, pool_cfg))
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a resolve config")),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    let _guard = rslog::init(log::LevelFilter::Info);
+
+    build_info::log_startup_info();
 
     let args = Args::parse();
     let config_path = args.config.to_string_lossy();
     info!("Loading config from {}", config_path);
 
-    let config = load_config(&config_path)?;
+    let config = Config::from_file(&config_path)?;
 
-    // 构建组件
     let groups_trie = build_groups_trie(&config.groups);
-    let hosts = build_hosts(&config.hosts);
-    let rules = build_rules(&config.rules, &groups_trie);
-    let upstreams = build_upstreams(&config.upstreams);
+    if !config.groups.is_empty() {
+        info!("domain groups loaded:");
+        for (tag, domains) in &config.groups {
+            info!("  '{}': {} domain(s)", tag, domains.len());
+        }
+    }
+    let hosts_trie = build_hosts_trie(&config.hosts);
+    if !config.hosts.is_empty() {
+        info!("hosts entries: {}", config.hosts.len());
+    }
+    let rules = build_rules(&config.rules);
+    info!("rules: {}", rules.len());
 
-    // 创建 LRU 缓存
     let cache_config = config.cache.unwrap_or_default();
     let cache = DnsCache::new(
         cache_config.size.unwrap_or(4096),
         cache_config.min_ttl.unwrap_or(60),
         cache_config.max_ttl.unwrap_or(3600),
+        cache_config.serve_expired.unwrap_or(false),
+        cache_config.keep_ttl.unwrap_or(false),
     );
 
-    info!("Built {} groups in trie", config.groups.len());
-    info!("Built {} hosts entries", hosts.len());
-    info!("Built {} rules", rules.len());
-    info!("Built {} upstreams", upstreams.len());
+    let mut all_configs: Vec<UpstreamConfig> = Vec::new();
+    let mut upstream_map: Vec<(String, Vec<usize>)> = Vec::new();
 
-    // 找默认 upstream
-    let default_upstream = config
-        .upstreams
-        .first()
-        .and_then(|m| m.keys().next().cloned())
-        .unwrap_or_else(|| "default".to_string());
+    info!("rsdns starting, upstream pools: {}", config.upstream.len());
+    for (name, servers) in &config.upstream {
+        info!("  upstream pool '{}': {} server(s)", name, servers.len());
+        let mut indices = Vec::new();
+        for server in servers {
+            let idx = all_configs.len();
+            let protocol_label = classify_upstream(&server.address);
+            let bootstrap_label = if server.bootstrap { "bootstrap" } else { "upstream" };
+            info!("    {} {} server: {}", bootstrap_label, protocol_label, server.address);
 
-    // 启动监听
-    for bind in &config.bind {
-        let addr_str = bind.address.clone();
-
-        if addr_str.starts_with("udp://") {
-            let addr: SocketAddr = addr_str.trim_start_matches("udp://").parse()?;
-            info!("Starting UDP server on {}", addr);
-            // 暂用占位，实际需要重构 server.rs 来使用新的 cache/trie
-            tokio::spawn(async move {
-                info!("Server would run on {}", addr);
-            });
-        } else {
-            // 尝试直接解析为 SocketAddr
-            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                info!("Starting UDP server on {}", addr);
-                tokio::spawn(async move {
-                    info!("Server would run on {}", addr);
-                });
+            if let Some(cfg) = parse_upstream(&server.address, server.bootstrap, server.pool.clone()) {
+                all_configs.push(cfg);
+                indices.push(idx);
+            } else {
+                warn!("    failed to parse upstream: {}", server.address);
             }
         }
-        // TODO: tcp://, tls://, https://
+        upstream_map.push((name.clone(), indices));
     }
 
-    // 保持运行
+    // Phase 1: bootstrap pools
+    let bootstrap_clients = build_bootstrap_pools(&mut all_configs).await;
+    info!("bootstrap clients: {}", bootstrap_clients.len());
+
+    // Phase 2: resolve domain upstreams via bootstrap (A + AAAA = all addresses)
+    let dynamic_indices: Vec<usize> = all_configs
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.needs_resolve() && !c.is_bootstrap())
+        .map(|(i, _)| i)
+        .collect();
+
+    if !dynamic_indices.is_empty() {
+        info!("resolving {} dynamic upstream(s) via bootstrap...", dynamic_indices.len());
+        let dynamic_entries: Vec<(usize, UpstreamConfig)> =
+            dynamic_indices.iter().map(|&i| (i, all_configs[i].clone())).collect();
+        let resolved = bootstrap_resolve_all(&bootstrap_clients, &dynamic_entries).await;
+
+        for (idx, addrs) in resolved {
+            if addrs.is_empty() {
+                return Err(format!("failed to resolve dynamic upstream index={}", idx).into());
+            }
+            info!("    resolved index={} -> {} addresses: {:?}", idx, addrs.len(), addrs);
+
+            let pool = build_resolved_pool(&all_configs[idx], addrs)
+                .map_err(|e| format!("failed to build resolved pool index={}: {}", idx, e))?;
+
+            all_configs[idx] = UpstreamConfig::Pool { pool, bootstrap: false };
+        }
+    }
+
+    // Phase 3: build remaining TCP pools (non-domain, non-bootstrap)
+    for cfg in &mut all_configs {
+        if matches!(cfg, UpstreamConfig::Tcp { bootstrap: false, .. }) {
+            materialize_static_pool(cfg);
+        }
+    }
+
+    // Phase 4: assemble UpstreamGroup
+    let upstreams: AHashMap<String, UpstreamGroup> = upstream_map
+        .into_iter()
+        .map(|(name, indices)| {
+            let clients: Vec<UpstreamClient> = indices
+                .iter()
+                .filter_map(|&i| match &all_configs[i] {
+                    UpstreamConfig::Pool { pool, bootstrap: _ } => Some(UpstreamClient::new(pool.clone())),
+                    _ => None,
+                })
+                .collect();
+            (name, UpstreamGroup::new(clients))
+        })
+        .collect();
+
+    let logger = Arc::new(QueryLogger::new(&config.log)?);
+    logger.start_flush_task(Duration::from_secs(5));
+    let server = DnsServer::new(hosts_trie, groups_trie, rules, cache, upstreams, logger.clone());
+
+    info!("listening on {} address(es)", config.bind.len());
+    for bind in &config.bind {
+        let addr_str = &bind.address;
+
+        if let Some(rest) = addr_str.strip_prefix("tcp://") {
+            let addr: SocketAddr = rest.parse()?;
+            let s = server.clone_inner();
+            info!("  TCP {}", addr);
+            tokio::spawn(async move {
+                if let Err(e) = s.serve_tcp(addr).await {
+                    error!("TCP server on {} failed: {}", addr, e);
+                }
+            });
+        } else {
+            let addr: SocketAddr = addr_str.parse()?;
+            let s = server.clone_inner();
+            info!("  UDP {}", addr);
+            tokio::spawn(async move {
+                if let Err(e) = s.serve_udp(addr).await {
+                    error!("UDP server on {} failed: {}", addr, e);
+                }
+            });
+        }
+    }
+
     info!("rsdns started, press Ctrl+C to stop");
     tokio::signal::ctrl_c().await?;
     info!("Shutting down");
+    logger.flush();
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_load_example_config() {
-        let config = Config::from_file("example/example-rsdns.yaml").expect("load failed");
-        assert_eq!(config.bind.len(), 2);
-        assert_eq!(config.groups.len(), 1);
-        assert_eq!(config.upstreams.len(), 2);
-        assert!(config.cache.is_some());
-        assert_eq!(config.hosts.len(), 2);
-        assert_eq!(config.rules.len(), 4);
+fn classify_upstream(addr: &str) -> &'static str {
+    if addr.starts_with("udp://") {
+        "UDP"
+    } else if addr.starts_with("tcp://") {
+        "TCP"
+    } else if addr.starts_with("tls://") {
+        "TLS"
+    } else if addr.starts_with("https://") {
+        "DoH"
+    } else if addr.starts_with("h3://") {
+        "DoH3"
+    } else if addr.starts_with("quic://") {
+        "DoQ"
+    } else {
+        "UDP"
     }
 }

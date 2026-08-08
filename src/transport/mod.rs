@@ -31,7 +31,7 @@ pub(crate) fn unix_socket_supported() -> bool {
 const DEFAULT_CHANNEL_CLIENT_CAPACITY: usize = 128;
 const DEFAULT_CHANNEL_SERVER_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StreamSettings {
     #[serde(rename = "network", default)]
     network: Network,
@@ -53,20 +53,6 @@ pub struct StreamSettings {
 
     #[serde(rename = "xhttpSettings")]
     xhttp_settings: Option<xhttp::XhttpSettings>,
-}
-
-impl Default for StreamSettings {
-    fn default() -> Self {
-        Self {
-            network: Network::default(),
-            security: Security::default(),
-            sockopt: sockopt::SocketOpt::default(),
-            tls_settings: None,
-            ws_settings: None,
-            grpc_settings: None,
-            xhttp_settings: None,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -114,25 +100,59 @@ pub enum TrStream {
 pub struct WebSocketIo<IO> {
     inner: WebSocketStream<IO>,
     read_buf: BytesMut,
+    write_buf: BytesMut,
 }
 
-impl<IO> WebSocketIo<IO> {
+impl<IO> WebSocketIo<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
     fn new(inner: WebSocketStream<IO>) -> Self {
         Self {
             inner,
             read_buf: BytesMut::new(),
+            write_buf: BytesMut::with_capacity(8192),
         }
     }
 
     fn new_with_read_buf(inner: WebSocketStream<IO>, data: Bytes) -> Self {
         let mut read_buf = BytesMut::with_capacity(data.len());
         read_buf.extend_from_slice(&data);
-        Self { inner, read_buf }
+        Self {
+            inner,
+            read_buf,
+            write_buf: BytesMut::with_capacity(8192),
+        }
+    }
+
+    fn flush_write_buf(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.write_buf.is_empty() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        match std::pin::Pin::new(&mut this.inner).poll_ready(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                let data = this.write_buf.split().freeze();
+                std::pin::Pin::new(&mut this.inner)
+                    .start_send(Message::Binary(data))
+                    .map_err(websocket_err_to_io)?;
+                std::pin::Pin::new(&mut this.inner)
+                    .poll_flush(cx)
+                    .map_err(websocket_err_to_io)
+            }
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(websocket_err_to_io(err))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
 fn websocket_err_to_io(err: tokio_tungstenite::tungstenite::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err)
+    io::Error::other(err)
 }
 
 impl<IO> AsyncRead for WebSocketIo<IO>
@@ -204,16 +224,15 @@ where
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        match std::pin::Pin::new(&mut this.inner).poll_ready(cx) {
-            std::task::Poll::Ready(Ok(())) => {
-                std::pin::Pin::new(&mut this.inner)
-                    .start_send(Message::Binary(buf.to_vec().into()))
-                    .map_err(websocket_err_to_io)?;
-                std::task::Poll::Ready(Ok(buf.len()))
-            }
-            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(websocket_err_to_io(err))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
+        this.write_buf.extend_from_slice(buf);
+
+        if this.write_buf.len() >= 8192 {
+            return std::pin::Pin::new(&mut *this)
+                .flush_write_buf(cx)
+                .map(|res| res.map(|()| buf.len()));
         }
+
+        std::task::Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(
@@ -221,6 +240,14 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if !this.write_buf.is_empty() {
+            match std::pin::Pin::new(&mut *this).flush_write_buf(cx) {
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+
         std::pin::Pin::new(&mut this.inner)
             .poll_flush(cx)
             .map_err(websocket_err_to_io)

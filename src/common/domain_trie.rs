@@ -9,6 +9,12 @@ pub struct DomainSuffixTrieBuilder {
     id_to_tag: Vec<Box<str>>,
 }
 
+impl Default for DomainSuffixTrieBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DomainSuffixTrieBuilder {
     pub fn new() -> Self {
         Self {
@@ -56,15 +62,15 @@ impl DomainSuffixTrieBuilder {
         id
     }
 
-    pub fn build(self) -> Result<DomainSuffixTrie, fst::Error> {
-        let mut builder = MapBuilder::memory();
-
-        // BTreeMap 保证了迭代时的字节序是有序的，满足 FST 的插入要求
-        for (key, value) in self.items {
-            builder.insert(key, value as u64)?;
+    pub fn build(mut self) -> Result<DomainSuffixTrie, fst::Error> {
+        let mut map_builder = MapBuilder::memory();
+        let items = std::mem::take(&mut self.items);
+        for (key, value) in items {
+            map_builder.insert(key, value as u64)?;
         }
 
-        let map_data = builder.into_inner()?;
+        let map_data = map_builder.into_inner()?;
+
         Ok(DomainSuffixTrie {
             map: Map::new(map_data)?,
             id_to_tag: self.id_to_tag.into_boxed_slice(),
@@ -78,6 +84,12 @@ pub struct DomainSuffixTrie {
     map: Map<Vec<u8>>,
     // 标签索引表
     id_to_tag: Box<[Box<str>]>,
+}
+
+impl Default for DomainSuffixTrie {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DomainSuffixTrie {
