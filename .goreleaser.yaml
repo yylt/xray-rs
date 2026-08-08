@@ -1,41 +1,27 @@
 builds:
   - goos:
       - linux
-      - windows
-      - android
     goarch:
       - amd64
       - arm64
     binary: xray-rs
     id: xray-rs
-    ignore:
-      - goos: windows
-        goarch: arm64
-      - goos: android
-        goarch: amd64
     main: goreleaser.go
     hooks:
       post:
-        - ./.goreleaser_hook.sh "{{ .Arch }}" "{{ .Os }}" "{{ .Binary }}"
+        - ./.goreleaser_hook.sh "{{ .Arch }}" "{{ .Os }}" "xray-rs"
 
   - goos:
       - linux
-      - windows
-      - android
     goarch:
       - amd64
       - arm64
     binary: rsdns
     id: rsdns
-    ignore:
-      - goos: windows
-        goarch: arm64
-      - goos: android
-        goarch: amd64
     main: goreleaser.go
     hooks:
       post:
-        - ./.goreleaser_hook.sh "{{ .Arch }}" "{{ .Os }}" "{{ .Binary }}"
+        - ./.goreleaser_hook.sh "{{ .Arch }}" "{{ .Os }}" "rsdns"
 
 checksum:
   name_template: "checksums.txt"

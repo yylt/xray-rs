@@ -1,19 +1,31 @@
+name: E2E
+
 on:
   push:
     branches: ["main"]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
   pull_request:
     branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   e2e-xray:
     name: E2E xray-rs
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -29,12 +41,15 @@ jobs:
   e2e-rsdns:
     name: E2E rsdns
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -50,5 +65,5 @@ jobs:
           RSDNS_UPSTREAM_DOH: "https://1.1.1.1/dns-query"
           RSDNS_UPSTREAM_DOH3: "h3://1.1.1.1/dns-query"
           RSDNS_UPSTREAM_TCP: "tcp://1.1.1.1:53"
-          RSDNS_UPSTREAM_DOQ: "quic://dns.adguard.com:853"
+          RSDNS_UPSTREAM_DOQ: ""
         run: ./tests/e2e/run_rsdns_tests.sh
