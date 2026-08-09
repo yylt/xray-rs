@@ -185,7 +185,7 @@ func startRsdnsWithSplitConfig(ctx context.Context, port int, testUpstream strin
 	if err := os.WriteFile(configPath, []byte(configYAML), 0o644); err != nil {
 		cancel()
 		os.RemoveAll(tmpDir)
-		return nil, fmt.Errorf("write config: %%w", err)
+		return nil, fmt.Errorf("write config: %w", err)
 	}
 	log.Printf("[rsdns] Split config (port=%d upstream=%s domain=%s):\n%s", port, testUpstream, testDomain, configYAML)
 	bp := rsdnsBinaryPath()
@@ -242,6 +242,11 @@ type dnsClient struct {
 	conn *net.UDPConn
 }
 
+type dnsResponse struct {
+	rcode uint8
+	ips   []net.IP
+}
+
 func newDNSClient(port int) (*dnsClient, error) {
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -272,6 +277,14 @@ func (c *dnsClient) LookupHost(domain string) ([]string, error) {
 	return hosts, nil
 }
 
+func (c *dnsClient) lookupRcode(domain string, qtype uint16) (uint8, error) {
+	resp, err := c.lookupResponse(domain, qtype)
+	if err != nil {
+		return 0, err
+	}
+	return resp.rcode, nil
+}
+
 func (c *dnsClient) LookupHostWithRetry(domain string, retries int, interval time.Duration) ([]string, error) {
 	var lastErr error
 	for i := 0; i < retries; i++ {
@@ -286,6 +299,17 @@ func (c *dnsClient) LookupHostWithRetry(domain string, retries int, interval tim
 }
 
 func (c *dnsClient) lookup(domain string, qtype uint16) ([]net.IP, error) {
+	resp, err := c.lookupResponse(domain, qtype)
+	if err != nil {
+		return nil, err
+	}
+	if resp.rcode != 0 {
+		return nil, nil
+	}
+	return resp.ips, nil
+}
+
+func (c *dnsClient) lookupResponse(domain string, qtype uint16) (*dnsResponse, error) {
 	wire := buildWireQuery(domain, qtype)
 	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := c.conn.Write(wire); err != nil {
@@ -312,15 +336,12 @@ func buildWireQuery(domain string, qtype uint16) []byte {
 	return buf
 }
 
-func parseWireResponse(data []byte) []net.IP {
+func parseWireResponse(data []byte) *dnsResponse {
 	if len(data) < 12 {
-		return nil
+		return &dnsResponse{}
 	}
 	ancount := int(uint16(data[6])<<8 | uint16(data[7]))
 	rcode := data[3] & 0x0F
-	if rcode != 0 {
-		return nil
-	}
 	pos := 12
 	for pos < len(data) && data[pos] != 0x00 {
 		if data[pos]&0xC0 == 0xC0 {
@@ -371,7 +392,7 @@ func parseWireResponse(data []byte) []net.IP {
 		}
 		pos += int(rdlen)
 	}
-	return ips
+	return &dnsResponse{rcode: rcode, ips: ips}
 }
 
 // --- wait for rsdns to be ready ---
@@ -569,6 +590,72 @@ rules:
 	return nil
 }
 
+func testRsdnsForwardDenyQtype() error {
+	port := 15362
+	cfg := fmt.Sprintf(`bind:
+  - address: "0.0.0.0:%d"
+upstream:
+  default:
+    servers:
+      - address: 223.5.5.5
+        bootstrap: true
+rules:
+  - match: "*"
+    action:
+      type: forward
+      upstream: default
+      deny_qtypes: [28]
+`, port)
+	tmpDir, _ := os.MkdirTemp("", "rsdns-e2e-*")
+	defer os.RemoveAll(tmpDir)
+	cfgPath := filepath.Join(tmpDir, "rsdns.yaml")
+	os.WriteFile(cfgPath, []byte(cfg), 0o644)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, rsdnsBinaryPath(), "--config", cfgPath)
+	wd, _ := os.Getwd()
+	cmd.Dir = filepath.Join(wd, "../..")
+
+	if !verbose {
+		logFile, err := os.Create(filepath.Join(tmpDir, "rsdns.log"))
+		if err == nil {
+			cmd.Stdout = logFile
+			cmd.Stderr = logFile
+		}
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	defer cmd.Process.Kill()
+
+	if err := waitForRsdnsReady(port, 15*time.Second); err != nil {
+		return fmt.Errorf("wait: %w", err)
+	}
+	cli, _ := newDNSClient(port)
+	defer cli.Close()
+
+	rcode, err := cli.lookupRcode("example.com", 28)
+	if err != nil {
+		return fmt.Errorf("lookup AAAA: %w", err)
+	}
+	if rcode != 5 {
+		return fmt.Errorf("expected REFUSED(5), got %d", rcode)
+	}
+
+	rcode, err = cli.lookupRcode("example.com", 1)
+	if err != nil {
+		return fmt.Errorf("lookup A: %w", err)
+	}
+	if rcode != 0 {
+		return fmt.Errorf("expected NOERROR(0) for A, got %d", rcode)
+	}
+
+	log.Printf("[rsdns-test] PASS REFUSED deny_qtypes")
+	return nil
+}
+
 func testRsdnsDoT() error {
 	addr := os.Getenv("RSDNS_UPSTREAM_DOT")
 	if addr == "" {
@@ -739,6 +826,7 @@ func testRsdnsAll() error {
 		{"Hosts", testRsdnsHosts},
 		{"Cache", testRsdnsCache},
 		{"Reject", testRsdnsReject},
+		{"ForwardDenyQtype", testRsdnsForwardDenyQtype},
 		{"DoT", testRsdnsDoT},
 		{"DoH", testRsdnsDoH},
 		{"DoH3", testRsdnsDoH3},

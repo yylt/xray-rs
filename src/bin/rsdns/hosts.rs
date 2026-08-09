@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use xray_rs::common::trie::{DomainMarisa, DomainMarisaBuilder};
+use xray_rs::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
 
 pub struct HostsTrie {
-    trie: DomainMarisa,
+    trie: DomainSuffixTrie,
     ips: Vec<Vec<IpAddr>>,
 }
 
@@ -18,7 +18,7 @@ impl HostsTrie {
 }
 
 pub struct HostsTrieBuilder {
-    builder: DomainMarisaBuilder,
+    builder: DomainSuffixTrieBuilder,
     ips: Vec<Vec<IpAddr>>,
     domain_to_idx: HashMap<String, usize>,
 }
@@ -26,7 +26,7 @@ pub struct HostsTrieBuilder {
 impl HostsTrieBuilder {
     pub fn new() -> Self {
         Self {
-            builder: DomainMarisaBuilder::new(),
+            builder: DomainSuffixTrieBuilder::new(),
             ips: Vec::new(),
             domain_to_idx: HashMap::new(),
         }
@@ -47,7 +47,7 @@ impl HostsTrieBuilder {
 
     pub fn build(self) -> HostsTrie {
         HostsTrie {
-            trie: self.builder.build(),
+            trie: self.builder.build().expect("FST build failed"),
             ips: self.ips,
         }
     }

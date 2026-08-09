@@ -2,6 +2,12 @@
 name = "xray-rs"
 version = "0.1.0"
 edition = "2021"
+description = "A Rust-based proxy toolchain"
+license = "MIT"
+repository = "https://github.com/yylt/xray-rs"
+readme = "README.md"
+keywords = ["proxy", "tunnel", "xray"]
+categories = ["network-programming"]
 
 [dependencies]
 futures = { version = "0.3.32", default-features = false, features = ["std"] }

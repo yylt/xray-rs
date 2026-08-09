@@ -1,8 +1,8 @@
 //! DNS upstream client and group types.
 //!
 //! An [`UpstreamClient`] wraps a [`ConnectionPool`] and exposes a simple
-//! `query()` interface.  An [`UpstreamGroup`] fans queries out to multiple
-//! clients concurrently, returning the first successful response.
+//! `query()` interface. An [`UpstreamGroup`] can query multiple clients in
+//! serial or parallel mode.
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -62,26 +62,50 @@ impl UpstreamClient {
 }
 
 /// A group of upstream clients queried concurrently.
-///
-/// All clients in the group are queried in parallel via `FuturesUnordered`;
-/// the first successful response wins.  If all clients fail, the last
-/// error is returned.
-///
 /// This is the top-level type stored in `DnsServer::upstreams`, keyed by
 /// the upstream pool name from the config.
 pub struct UpstreamGroup {
     clients: Vec<UpstreamClient>,
+    mode: QueryMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryMode {
+    Serial,
+    Parallel,
 }
 
 impl UpstreamGroup {
     /// Creates a group from a list of clients.
-    pub fn new(clients: Vec<UpstreamClient>) -> Self {
-        Self { clients }
+    pub fn new(clients: Vec<UpstreamClient>, mode: QueryMode) -> Self {
+        Self { clients, mode }
     }
 
-    /// Sends `msg` to all clients in parallel; returns the first successful
-    /// response, or the last failure if all fail.
+    /// Sends `msg` using the group's configured query mode.
     pub async fn query(&self, msg: &Message) -> io::Result<Message> {
+        match self.mode {
+            QueryMode::Serial => self.query_serial(msg).await,
+            QueryMode::Parallel => self.query_parallel(msg).await,
+        }
+    }
+
+    async fn query_serial(&self, msg: &Message) -> io::Result<Message> {
+        let mut first_err: Option<io::Error> = None;
+        for client in &self.clients {
+            match client.query(msg).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        Err(first_err.unwrap_or_else(|| io::Error::other("no upstream servers configured")))
+    }
+
+    async fn query_parallel(&self, msg: &Message) -> io::Result<Message> {
         let mut futs: FuturesUnordered<_> = self
             .clients
             .iter()

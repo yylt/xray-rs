@@ -3,7 +3,6 @@ use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{DNSClass, Name, Record};
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use log::{error, info, warn};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -14,10 +13,11 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-use xray_rs::common::trie::DomainMarisa;
+use xray_rs::common::domain_trie::DomainSuffixTrie;
 
-use super::cache::{BlockCache, CacheEntry, CacheKey, CacheRecord, CacheResult, DnsCache};
+use super::cache::{CacheEntry, CacheKey, CacheRecord, CacheResult, DnsCache};
 use super::config::LogConfig;
+use super::factory::is_h3_cleanup_error;
 use super::hosts::HostsTrie;
 use super::rule::{BlockResponse, Rule, RuleAction};
 use super::upstream::UpstreamGroup;
@@ -148,7 +148,7 @@ impl QueryLogger {
 
 pub struct DnsServer {
     hosts_trie: Arc<HostsTrie>,
-    groups_trie: Arc<DomainMarisa>,
+    groups_trie: Arc<DomainSuffixTrie>,
     rules: Arc<Vec<Rule>>,
     cache: Arc<DnsCache>,
     upstreams: Arc<AHashMap<String, UpstreamGroup>>,
@@ -158,7 +158,7 @@ pub struct DnsServer {
 impl DnsServer {
     pub fn new(
         hosts_trie: HostsTrie,
-        groups_trie: DomainMarisa,
+        groups_trie: DomainSuffixTrie,
         rules: Vec<Rule>,
         cache: DnsCache,
         upstreams: AHashMap<String, UpstreamGroup>,
@@ -326,15 +326,10 @@ impl DnsServer {
         match rule {
             Some(rule) => match &rule.action {
                 RuleAction::Block { response } => {
-                    let (resp, block) = match response {
-                        BlockResponse::NXDomain => (self.build_nxdomain(msg), BlockCache::NXDomain),
-                        BlockResponse::Poison => {
-                            (self.build_poison(msg, &cache_key.name, cache_key.qtype), BlockCache::Poison)
-                        }
+                    let resp = match response {
+                        BlockResponse::NXDomain => self.build_nxdomain(msg),
+                        BlockResponse::Poison => self.build_poison(msg, &cache_key.name, cache_key.qtype),
                     };
-                    self.cache
-                        .put(cache_key.clone(), vec![CacheRecord::Block(block)], 300)
-                        .await;
                     let action = match response {
                         BlockResponse::NXDomain => "block-nxdomain",
                         BlockResponse::Poison => "block-poison",
@@ -358,8 +353,9 @@ impl DnsServer {
                     upstream,
                     cache: use_cache,
                     ttl: rewrite_ttl,
+                    deny_qtypes,
                 } => {
-                    self.handle_forward(msg, cache_key, upstream, *use_cache, *rewrite_ttl)
+                    self.handle_forward(msg, cache_key, upstream, *use_cache, *rewrite_ttl, deny_qtypes)
                         .await
                 }
             },
@@ -382,13 +378,17 @@ impl DnsServer {
         upstream: &str,
         use_cache: bool,
         rewrite_ttl: Option<u32>,
+        deny_qtypes: &[u16],
     ) -> (Message, String) {
         let action_label = format!("forward({})", upstream);
+        if deny_qtypes.contains(&cache_key.qtype) {
+            return (self.build_refused(msg), format!("forward-refused({})", upstream));
+        }
         if !use_cache {
             return match self.forward_to_upstream(msg, upstream, cache_key, rewrite_ttl).await {
                 Ok(resp) => (resp, action_label),
                 Err(e) => {
-                    warn!("forward {} to upstream {} failed: {}", cache_key.name, upstream, e);
+                    self.log_upstream_error("forward", cache_key.name.as_str(), upstream, &e);
                     (self.build_servfail(msg), action_label)
                 }
             };
@@ -418,7 +418,11 @@ impl DnsServer {
                 let ck = cache_key.clone();
                 tokio::spawn(async move {
                     if let Err(e) = forward_to_upstream_bg(&cache, &upstreams, &ck, &us, rewrite_ttl).await {
-                        warn!("background refresh for {} failed: {}", ck.name, e);
+                        if is_soft_upstream_error(&e) {
+                            info!("background refresh for {} closed: {}", ck.name, e);
+                        } else {
+                            warn!("background refresh for {} failed: {}", ck.name, e);
+                        }
                     }
                 });
                 (response, format!("forward-stale({})", upstream))
@@ -426,7 +430,7 @@ impl DnsServer {
             CacheResult::Miss => match self.forward_to_upstream(msg, upstream, cache_key, rewrite_ttl).await {
                 Ok(resp) => (resp, action_label),
                 Err(e) => {
-                    warn!("forward {} to upstream {} failed: {}", cache_key.name, upstream, e);
+                    self.log_upstream_error("forward", cache_key.name.as_str(), upstream, &e);
                     (self.build_servfail(msg), action_label)
                 }
             },
@@ -537,26 +541,23 @@ impl DnsServer {
         response
     }
 
+    fn build_refused(&self, msg: &Message) -> Message {
+        let mut response = msg.clone();
+        response.metadata.message_type = MessageType::Response;
+        response.metadata.response_code = ResponseCode::Refused;
+        response
+    }
+
+    fn log_upstream_error(&self, op: &str, name: &str, upstream: &str, err: &io::Error) {
+        if is_soft_upstream_error(err) {
+            info!("{} {} to upstream {} closed: {}", op, name, upstream, err);
+        } else {
+            warn!("{} {} to upstream {} failed: {}", op, name, upstream, err);
+        }
+    }
+
     /// 从缓存条目构造应答报文
     fn build_response_from_cache(&self, msg: &Message, entry: &CacheEntry) -> io::Result<Message> {
-        let records = &entry.records;
-        for record in records {
-            if let CacheRecord::Block(ref block) = record {
-                return match block {
-                    BlockCache::NXDomain => self.build_nxdomain(msg),
-                    BlockCache::Poison => {
-                        let query = msg
-                            .queries
-                            .first()
-                            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no question"))?;
-                        let name = query.name().to_ascii().to_lowercase().trim_end_matches('.').to_string();
-                        let qtype = u16::from(query.query_type());
-                        self.build_poison(msg, &name, qtype)
-                    }
-                };
-            }
-        }
-
         let mut response = make_response_base(msg)?;
         let query = msg
             .queries
@@ -564,21 +565,28 @@ impl DnsServer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no question"))?;
         let name = query.name().clone();
         let reply_ttl = entry.remaining_ttl(self.cache.keep_ttl);
+        let records = &entry.records;
         for record in records {
             let r = match record {
                 CacheRecord::A(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::A(A(*ip))),
                 CacheRecord::Aaaa(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::AAAA(AAAA(*ip))),
-                CacheRecord::Https(wire) => {
-                    let mut decoder = BinDecoder::new(wire);
-                    Record::read(&mut decoder).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                }
-                CacheRecord::Block(_) => continue,
             };
             response.answers.push(r);
         }
 
         Ok(response)
     }
+}
+
+fn is_soft_upstream_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    ) || is_h3_cleanup_error(&err.to_string())
 }
 
 /// 基本应答骨架
@@ -598,9 +606,7 @@ fn extract_cache_records(msg: &Message) -> Option<Vec<CacheRecord>> {
         match &answer.data {
             RData::A(ip) => records.push(CacheRecord::A(ip.0)),
             RData::AAAA(ip) => records.push(CacheRecord::Aaaa(ip.0)),
-            RData::HTTPS(_data) => {
-                records.push(CacheRecord::Https(Vec::new()));
-            }
+            RData::HTTPS(_) => {}
             _ => {}
         }
     }

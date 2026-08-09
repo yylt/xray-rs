@@ -21,18 +21,9 @@ impl CacheKey {
 }
 
 #[derive(Debug, Clone)]
-pub enum BlockCache {
-    NXDomain,
-    Poison,
-}
-
-#[derive(Debug, Clone)]
 pub enum CacheRecord {
     A(Ipv4Addr),
     Aaaa(Ipv6Addr),
-    Block(BlockCache),
-    /// HTTPS/SVCB 类型记录，存放应答记录的完整 wire 编码
-    Https(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -44,13 +35,6 @@ pub struct CacheEntry {
 
 impl CacheEntry {
     pub fn action_name(&self) -> &'static str {
-        for r in &self.records {
-            match r {
-                CacheRecord::Block(_b) => return "block-cache",
-                CacheRecord::Https(_) => return "forward-cache",
-                _ => {}
-            }
-        }
         if self.records.is_empty() {
             return "forward-cache-fail";
         }
@@ -164,12 +148,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_block() {
+    async fn test_cache_empty_entry() {
         let cache = DnsCache::new(10, 60, 3600, false, false);
         let key = CacheKey::new("block.test", 1);
-        cache
-            .put(key.clone(), vec![CacheRecord::Block(BlockCache::NXDomain)], 300)
-            .await;
+        cache.put(key.clone(), vec![], 300).await;
         let result = cache.get_cached(&key).await;
         assert!(matches!(result, CacheResult::Fresh(_)));
     }

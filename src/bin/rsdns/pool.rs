@@ -110,16 +110,16 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_size: 4,
+            max_size: 3,
             min_idle: 1,
-            idle_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(10),
             max_lifetime: Duration::from_secs(300),
             health_interval: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(8),
-            dns_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(3),
+            dns_timeout: Duration::from_secs(3),
             prefer_family: PreferFamily::Any,
             health_check_timeout: Duration::from_secs(3),
-            max_consecutive_fail: 3,
+            max_consecutive_fail: 2,
             cool_down: Duration::from_secs(30),
             is_udp: false,
         }
@@ -284,7 +284,9 @@ impl ConnectionPool {
     ///
     /// The pool starts empty — connections are created lazily on the first
     /// `checkout()`, then replenished by the reaper.
-    pub fn new(addresses: Vec<SocketAddr>, factory: ConnFactory, config: PoolConfig) -> Arc<Self> {
+    pub fn new(mut addresses: Vec<SocketAddr>, factory: ConnFactory, config: PoolConfig) -> Arc<Self> {
+        addresses.sort_unstable();
+        addresses.dedup();
         let addrs: Vec<AddrState> = addresses.into_iter().map(AddrState::new).collect();
         let pool = Arc::new(Self {
             connections: Arc::new(Mutex::new(VecDeque::new())),

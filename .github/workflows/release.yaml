@@ -69,18 +69,26 @@ jobs:
           cross build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
           cross build ${{ matrix.platform.build-args }} --bin ${{ env.RSDNS_BIN_NAME }} --target ${{ matrix.platform.target }}
 
+      - name: Package release artifacts
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.BIN_NAME }} dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}
+          cp target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.RSDNS_BIN_NAME }} dist/${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}
+          tar -C dist -czf dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.tar.gz ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
+          tar -C dist -czf dist/${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}.tar.gz ${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}
+
       - name: Store xray-rs artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
-          path: target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.BIN_NAME }}
+          path: dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.tar.gz
           retention-days: 1
 
       - name: Store rsdns artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}
-          path: target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.RSDNS_BIN_NAME }}
+          path: dist/${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}.tar.gz
           retention-days: 1
 
   release:
@@ -97,17 +105,11 @@ jobs:
         with:
           path: artifacts
 
-      - name: list artifacts
-        run: find artifacts/
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v5
+      - name: Create release
+        uses: softprops/action-gh-release@v2
         with:
-          distribution: goreleaser
-          version: '~> v1'
-          args: release --clean --skip=validate
+          files: |
+            artifacts/**/${{ env.BIN_NAME }}-*.tar.gz
+            artifacts/**/${{ env.RSDNS_BIN_NAME }}-*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

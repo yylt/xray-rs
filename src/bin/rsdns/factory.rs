@@ -268,7 +268,7 @@ pub fn doh3_factory(host: Arc<str>, path: Arc<str>, tls_config: Arc<rustls::Clie
                 .crypto_config(quic_config)
                 .build(addr, host, path)
                 .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
+                .map_err(|e| normalize_h3_error(e.to_string()))?;
             let boxed: BoxedDnsSender = Box::new(stream);
             Ok(boxed)
         };
@@ -294,4 +294,19 @@ pub fn doq_factory(host: Arc<str>, tls_config: Arc<rustls::ClientConfig>) -> Con
         };
         Box::pin(fut)
     })
+}
+
+fn normalize_h3_error(err: String) -> io::Error {
+    if is_h3_cleanup_error(&err) {
+        io::Error::new(io::ErrorKind::ConnectionAborted, "h3 connection closed")
+    } else {
+        io::Error::other(err)
+    }
+}
+
+pub(crate) fn is_h3_cleanup_error(err: &str) -> bool {
+    err.contains("H3_NO_ERROR")
+        || err.contains("ApplicationClose")
+        || err.contains("connection closed")
+        || err.contains("stream closed")
 }
