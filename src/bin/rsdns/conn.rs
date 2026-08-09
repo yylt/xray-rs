@@ -137,7 +137,13 @@ impl CloneableSender {
                     }
                 };
 
+                let failed = result.is_err();
                 let _ = reply.send(result);
+                if failed {
+                    sender.shutdown();
+                    shutdown_clone.store(true, Ordering::Release);
+                    break;
+                }
             }
             sender.shutdown();
             shutdown_clone.store(true, Ordering::Release);

@@ -20,39 +20,71 @@ groups:
     - foo.com
     - "*.foo.org"
 
-# Upstream pools: name → servers
-# Each pool's servers are queried concurrently, first response wins.
+# Upstream pools: name → servers or detailed group config.
+# Default mode is serial; mode: parallel opt-in preserves old fan-out behavior.
 # bootstrap=true servers are used only for resolving domain-based upstreams.
 # pool section enables connection pooling with adaptive address selection.
 upstream:
   bootstrap:
-    - address: 223.5.5.5
-      bootstrap: true
+    servers:
+      - address: 223.5.5.5
+        bootstrap: true
   default:
-    - address: tls://dot.pub           # TLS — domain resolved via bootstrap, all A+AAAA IPs used
-      pool:
-        max_size: 8
-        min_idle: 2
-        prefer_family: ipv4
-        connect_timeout: 3
-        health_check_timeout: 3
-        max_consecutive_fail: 3
-        cool_down_secs: 30
-    - address: https://dns.quad9.net/dns-query  # DoH — domain resolved via bootstrap
-      pool:
-        max_size: 4
-    - address: tls://1.1.1.1           # TLS with static IP
+    mode: serial
+    servers:
+      - address: tls://dot.pub           # TLS — domain resolved via bootstrap, all A+AAAA IPs used
+        pool:
+          # DoT is the main target for pool tuning: it benefits most from
+          # multiple long-lived connections and a small warm pool.
+          # Suggested starting point:
+          #   max_size: 8
+          #   min_idle: 2
+          #   health_interval: 60
+          #   connect_timeout: 5
+          #   dns_timeout: 5
+          #   health_check_timeout: 3
+          #   max_consecutive_fail: 3
+          #   cool_down_secs: 30
+          max_size: 8
+          min_idle: 2
+          prefer_family: ipv4
+          connect_timeout: 3
+          health_check_timeout: 3
+          max_consecutive_fail: 3
+          cool_down_secs: 30
+      - address: https://dns.quad9.net/dns-query  # DoH — domain resolved via bootstrap
+        pool:
+          # DoH already multiplexes well over HTTP/2, so keep the pool small.
+          # Suggested starting point:
+          #   max_size: 2~4
+          #   min_idle: 1
+          #   health_interval: 60
+          #   connect_timeout: 5
+          #   dns_timeout: 5
+          max_size: 4
+      - address: tls://1.1.1.1           # TLS with static IP
   overseas:
-    - address: tls://8.8.8.8
-    - address: https://cloudflare-dns.com/dns-query
-      pool:
-        max_size: 4
-    - address: h3://mozilla.cloudflare-dns.com/dns-query  # DNS-over-HTTP/3
-      pool:
-        max_size: 4
-    - address: quic://dns.adguard.com  # DNS-over-QUIC (new protocol support)
-      pool:
-        max_size: 4
+    mode: parallel
+    servers:
+      - address: tls://8.8.8.8
+      - address: https://cloudflare-dns.com/dns-query
+        pool:
+          # Same guidance as DoH above.
+          # Small pool, stable warm connection, no need to over-scale.
+          max_size: 4
+      - address: h3://mozilla.cloudflare-dns.com/dns-query  # DNS-over-HTTP/3
+        pool:
+          # DoH3 usually needs only a tiny pool because QUIC already carries
+          # concurrent streams. Keep it conservative unless you see saturation.
+          # Suggested starting point:
+          #   max_size: 1~4
+          #   min_idle: 1
+          max_size: 4
+      - address: quic://dns.adguard.com  # DNS-over-QUIC (new protocol support)
+        pool:
+          # DoQ has the same pooling shape as DoH3: keep it small unless the
+          # upstream or your traffic volume clearly needs more parallelism.
+          max_size: 4
 
 # Cache configuration
 cache:
@@ -121,3 +153,4 @@ rules:
       type: forward
       upstream: default
       keep_ttl: true
+      deny_qtypes: [65]

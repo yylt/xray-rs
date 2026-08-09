@@ -19,17 +19,17 @@ use std::time::Duration;
 
 use xray_rs::build_info;
 use xray_rs::common::{
+    domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder},
     rslog,
     tls::default_tls_client_config,
-    trie::{DomainMarisa, DomainMarisaBuilder},
 };
 
 use cache::DnsCache;
-use config::Config;
+use config::{Config, QueryModeConfig};
 use hosts::HostsTrieBuilder;
 use rule::{BlockResponse, Rule, RuleAction};
 use server::{DnsServer, QueryLogger};
-use upstream::{UpstreamClient, UpstreamGroup};
+use upstream::{QueryMode, UpstreamClient, UpstreamGroup};
 
 type TlsConfig = Arc<rustls::ClientConfig>;
 
@@ -49,8 +49,8 @@ struct Args {
     config: PathBuf,
 }
 
-fn build_groups_trie(groups: &std::collections::HashMap<String, Vec<String>>) -> DomainMarisa {
-    let mut builder = DomainMarisaBuilder::new();
+fn build_groups_trie(groups: &std::collections::HashMap<String, Vec<String>>) -> DomainSuffixTrie {
+    let mut builder = DomainSuffixTrieBuilder::new();
 
     for (tag, items) in groups {
         for item in items {
@@ -75,7 +75,7 @@ fn build_groups_trie(groups: &std::collections::HashMap<String, Vec<String>>) ->
         }
     }
 
-    builder.build()
+    builder.build().expect("FST build failed")
 }
 
 fn build_hosts_trie(entries: &[String]) -> hosts::HostsTrie {
@@ -136,10 +136,16 @@ fn build_rules(config_rules: &[config::RuleConfig]) -> Vec<Rule> {
                     target: target.clone(),
                     ttl: ttl.unwrap_or(600),
                 },
-                config::RuleActionConfig::Forward { upstream, cache, ttl } => RuleAction::Forward {
+                config::RuleActionConfig::Forward {
+                    upstream,
+                    cache,
+                    ttl,
+                    deny_qtypes,
+                } => RuleAction::Forward {
                     upstream: upstream.clone(),
                     cache: *cache,
                     ttl: *ttl,
+                    deny_qtypes: deny_qtypes.clone(),
                 },
             };
             Rule { group, qtype, action }
@@ -410,6 +416,8 @@ async fn bootstrap_resolve_all(
                 }
             }
         }
+        addrs.sort_unstable();
+        addrs.dedup();
         addrs
     }
 
@@ -517,10 +525,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut all_configs: Vec<UpstreamConfig> = Vec::new();
-    let mut upstream_map: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut upstream_map: Vec<(String, Vec<usize>, QueryModeConfig)> = Vec::new();
 
     info!("rsdns starting, upstream pools: {}", config.upstream.len());
-    for (name, servers) in &config.upstream {
+    for (name, group) in &config.upstream {
+        let servers = group.servers();
         info!("  upstream pool '{}': {} server(s)", name, servers.len());
         let mut indices = Vec::new();
         for server in servers {
@@ -536,7 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!("    failed to parse upstream: {}", server.address);
             }
         }
-        upstream_map.push((name.clone(), indices));
+        upstream_map.push((name.clone(), indices, group.mode()));
     }
 
     // Phase 1: bootstrap pools
@@ -580,7 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 4: assemble UpstreamGroup
     let upstreams: AHashMap<String, UpstreamGroup> = upstream_map
         .into_iter()
-        .map(|(name, indices)| {
+        .map(|(name, indices, mode)| {
             let clients: Vec<UpstreamClient> = indices
                 .iter()
                 .filter_map(|&i| match &all_configs[i] {
@@ -588,7 +597,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => None,
                 })
                 .collect();
-            (name, UpstreamGroup::new(clients))
+            let mode = match mode {
+                QueryModeConfig::Serial => QueryMode::Serial,
+                QueryModeConfig::Parallel => QueryMode::Parallel,
+            };
+            (name, UpstreamGroup::new(clients, mode))
         })
         .collect();
 
@@ -643,5 +656,39 @@ fn classify_upstream(addr: &str) -> &'static str {
         "DoQ"
     } else {
         "UDP"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_rules_maps_forward_deny_qtypes() {
+        let rules = build_rules(&[config::RuleConfig {
+            r#match: config::MatchTarget::Wildcard("*".into()),
+            qtype: None,
+            action: config::RuleActionConfig::Forward {
+                upstream: "default".into(),
+                cache: true,
+                ttl: Some(60),
+                deny_qtypes: vec![28, 65],
+            },
+        }]);
+
+        match &rules[0].action {
+            RuleAction::Forward {
+                upstream,
+                cache,
+                ttl,
+                deny_qtypes,
+            } => {
+                assert_eq!(upstream, "default");
+                assert!(*cache);
+                assert_eq!(*ttl, Some(60));
+                assert_eq!(deny_qtypes, &vec![28, 65]);
+            }
+            _ => panic!("expected forward rule"),
+        }
     }
 }

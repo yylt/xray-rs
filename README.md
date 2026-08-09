@@ -141,17 +141,35 @@ dns:
 
 ## rsdns
 
-仓库同时包含独立 DNS 程序：
+独立 DNS 服务器，支持丰富的入站协议和上游查询通道：
+
+### 入站
+
+- UDP (`ip:port`)
+- TCP (`tcp://ip:port`)
+
+### 上游
+
+- UDP / TCP（原生 DNS）
+- DoT (`tls://`)
+- DoH (`https://`)
+- DoH3 (`h3://`)
+- DoQ (`quic://`)
+
+### 功能
+
+- **查询管道**：hosts → cache → rules → upstream，未命中规则返回 NXDOMAIN
+- **规则**：支持 `block`（NXDomain/毒化 IP）、`cname`（重写 + 递归解析）、`forward`（转发到上游池，可配置绕过缓存/TTL 覆盖）
+- **缓存**：LRU，可配置容量、TTL 范围、过期回退（返回过期结果 + 后台刷新）
+- **连接池**：自适应加权地址选择、故障冷却、SOA 健康探测、地址族偏好
+
+运行：
 
 ```bash
 cargo run --bin rsdns -- -c rsdns.yaml
 ```
 
-当前从源码可见：
-
-- 默认配置文件：`rsdns.yaml`
-- 支持 `forward`、`block`、`rewrite`
-- 当前监听实现主要是 `udp://`
+完整示例配置：`example/rsdns-all-example.yaml`
 
 ## 开发
 

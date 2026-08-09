@@ -41,6 +41,18 @@ Do **not** hand-edit `src/generated/grpc_generated.rs`.
 - **`src/proxy/api.rs`**: management API inbound (requires router + stats + sinks deps).
 - **Generated gRPC**: re-exported as `xray_rs::grpc_transport`.
 
+## rsdns (DNS Binary)
+
+- Source: `src/bin/rsdns/`. Entry: `main.rs`. Modules: `config.rs`, `server.rs`, `rule.rs`, `upstream.rs`, `conn.rs`, `cache.rs`, `hosts.rs`, `factory.rs`, `pool.rs`.
+- **Listeners (inbound)**: UDP (`ip:port`) and TCP (`tcp://ip:port`), configured via `bind[]`.
+- **Upstream protocols (outbound)**: plain UDP/TCP, DoT (`tls://`), DoH (`https://`), DoH3 (`h3://`), DoQ (`quic://`).
+- **Query pipeline** (`server.rs:do_query`): hosts → cache → rules → upstream; fallback returns NXDOMAIN.
+- **Rules**: ordered by priority. Actions: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional cache bypass/TTL override).
+- **Cache**: LRU with configurable capacity, TTL clamping, serve-expired with background refresh.
+- **Connection pool**: adaptive weighted address selection, cooldown on failure, SOA health probes, per-address-family preference.
+- Example config: `example/rsdns-all-example.yaml` (covers all features).
+- E2E tests: `tests/e2e/test_rsdns.go`, `tests/e2e/run_rsdns_tests.sh`.
+
 ## Platform Notes
 
 - Unix domain sockets: only behind `#[cfg(unix)]` in `src/transport/raw.rs`.

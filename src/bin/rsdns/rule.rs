@@ -1,4 +1,4 @@
-use xray_rs::common::trie::DomainMarisa;
+use xray_rs::common::domain_trie::DomainSuffixTrie;
 
 #[derive(Debug, Clone)]
 pub enum RuleAction {
@@ -13,6 +13,7 @@ pub enum RuleAction {
         upstream: String,
         cache: bool,
         ttl: Option<u32>,
+        deny_qtypes: Vec<u16>,
     },
 }
 
@@ -30,7 +31,7 @@ pub struct Rule {
 }
 
 impl Rule {
-    pub fn matches(&self, domain: &str, qtype: u16, groups_trie: &DomainMarisa) -> bool {
+    pub fn matches(&self, domain: &str, qtype: u16, groups_trie: &DomainSuffixTrie) -> bool {
         if let Some(expected_qtype) = self.qtype {
             if expected_qtype != 0 && expected_qtype != qtype {
                 return false;

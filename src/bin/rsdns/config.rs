@@ -20,10 +20,10 @@ pub struct Config {
     /// values are suffix patterns (supports `"file:"` prefix, `"*."` wildcards).
     #[serde(default)]
     pub groups: HashMap<String, Vec<String>>,
-    /// Upstream pools keyed by name.  Each pool is a list of upstream servers
-    /// queried concurrently (first response wins).
+    /// Upstream pools keyed by name. Each pool can be a plain server list or
+    /// an object with an explicit query mode.
     #[serde(default)]
-    pub upstream: HashMap<String, Vec<ServerConfig>>,
+    pub upstream: HashMap<String, UpstreamGroupConfig>,
     /// Optional cache tuning (LRU capacity, TTL bounds, stale serving).
     pub cache: Option<CacheConfig>,
     /// Static host overrides (suffix-matched).  Format: `"IP domain"`,
@@ -58,6 +58,45 @@ pub struct ServerConfig {
     /// Optional connection-pool configuration (see [`RawPoolConfig`]).
     #[serde(default)]
     pub pool: Option<RawPoolConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum UpstreamGroupConfig {
+    Servers(Vec<ServerConfig>),
+    Detailed(UpstreamGroupDetail),
+}
+
+impl UpstreamGroupConfig {
+    pub fn mode(&self) -> QueryModeConfig {
+        match self {
+            Self::Servers(_) => QueryModeConfig::Serial,
+            Self::Detailed(detail) => detail.mode,
+        }
+    }
+
+    pub fn servers(&self) -> &[ServerConfig] {
+        match self {
+            Self::Servers(servers) => servers,
+            Self::Detailed(detail) => &detail.servers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpstreamGroupDetail {
+    #[serde(default)]
+    pub mode: QueryModeConfig,
+    #[serde(default)]
+    pub servers: Vec<ServerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryModeConfig {
+    Parallel,
+    #[default]
+    Serial,
 }
 
 /// Cache behaviour tuning.  All fields are optional; missing fields use
@@ -140,6 +179,9 @@ pub enum RuleActionConfig {
         cache: bool,
         /// If set, rewrite the response TTL to this value.
         ttl: Option<u32>,
+        /// Refuse these query types before forwarding upstream.
+        #[serde(default)]
+        deny_qtypes: Vec<u16>,
     },
 }
 
@@ -294,14 +336,17 @@ groups:
     - "*.corp.internal"
 upstream:
   default:
-    - address: 223.5.5.5
-      bootstrap: true
-    - address: tls://dot.pub
-      pool:
-        max_size: 8
-        prefer_family: ipv4
+    servers:
+      - address: 223.5.5.5
+        bootstrap: true
+      - address: tls://dot.pub
+        pool:
+          max_size: 8
+          prefer_family: ipv4
   overseas:
-    - address: tls://8.8.8.8
+    mode: parallel
+    servers:
+      - address: tls://8.8.8.8
 cache:
   size: 4096
   min_ttl: 60
@@ -323,6 +368,7 @@ rules:
     action:
       type: forward
       upstream: default
+      deny_qtypes: [65]
 "#;
         let config = Config::from_yaml_str(yaml).expect("parse failed");
         assert_eq!(config.bind.len(), 2);
@@ -330,10 +376,25 @@ rules:
         assert_eq!(config.bind[1].address, "tcp://0.0.0.0:53");
         assert_eq!(config.groups.len(), 2);
         assert_eq!(config.upstream.len(), 2);
+        assert_eq!(config.upstream["default"].mode(), QueryModeConfig::Serial);
+        assert_eq!(config.upstream["overseas"].mode(), QueryModeConfig::Parallel);
+        assert_eq!(config.upstream["default"].servers().len(), 2);
         assert!(config.cache.is_some());
         assert_eq!(config.cache.as_ref().unwrap().size, Some(4096));
         assert_eq!(config.hosts.len(), 1);
         assert_eq!(config.rules.len(), 3);
+    }
+
+    #[test]
+    fn test_legacy_upstream_list_defaults_to_serial() {
+        let yaml = r#"
+upstream:
+  default:
+    - address: 223.5.5.5
+"#;
+        let config = Config::from_yaml_str(yaml).expect("parse failed");
+        assert_eq!(config.upstream["default"].mode(), QueryModeConfig::Serial);
+        assert_eq!(config.upstream["default"].servers().len(), 1);
     }
 
     #[test]

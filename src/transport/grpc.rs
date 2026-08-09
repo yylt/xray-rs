@@ -25,11 +25,11 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
 
-const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = true;
 const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 300;
-const DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD: usize = 1024 * 1024;
+const DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD: usize = 64 * 1024;
 const DEFAULT_GRPC_MULTI_BATCH_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,17 +119,27 @@ impl Grpc {
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "grpc_settings is required"))?;
 
         let tls_client = if sset.security == super::Security::Tls {
-            sset.tls_settings
-                .as_ref()
-                .and_then(|ts| crate::transport::tls::client::new(ts).ok())
+            Some(
+                crate::transport::tls::client::new(
+                    sset.tls_settings
+                        .as_ref()
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "grpc tls security requires tlsSettings"))?,
+                )
+                .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("failed to build grpc tls client: {}", e)))?,
+            )
         } else {
             None
         };
 
         let tls_server = if sset.security == super::Security::Tls {
-            sset.tls_settings
-                .as_ref()
-                .and_then(|ts| crate::transport::tls::server::new(ts).ok())
+            Some(
+                crate::transport::tls::server::new(
+                    sset.tls_settings
+                        .as_ref()
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "grpc tls security requires tlsSettings"))?,
+                )
+                .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("failed to build grpc tls server: {}", e)))?,
+            )
         } else {
             None
         };
@@ -849,14 +859,10 @@ fn make_service(buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc:
     let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
     let write_buf_capacity = buf_byte_size.clamp(8192, DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD);
-    let flush_threshold = buf_byte_size
-        .max(write_buf_capacity)
-        .min(DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD);
 
     let stream_service = GrpcStream {
         read_buf: Bytes::new(),
         write_buf: BytesMut::with_capacity(write_buf_capacity),
-        write_flush_threshold: flush_threshold,
         incoming_rx: Some(incoming_rx),
         outgoing_tx: Some(PollSender::new(outgoing_tx)),
         task: None,
@@ -964,7 +970,6 @@ impl From<&GrpcSettings> for RouteConfig {
 pub struct GrpcStream {
     read_buf: Bytes,
     write_buf: BytesMut,
-    write_flush_threshold: usize,
     incoming_rx: Option<mpsc::Receiver<Bytes>>,
     outgoing_tx: Option<PollSender<Bytes>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -1015,7 +1020,7 @@ impl AsyncRead for GrpcStream {
 
 impl AsyncWrite for GrpcStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
-        if self.write_buf.len() >= self.write_flush_threshold && self.as_mut().poll_flush(cx)?.is_pending() {
+        if self.write_buf.len() >= DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD && self.as_mut().poll_flush(cx)?.is_pending() {
             return Poll::Pending;
         }
         if buf.is_empty() {
