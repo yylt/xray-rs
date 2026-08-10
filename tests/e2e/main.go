@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +22,9 @@ var (
 	verbose     bool
 	suite       string
 )
+
+// errSkip is a sentinel error that signals a test was skipped.
+var errSkip = errors.New("SKIP")
 
 func init() {
 	flag.BoolVar(&verbose, "v", false, "verbose output")
@@ -74,7 +78,9 @@ func main() {
 	}
 
 	if suite == "all" || suite == "rsdns" {
-		runTest(results, "rsdns", testRsdnsAll)
+		for _, t := range RsdnsTests {
+			runTest(results, "rsdns/"+t.Name, t.Fn)
+		}
 	}
 
 	results.PrintSummary()
@@ -108,12 +114,16 @@ func runTest(results *TestResults, name string, testFunc func() error) {
 	log.Printf("[run] START %s", name)
 
 	start := time.Now()
-	if err := testFunc(); err != nil {
-		elapsed := time.Since(start)
+	err := testFunc()
+	elapsed := time.Since(start)
+
+	if errors.Is(err, errSkip) {
+		log.Printf("[run] SKIP %s (%.2fs)", name, elapsed.Seconds())
+		results.Skipped++
+	} else if err != nil {
 		log.Printf("[run] FAIL %s (%.2fs): %v", name, elapsed.Seconds(), err)
 		results.Failed++
 	} else {
-		elapsed := time.Since(start)
 		log.Printf("[run] PASS %s (%.2fs)", name, elapsed.Seconds())
 		results.Passed++
 	}

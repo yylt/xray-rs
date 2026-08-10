@@ -1,3 +1,4 @@
+use hickory_proto::rr::RecordType;
 use xray_rs::common::domain_trie::DomainSuffixTrie;
 
 #[derive(Debug, Clone)]
@@ -8,12 +9,14 @@ pub enum RuleAction {
     Cname {
         target: String,
         ttl: u32,
+        upstream: String,
+        deny_qtypes: Vec<RecordType>,
     },
     Forward {
         upstream: String,
         cache: bool,
         ttl: Option<u32>,
-        deny_qtypes: Vec<u16>,
+        deny_qtypes: Vec<RecordType>,
     },
 }
 
@@ -26,27 +29,19 @@ pub enum BlockResponse {
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub group: String,
-    pub qtype: Option<u16>,
+    pub qtype: Option<RecordType>,
     pub action: RuleAction,
 }
 
 impl Rule {
-    pub fn matches(&self, domain: &str, qtype: u16, groups_trie: &DomainSuffixTrie) -> bool {
+    pub fn matches(&self, domain: &str, qtype: RecordType, groups_trie: &DomainSuffixTrie) -> bool {
         if let Some(expected_qtype) = self.qtype {
-            if expected_qtype != 0 && expected_qtype != qtype {
+            // ANY matches all query types, same as None
+            if expected_qtype != RecordType::ANY && expected_qtype != qtype {
                 return false;
             }
         }
-
         let domain = domain.trim_end_matches('.');
-
-        if self.group == "*" {
-            return true;
-        }
-
-        groups_trie
-            .lookup(domain)
-            .map(|tag| tag == self.group.as_str())
-            .unwrap_or(false)
+        self.group == "*" || groups_trie.lookup(domain).is_some_and(|tag| tag == self.group.as_str())
     }
 }

@@ -95,6 +95,8 @@ jobs:
     name: Release
     needs: [build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout Git repo
         uses: actions/checkout@v4
@@ -108,8 +110,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.RELEASE_TOKEN }}
           files: |
             artifacts/**/${{ env.BIN_NAME }}-*.tar.gz
             artifacts/**/${{ env.RSDNS_BIN_NAME }}-*.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

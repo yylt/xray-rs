@@ -1,8 +1,8 @@
 use ahash::AHashMap;
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, TXT};
 use hickory_proto::rr::RData;
-use hickory_proto::rr::{DNSClass, Name, Record};
+use hickory_proto::rr::{Name, Record, RecordType};
 use log::{error, info, warn};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -10,6 +10,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use socket2::{Domain, Protocol, Socket, Type};
+use std::os::fd::IntoRawFd;
+use std::os::unix::io::FromRawFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -25,7 +28,7 @@ use super::upstream::UpstreamGroup;
 const MAX_DNS_SIZE: usize = 4096;
 
 pub struct QueryLog {
-    pub qtype: u16,
+    pub qtype: RecordType,
     pub name: String,
     pub proto: &'static str,
     pub remote: IpAddr,
@@ -34,6 +37,7 @@ pub struct QueryLog {
     pub duration: Duration,
     pub rcode: ResponseCode,
     pub action: String,
+    pub answers: String,
 }
 
 impl QueryLog {
@@ -68,6 +72,7 @@ impl QueryLog {
                 IpAddr::V4(v4) => write!(w, "{}", v4),
                 IpAddr::V6(v6) => write!(w, "[{}]", v6),
             },
+            "answers" => w.write_str(&self.answers),
             _ => write!(w, "{{{}}}", key),
         };
     }
@@ -81,6 +86,32 @@ fn format_rcode(rcode: ResponseCode) -> &'static str {
         ResponseCode::Refused => "REFUSED",
         ResponseCode::FormErr => "FORMERR",
         _ => "UNKNOWN",
+    }
+}
+
+fn format_answer_types(msg: &Message) -> String {
+    let mut s = String::new();
+    for r in &msg.answers {
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(match &r.data {
+            RData::A(_) => "A",
+            RData::AAAA(_) => "AAAA",
+            RData::CNAME(_) => "CNAME",
+            RData::HTTPS(_) => "HTTPS",
+            RData::SOA(_) => "SOA",
+            RData::NS(_) => "NS",
+            RData::PTR(_) => "PTR",
+            RData::MX(_) => "MX",
+            RData::TXT(_) => "TXT",
+            _ => "?",
+        });
+    }
+    if s.is_empty() {
+        "-".to_string()
+    } else {
+        s
     }
 }
 
@@ -175,7 +206,8 @@ impl DnsServer {
     }
 
     pub async fn serve_udp(&self, addr: SocketAddr) -> io::Result<()> {
-        let socket = Arc::new(UdpSocket::bind(addr).await?);
+        let socket = self.bind_udp_dual_stack(addr).await?;
+        let socket = Arc::new(socket);
         info!("rsdns listening on UDP {}", addr);
 
         let mut buf = vec![0u8; MAX_DNS_SIZE];
@@ -201,7 +233,7 @@ impl DnsServer {
     }
 
     pub async fn serve_tcp(&self, addr: SocketAddr) -> io::Result<()> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = self.bind_tcp_dual_stack(addr).await?;
         info!("rsdns listening on TCP {}", addr);
 
         loop {
@@ -265,9 +297,9 @@ impl DnsServer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no question"))?;
 
         let name = query.name().to_ascii().to_lowercase().trim_end_matches('.').to_string();
-        let qtype = u16::from(query.query_type());
+        let qtype = query.query_type();
 
-        let cache_key = CacheKey::new(&name, qtype);
+        let cache_key = CacheKey::new(name.clone(), qtype);
         let msg_id = msg.id;
         let (mut response, action) = self.do_query(&msg, &cache_key).await;
         response.metadata.id = msg_id;
@@ -283,6 +315,7 @@ impl DnsServer {
             duration: elapsed,
             rcode: response.metadata.response_code,
             action,
+            answers: format_answer_types(&response),
         };
         self.logger.write(&qlog);
 
@@ -342,13 +375,23 @@ impl DnsServer {
                         }
                     }
                 }
-                RuleAction::Cname { target, ttl } => match self.handle_cname(msg, cache_key, target, *ttl).await {
-                    Ok(resp) => (resp, "cname".into()),
-                    Err(e) => {
-                        warn!("cname for {} -> {} failed: {}", cache_key.name, target, e);
-                        (self.build_servfail(msg), "cname".into())
+                RuleAction::Cname {
+                    target,
+                    ttl,
+                    upstream,
+                    deny_qtypes,
+                } => {
+                    match self
+                        .handle_cname(msg, cache_key, target, *ttl, upstream, deny_qtypes)
+                        .await
+                    {
+                        Ok(resp) => (resp, "cname".into()),
+                        Err(e) => {
+                            warn!("cname for {} -> {} failed: {}", cache_key.name, target, e);
+                            (self.build_servfail(msg), "cname".into())
+                        }
                     }
-                },
+                }
                 RuleAction::Forward {
                     upstream,
                     cache: use_cache,
@@ -378,11 +421,17 @@ impl DnsServer {
         upstream: &str,
         use_cache: bool,
         rewrite_ttl: Option<u32>,
-        deny_qtypes: &[u16],
+        deny_qtypes: &[RecordType],
     ) -> (Message, String) {
         let action_label = format!("forward({})", upstream);
         if deny_qtypes.contains(&cache_key.qtype) {
-            return (self.build_refused(msg), format!("forward-refused({})", upstream));
+            return match self.build_nodata(msg) {
+                Ok(resp) => (resp, format!("forward-nodata({})", upstream)),
+                Err(e) => {
+                    warn!("build_nodata for {} failed: {}", cache_key.name, e);
+                    (self.build_servfail(msg), action_label)
+                }
+            };
         }
         if !use_cache {
             return match self.forward_to_upstream(msg, upstream, cache_key, rewrite_ttl).await {
@@ -437,7 +486,7 @@ impl DnsServer {
         }
     }
 
-    /// 查询上游 DNS 并缓存结果
+    /// 查询上游 DNS 并缓存结果。
     async fn forward_to_upstream(
         &self,
         msg: &Message,
@@ -450,49 +499,87 @@ impl DnsServer {
             .get(upstream)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("upstream {} not found", upstream)))?;
 
-        let response = group.query(msg).await?;
+        let response = group.query(msg).await;
 
-        cache_upstream_response(&self.cache, cache_key, &response, rewrite_ttl).await;
-
-        let mut response = response;
-        if let Some(rttl) = rewrite_ttl {
-            rewrite_ttl_in_response(&mut response, rttl);
+        match response {
+            Ok(response) => {
+                cache_upstream_response(&self.cache, cache_key, &response, rewrite_ttl).await;
+                let mut response = response;
+                if let Some(rttl) = rewrite_ttl {
+                    rewrite_ttl_in_response(&mut response, rttl);
+                }
+                sort_answers_cname_last(&mut response.answers);
+                Ok(response)
+            }
+            Err(e) => Err(e),
         }
-
-        Ok(response)
     }
 
-    /// 处理 CNAME 规则：解析目标域名的实际 IP，并为原域名附加 CNAME 记录
-    async fn handle_cname(&self, msg: &Message, cache_key: &CacheKey, target: &str, ttl: u32) -> io::Result<Message> {
-        let cname_msg = build_cname_query(msg, target, cache_key.qtype);
-        let default_upstream = self.upstreams.keys().next().map(|s| s.as_str()).unwrap_or("default");
-        let ck = CacheKey::new(target, cache_key.qtype);
-
-        let mut response = self
-            .forward_to_upstream(&cname_msg, default_upstream, &ck, Some(ttl))
-            .await?;
-
-        let cname_name = Name::from_utf8(target).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
+    /// 处理 CNAME 规则：返回 CNAME 记录，并通过指定 upstream 代查 target 的真实记录。
+    /// 若上游查询失败，则仅返回 CNAME 记录作为降级。
+    async fn handle_cname(
+        &self,
+        msg: &Message,
+        cache_key: &CacheKey,
+        target: &str,
+        ttl: u32,
+        upstream: &str,
+        deny_qtypes: &[RecordType],
+    ) -> io::Result<Message> {
+        if deny_qtypes.contains(&cache_key.qtype) {
+            return self.build_nodata(msg);
+        }
         let query_name = msg.queries.first().map(|q| q.name().clone()).unwrap_or_default();
+        let cname_name = Name::from_utf8(target).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let cname_record = Record::from_rdata(query_name.clone(), ttl, RData::CNAME(CNAME(cname_name)));
 
-        let cname_record = Record::from_rdata(query_name, ttl, RData::CNAME(CNAME(cname_name)));
-        response.answers.push(cname_record);
-        response.metadata.id = msg.id;
+        let target_msg = make_query_msg(target, cache_key.qtype)?;
+        let target_cache_key = CacheKey::new(target.to_string(), cache_key.qtype);
+
+        let response = match self
+            .forward_to_upstream(&target_msg, upstream, &target_cache_key, Some(ttl))
+            .await
+        {
+            Ok(mut upstream_resp) => {
+                upstream_resp.metadata.id = msg.id;
+                upstream_resp.queries = msg.queries.clone();
+                for answer in &mut upstream_resp.answers {
+                    answer.name = query_name.clone();
+                }
+                upstream_resp
+            }
+            Err(e) => {
+                warn!(
+                    "cname resolve target {} for {} failed: {}, fallback to CNAME only",
+                    target, cache_key.name, e
+                );
+                // 降级：仅返回 CNAME 记录
+                let mut resp = make_response_base(msg)?;
+                resp.answers.push(cname_record);
+                resp.metadata.id = msg.id;
+                resp
+            }
+        };
 
         Ok(response)
     }
 
-    fn build_hosts_response(&self, msg: &Message, name: &str, qtype: u16, ips: &[IpAddr]) -> io::Result<Message> {
+    fn build_hosts_response(
+        &self,
+        msg: &Message,
+        name: &str,
+        qtype: RecordType,
+        ips: &[IpAddr],
+    ) -> io::Result<Message> {
         let mut response = make_response_base(msg)?;
         let rr_name = Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         for ip in ips {
             let record = match (ip, qtype) {
-                (IpAddr::V4(v4), 1) | (IpAddr::V4(v4), 255) => {
+                (IpAddr::V4(v4), RecordType::A) | (IpAddr::V4(v4), RecordType::ANY) => {
                     Record::from_rdata(rr_name.clone(), 300, RData::A(A(*v4)))
                 }
-                (IpAddr::V6(v6), 28) | (IpAddr::V6(v6), 255) => {
+                (IpAddr::V6(v6), RecordType::AAAA) | (IpAddr::V6(v6), RecordType::ANY) => {
                     Record::from_rdata(rr_name.clone(), 300, RData::AAAA(AAAA(*v6)))
                 }
                 _ => continue,
@@ -509,12 +596,12 @@ impl DnsServer {
         Ok(response)
     }
 
-    fn build_poison(&self, msg: &Message, name: &str, qtype: u16) -> io::Result<Message> {
+    fn build_poison(&self, msg: &Message, name: &str, qtype: RecordType) -> io::Result<Message> {
         let mut response = make_response_base(msg)?;
         let rr_name = Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         match qtype {
-            1 | 255 => {
+            RecordType::A | RecordType::ANY => {
                 let record = Record::from_rdata(rr_name.clone(), 300, RData::A(A(Ipv4Addr::new(0, 0, 0, 0))));
                 response.answers.push(record);
                 response.metadata.response_code = ResponseCode::NoError;
@@ -524,7 +611,7 @@ impl DnsServer {
             }
         }
         match qtype {
-            28 | 255 => {
+            RecordType::AAAA | RecordType::ANY => {
                 let record = Record::from_rdata(rr_name, 300, RData::AAAA(AAAA(Ipv6Addr::UNSPECIFIED)));
                 response.answers.push(record);
             }
@@ -535,17 +622,52 @@ impl DnsServer {
     }
 
     fn build_servfail(&self, msg: &Message) -> Message {
-        let mut response = msg.clone();
+        let mut response = Message::new(0, MessageType::Response, OpCode::Query);
+        response.metadata = msg.metadata;
         response.metadata.message_type = MessageType::Response;
         response.metadata.response_code = ResponseCode::ServFail;
+        response.queries = msg.queries.clone();
         response
     }
 
-    fn build_refused(&self, msg: &Message) -> Message {
-        let mut response = msg.clone();
-        response.metadata.message_type = MessageType::Response;
-        response.metadata.response_code = ResponseCode::Refused;
-        response
+    fn build_nodata(&self, msg: &Message) -> io::Result<Message> {
+        make_response_base(msg)
+    }
+
+    /// 绑定 UDP socket，若地址为 IPv6 则同时设置双栈（IPV6_V6ONLY=0），
+    /// 使一个 socket 可同时处理 IPv4 和 IPv6 流量。
+    async fn bind_udp_dual_stack(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+        let socket = if addr.is_ipv6() {
+            let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            sock.set_only_v6(false)?;
+            sock.set_reuse_address(true)?;
+            sock.bind(&socket2::SockAddr::from(addr))?;
+            sock.set_nonblocking(true)?;
+            // SAFETY: sock is a valid fd we just created and configured
+            let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(sock.into_raw_fd()) };
+            UdpSocket::from_std(std_socket)?
+        } else {
+            UdpSocket::bind(addr).await?
+        };
+        Ok(socket)
+    }
+
+    /// 绑定 TCP listener，若地址为 IPv6 则设置双栈（IPV6_V6ONLY=0）。
+    async fn bind_tcp_dual_stack(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+        let listener = if addr.is_ipv6() {
+            let sock = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+            sock.set_only_v6(false)?;
+            sock.set_reuse_address(true)?;
+            sock.bind(&socket2::SockAddr::from(addr))?;
+            sock.listen(1024)?;
+            sock.set_nonblocking(true)?;
+            // SAFETY: sock is a valid fd we just created and configured
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(sock.into_raw_fd()) };
+            TcpListener::from_std(std_listener)?
+        } else {
+            TcpListener::bind(addr).await?
+        };
+        Ok(listener)
     }
 
     fn log_upstream_error(&self, op: &str, name: &str, upstream: &str, err: &io::Error) {
@@ -570,9 +692,32 @@ impl DnsServer {
             let r = match record {
                 CacheRecord::A(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::A(A(*ip))),
                 CacheRecord::Aaaa(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::AAAA(AAAA(*ip))),
+                CacheRecord::Cname(target) => {
+                    let cname_name =
+                        Name::from_utf8(target).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    Record::from_rdata(name.clone(), reply_ttl, RData::CNAME(CNAME(cname_name)))
+                }
+                CacheRecord::Mx { preference, exchange } => {
+                    let exchange_name =
+                        Name::from_utf8(exchange).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    Record::from_rdata(name.clone(), reply_ttl, RData::MX(MX::new(*preference, exchange_name)))
+                }
+                CacheRecord::Txt(txt_data) => {
+                    Record::from_rdata(name.clone(), reply_ttl, RData::TXT(TXT::new(txt_data.clone())))
+                }
+                CacheRecord::Https(svcb) => {
+                    Record::from_rdata(name.clone(), reply_ttl, RData::HTTPS(HTTPS(svcb.clone())))
+                }
+                CacheRecord::NxDomain => continue,
             };
             response.answers.push(r);
         }
+
+        if let Some(CacheRecord::NxDomain) = records.first() {
+            response.metadata.response_code = ResponseCode::NXDomain;
+        }
+
+        sort_answers_cname_last(&mut response.answers);
 
         Ok(response)
     }
@@ -589,6 +734,18 @@ fn is_soft_upstream_error(err: &io::Error) -> bool {
     ) || is_h3_cleanup_error(&err.to_string())
 }
 
+/// 构造一个用于上游查询的 DNS Message
+fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Message> {
+    let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+    let mut q = Query::new();
+    q.set_name(Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
+    q.set_query_type(qtype);
+    q.set_query_class(hickory_proto::rr::DNSClass::IN);
+    msg.queries.push(q);
+    msg.metadata.recursion_desired = true;
+    Ok(msg)
+}
+
 /// 基本应答骨架
 fn make_response_base(msg: &Message) -> io::Result<Message> {
     let mut response = Message::new(msg.id, MessageType::Response, OpCode::Query);
@@ -599,14 +756,33 @@ fn make_response_base(msg: &Message) -> io::Result<Message> {
     Ok(response)
 }
 
-/// 从上游应答中提取可缓存的记录（A / AAAA / HTTPS），无匹配类型时返回 None
+/// 将 CNAME 记录排序到最后面，A/AAAA 等其他类型排在前面。
+/// 这样客户端优先获得直接地址记录。
+fn sort_answers_cname_last(answers: &mut [Record]) {
+    answers.sort_by_key(|r| matches!(r.data, RData::CNAME(_)));
+}
+
+/// 从上游应答中提取可缓存的记录（A / AAAA / CNAME / MX / TXT）
 fn extract_cache_records(msg: &Message) -> Option<Vec<CacheRecord>> {
     let mut records = Vec::new();
     for answer in &msg.answers {
         match &answer.data {
             RData::A(ip) => records.push(CacheRecord::A(ip.0)),
             RData::AAAA(ip) => records.push(CacheRecord::Aaaa(ip.0)),
-            RData::HTTPS(_) => {}
+            RData::CNAME(cname) => records.push(CacheRecord::Cname(cname.0.to_ascii())),
+            RData::MX(mx) => records.push(CacheRecord::Mx {
+                preference: mx.preference,
+                exchange: mx.exchange.to_ascii(),
+            }),
+            RData::TXT(txt) => {
+                let strings: Vec<String> = txt
+                    .txt_data
+                    .iter()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .collect();
+                records.push(CacheRecord::Txt(strings))
+            }
+            RData::HTTPS(https) => records.push(CacheRecord::Https(https.0.clone())),
             _ => {}
         }
     }
@@ -629,12 +805,25 @@ fn rewrite_ttl_in_response(msg: &mut Message, ttl: u32) {
     }
 }
 
-/// 将上游应答记录写入缓存
+/// 将上游应答记录写入缓存（包括正常记录和 NXDOMAIN 负缓存）
 async fn cache_upstream_response(cache: &DnsCache, cache_key: &CacheKey, response: &Message, rewrite_ttl: Option<u32>) {
     if let Some(records) = extract_cache_records(response) {
         let ttl = extract_min_ttl(response);
         let final_ttl = rewrite_ttl.unwrap_or(ttl);
         cache.put(cache_key.clone(), records, final_ttl).await;
+        return;
+    }
+
+    let rcode = response.metadata.response_code;
+    let negative_record = match rcode {
+        ResponseCode::NXDomain => Some(CacheRecord::NxDomain),
+        _ => None,
+    };
+
+    if let Some(record) = negative_record {
+        let ttl = extract_min_ttl(response);
+        let final_ttl = rewrite_ttl.unwrap_or(ttl);
+        cache.put(cache_key.clone(), vec![record], final_ttl).await;
     }
 }
 
@@ -653,21 +842,4 @@ async fn forward_to_upstream_bg(
     let response = group.query_bg(cache_key).await?;
     cache_upstream_response(cache, cache_key, &response, rewrite_ttl).await;
     Ok(())
-}
-
-/// 构造 CNAME 目标的子查询报文（默认 type=A，除非原查询是 AAAA）
-fn build_cname_query(query: &Message, target: &str, qtype: u16) -> Message {
-    let mut msg = query.clone();
-    if let Ok(name) = Name::from_utf8(target) {
-        let mut q = hickory_proto::op::Query::new();
-        q.set_name(name);
-        q.set_query_type(match qtype {
-            28 => hickory_proto::rr::RecordType::AAAA,
-            _ => hickory_proto::rr::RecordType::A,
-        });
-        q.set_query_class(DNSClass::IN);
-        msg.queries.clear();
-        msg.queries.push(q);
-    }
-    msg
 }

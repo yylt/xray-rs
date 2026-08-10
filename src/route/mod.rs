@@ -1,6 +1,3 @@
-pub mod cache;
-pub mod dns;
-pub mod matcher;
 pub mod resolver;
 pub mod router;
 
@@ -11,8 +8,6 @@ pub use router::{Router, SharedRouter};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::{io, net::IpAddr, sync::Arc};
-
-// 使用 common::domain_trie 和 common::ip_trie 代替旧的 trie 模块
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingSettings {
