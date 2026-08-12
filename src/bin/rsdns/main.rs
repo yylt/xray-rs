@@ -26,6 +26,7 @@ use xray_rs::common::{
 
 use cache::DnsCache;
 use config::{Config, QueryModeConfig};
+use hickory_proto::rr::RecordType;
 use hosts::HostsTrieBuilder;
 use rule::{BlockResponse, Rule, RuleAction};
 use server::{DnsServer, QueryLogger};
@@ -132,9 +133,16 @@ fn build_rules(config_rules: &[config::RuleConfig]) -> Vec<Rule> {
                         config::BlockResponse::Poison => BlockResponse::Poison,
                     },
                 },
-                config::RuleActionConfig::Cname { target, ttl } => RuleAction::Cname {
+                config::RuleActionConfig::Cname {
+                    target,
+                    ttl,
+                    upstream,
+                    deny_qtypes,
+                } => RuleAction::Cname {
                     target: target.clone(),
                     ttl: ttl.unwrap_or(600),
+                    upstream: upstream.clone(),
+                    deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
                 },
                 config::RuleActionConfig::Forward {
                     upstream,
@@ -145,7 +153,7 @@ fn build_rules(config_rules: &[config::RuleConfig]) -> Vec<Rule> {
                     upstream: upstream.clone(),
                     cache: *cache,
                     ttl: *ttl,
-                    deny_qtypes: deny_qtypes.clone(),
+                    deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
                 },
             };
             Rule { group, qtype, action }
@@ -153,28 +161,23 @@ fn build_rules(config_rules: &[config::RuleConfig]) -> Vec<Rule> {
         .collect()
 }
 
-fn parse_qtype(s: &str) -> u16 {
-    match s.to_uppercase().as_str() {
-        "A" => 1,
-        "AAAA" => 28,
-        "ANY" => 255,
-        "CNAME" => 5,
-        "MX" => 15,
-        "TXT" => 16,
-        "NS" => 2,
-        "SOA" => 6,
-        "PTR" => 12,
-        "SRV" => 33,
-        _ => s.parse::<u16>().unwrap_or_default(),
-    }
-}
-
-fn parse_host_port(s: &str) -> Option<(String, u16)> {
-    if let Some((host, port_str)) = s.rsplit_once(':') {
-        let port: u16 = port_str.parse().ok()?;
-        Some((host.to_string(), port))
-    } else {
-        Some((s.to_string(), 853))
+fn parse_qtype(s: &str) -> hickory_proto::rr::RecordType {
+    match s.as_bytes() {
+        b"A" | b"a" => RecordType::A,
+        b"AAAA" | b"aaaa" => RecordType::AAAA,
+        b"ANY" | b"any" => RecordType::ANY,
+        b"CNAME" | b"cname" => RecordType::CNAME,
+        b"MX" | b"mx" => RecordType::MX,
+        b"TXT" | b"txt" => RecordType::TXT,
+        b"NS" | b"ns" => RecordType::NS,
+        b"SOA" | b"soa" => RecordType::SOA,
+        b"PTR" | b"ptr" => RecordType::PTR,
+        b"SRV" | b"srv" => RecordType::SRV,
+        b"HTTPS" | b"https" => RecordType::HTTPS,
+        _ => s
+            .parse::<u16>()
+            .map(RecordType::from)
+            .unwrap_or_else(|_| panic!("invalid query type: {s}")),
     }
 }
 
@@ -219,6 +222,94 @@ impl UpstreamConfig {
     fn needs_resolve(&self) -> bool {
         matches!(self, Self::NeedResolve { .. })
     }
+
+    fn from_tls_url(rest: &str, bootstrap: bool, raw_pool: Option<config::RawPoolConfig>) -> Option<Self> {
+        let (host, port) = parse_host_port(rest)?;
+        let tls_config = default_tls_client_config();
+        match host.as_str().parse::<IpAddr>() {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port);
+                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
+                let pool = pool::ConnectionPool::new(vec![addr], factory::tls_factory(host, tls_config), pool_cfg);
+                Some(Self::Pool { pool, bootstrap })
+            }
+            Err(_) => Some(Self::NeedResolve {
+                server_name: host,
+                port,
+                tls_config,
+                raw_pool,
+                bootstrap,
+                protocol: ResolveProtocol::Tls,
+            }),
+        }
+    }
+
+    fn from_http_url(addr: &str, bootstrap: bool, raw_pool: Option<config::RawPoolConfig>) -> Option<Self> {
+        let parsed: url::Url = addr.parse().ok()?;
+        let host: Arc<str> = parsed.host_str()?.to_string().into();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let path: Arc<str> = match parsed.query() {
+            Some(q) => format!("{}?{}", parsed.path(), q),
+            None => parsed.path().to_string(),
+        }
+        .into();
+
+        let tls_config = default_tls_client_config();
+        let factory_fn: fn(Arc<str>, Arc<str>, Arc<rustls::ClientConfig>) -> conn::ConnFactory = match parsed.scheme() {
+            "https" => factory::doh_factory,
+            "h3" => factory::doh3_factory,
+            _ => return None,
+        };
+        let protocol = match parsed.scheme() {
+            "https" => ResolveProtocol::Doh {
+                host: host.clone(),
+                path: path.clone(),
+            },
+            _ => ResolveProtocol::Doh3 {
+                host: host.clone(),
+                path: path.clone(),
+            },
+        };
+
+        let pool_cfg = raw_pool.clone().unwrap_or_default().into_pool_config(false);
+        match host.as_ref().parse::<IpAddr>() {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port);
+                let pool = pool::ConnectionPool::new(vec![addr], factory_fn(host, path, tls_config), pool_cfg);
+                Some(Self::Pool { pool, bootstrap })
+            }
+            Err(_) => Some(Self::NeedResolve {
+                server_name: host.to_string(),
+                port,
+                tls_config,
+                raw_pool,
+                bootstrap,
+                protocol,
+            }),
+        }
+    }
+
+    fn from_quic_url(rest: &str, bootstrap: bool, raw_pool: Option<config::RawPoolConfig>) -> Option<Self> {
+        let (host, port) = parse_host_port(rest)?;
+        let tls_config = default_tls_client_config();
+        let host_arc: Arc<str> = host.as_str().into();
+        match host.as_str().parse::<IpAddr>() {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port);
+                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
+                let pool = pool::ConnectionPool::new(vec![addr], factory::doq_factory(host_arc, tls_config), pool_cfg);
+                Some(Self::Pool { pool, bootstrap })
+            }
+            Err(_) => Some(Self::NeedResolve {
+                server_name: host,
+                port,
+                tls_config,
+                raw_pool,
+                bootstrap,
+                protocol: ResolveProtocol::Doq { host: host_arc },
+            }),
+        }
+    }
 }
 
 fn build_tcp_pool(addr: SocketAddr, raw_pool: Option<config::RawPoolConfig>) -> Arc<pool::ConnectionPool> {
@@ -231,145 +322,48 @@ fn build_udp_pool(addr: SocketAddr, raw_pool: Option<config::RawPoolConfig>) -> 
     pool::ConnectionPool::new(vec![addr], factory::udp_factory(), pool_cfg)
 }
 
+fn parse_host_port(s: &str) -> Option<(String, u16)> {
+    s.rsplit_once(':')
+        .and_then(|(host, port_str)| port_str.parse::<u16>().ok().map(|port| (host.to_string(), port)))
+        .or_else(|| Some((s.to_string(), 853)))
+}
+
 fn parse_upstream(addr: &str, bootstrap: bool, raw_pool: Option<config::RawPoolConfig>) -> Option<UpstreamConfig> {
+    use UpstreamConfig as U;
     if let Some(rest) = addr.strip_prefix("udp://") {
         let sock_addr: SocketAddr = rest.parse().ok()?;
         let pool = build_udp_pool(sock_addr, raw_pool);
-        return Some(UpstreamConfig::Pool { pool, bootstrap });
+        return Some(U::Pool { pool, bootstrap });
     }
     if let Some(rest) = addr.strip_prefix("tcp://") {
         let sock_addr: SocketAddr = rest
             .parse::<SocketAddr>()
             .or_else(|_| format!("{}:53", rest).parse())
             .ok()?;
-        return Some(UpstreamConfig::Tcp {
+        return Some(U::Tcp {
             addr: sock_addr,
             bootstrap,
             raw_pool,
         });
     }
     if let Some(rest) = addr.strip_prefix("tls://") {
-        let (host, port) = parse_host_port(rest)?;
-        let tls_config = default_tls_client_config();
-        match host.parse::<IpAddr>() {
-            Ok(ip) => {
-                let addr = SocketAddr::new(ip, port);
-                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
-                let pool = pool::ConnectionPool::new(vec![addr], factory::tls_factory(host, tls_config), pool_cfg);
-                return Some(UpstreamConfig::Pool { pool, bootstrap });
-            }
-            Err(_) => {
-                return Some(UpstreamConfig::NeedResolve {
-                    server_name: host,
-                    port,
-                    tls_config,
-                    raw_pool,
-                    bootstrap,
-                    protocol: ResolveProtocol::Tls,
-                });
-            }
-        }
+        return U::from_tls_url(rest, bootstrap, raw_pool);
     }
-    if let Some(_rest) = addr.strip_prefix("https://") {
-        let tls_config = default_tls_client_config();
-        let parsed: url::Url = addr.parse().ok()?;
-        let host: Arc<str> = parsed.host_str()?.to_string().into();
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let path: Arc<str> = match parsed.query() {
-            Some(q) => format!("{}?{}", parsed.path(), q),
-            None => parsed.path().to_string(),
-        }
-        .into();
-
-        match host.parse::<IpAddr>() {
-            Ok(ip) => {
-                let addr = SocketAddr::new(ip, port);
-                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
-                let pool = pool::ConnectionPool::new(
-                    vec![addr],
-                    factory::doh_factory(host.clone(), path, tls_config),
-                    pool_cfg,
-                );
-                return Some(UpstreamConfig::Pool { pool, bootstrap });
-            }
-            Err(_) => {
-                return Some(UpstreamConfig::NeedResolve {
-                    server_name: host.to_string(),
-                    port,
-                    tls_config,
-                    raw_pool,
-                    bootstrap,
-                    protocol: ResolveProtocol::Doh { host, path },
-                });
-            }
-        }
+    if addr.starts_with("https://") {
+        return U::from_http_url(addr, bootstrap, raw_pool);
     }
-    if let Some(_rest) = addr.strip_prefix("h3://") {
-        let tls_config = default_tls_client_config();
-        let parsed: url::Url = addr.parse().ok()?;
-        let host: Arc<str> = parsed.host_str()?.to_string().into();
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let path: Arc<str> = match parsed.query() {
-            Some(q) => format!("{}?{}", parsed.path(), q),
-            None => parsed.path().to_string(),
-        }
-        .into();
-
-        match host.parse::<IpAddr>() {
-            Ok(ip) => {
-                let addr = SocketAddr::new(ip, port);
-                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
-                let pool = pool::ConnectionPool::new(
-                    vec![addr],
-                    factory::doh3_factory(host.clone(), path, tls_config),
-                    pool_cfg,
-                );
-                return Some(UpstreamConfig::Pool { pool, bootstrap });
-            }
-            Err(_) => {
-                return Some(UpstreamConfig::NeedResolve {
-                    server_name: host.to_string(),
-                    port,
-                    tls_config,
-                    raw_pool,
-                    bootstrap,
-                    protocol: ResolveProtocol::Doh3 { host, path },
-                });
-            }
-        }
+    if addr.starts_with("h3://") {
+        return U::from_http_url(addr, bootstrap, raw_pool);
     }
     if let Some(rest) = addr.strip_prefix("quic://") {
-        let (host, port) = parse_host_port(rest)?;
-        let tls_config = default_tls_client_config();
-
-        match host.parse::<IpAddr>() {
-            Ok(ip) => {
-                let addr = SocketAddr::new(ip, port);
-                let pool_cfg = raw_pool.unwrap_or_default().into_pool_config(false);
-                let host_arc: Arc<str> = host.into();
-                let pool = pool::ConnectionPool::new(vec![addr], factory::doq_factory(host_arc, tls_config), pool_cfg);
-                return Some(UpstreamConfig::Pool { pool, bootstrap });
-            }
-            Err(_) => {
-                let host_arc: Arc<str> = host.clone().into();
-                return Some(UpstreamConfig::NeedResolve {
-                    server_name: host,
-                    port,
-                    tls_config,
-                    raw_pool,
-                    bootstrap,
-                    protocol: ResolveProtocol::Doq { host: host_arc },
-                });
-            }
-        }
+        return U::from_quic_url(rest, bootstrap, raw_pool);
     }
-
     let sock_addr: SocketAddr = addr
         .parse::<SocketAddr>()
         .or_else(|_| format!("{}:53", addr).parse())
         .ok()?;
     let pool = build_udp_pool(sock_addr, raw_pool);
-    Some(UpstreamConfig::Pool { pool, bootstrap })
+    Some(U::Pool { pool, bootstrap })
 }
 
 async fn bootstrap_resolve_all(
@@ -505,7 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.groups.is_empty() {
         info!("domain groups loaded:");
         for (tag, domains) in &config.groups {
-            info!("  '{}': {} domain(s)", tag, domains.len());
+            info!("  '{}': {} items", tag, domains.len());
         }
     }
     let hosts_trie = build_hosts_trie(&config.hosts);
@@ -529,7 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("rsdns starting, upstream pools: {}", config.upstream.len());
     for (name, group) in &config.upstream {
-        let servers = group.servers();
+        let servers = &group.servers;
         info!("  upstream pool '{}': {} server(s)", name, servers.len());
         let mut indices = Vec::new();
         for server in servers {
@@ -545,7 +539,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!("    failed to parse upstream: {}", server.address);
             }
         }
-        upstream_map.push((name.clone(), indices, group.mode()));
+        upstream_map.push((name.clone(), indices, group.mode));
     }
 
     // Phase 1: bootstrap pools
@@ -672,7 +666,7 @@ mod tests {
                 upstream: "default".into(),
                 cache: true,
                 ttl: Some(60),
-                deny_qtypes: vec![28, 65],
+                deny_qtypes: vec!["AAAA".into(), "HTTPS".into()],
             },
         }]);
 
@@ -686,7 +680,7 @@ mod tests {
                 assert_eq!(upstream, "default");
                 assert!(*cache);
                 assert_eq!(*ttl, Some(60));
-                assert_eq!(deny_qtypes, &vec![28, 65]);
+                assert_eq!(deny_qtypes, &vec![RecordType::AAAA, RecordType::HTTPS]);
             }
             _ => panic!("expected forward rule"),
         }

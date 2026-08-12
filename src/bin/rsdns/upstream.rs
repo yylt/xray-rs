@@ -3,11 +3,52 @@
 //! An [`UpstreamClient`] wraps a [`ConnectionPool`] and exposes a simple
 //! `query()` interface. An [`UpstreamGroup`] can query multiple clients in
 //! serial or parallel mode.
+//!
+//! ## Error classification
+//!
+//! `UpstreamClient::query()` returns `io::Result<Message>`.  Errors
+//! (returned as `Err(_)`) indicate that **no valid DNS response was
+//! received** — the caller should retry the next server in the group
+//! (`UpstreamGroup`) or return a SERVFAIL to the client.
+//!
+//! Errors that **do** produce `Err` (and thus trigger retry or SERVFAIL):
+//!
+//! | Source layer       | Example error                  | io::ErrorKind      |
+//! |--------------------|--------------------------------|--------------------|
+//! | Pool exhausted     | `NotConnected` — all max_size connections busy | NotConnected |
+//! | Connection setup   | TCP connect / TLS handshake / QUIC handshake timeout or refused | TimedOut, ConnectionRefused, ConnectionReset |
+//! | Connection dead    | `sender queue full` / `sender closed` — CloneableSender already shut down | BrokenPipe, Other |
+//! | DNS transport      | `dns timeout` — no response within `dns_timeout` | TimedOut |
+//! | Stream closed      | Multiplexer or QUIC stream terminated | ConnectionAborted, ConnectionReset, UnexpectedEof |
+//! | DNS format         | Wire-format parse error in response | Other |
+//! | Mux queue overflow | `mux request queue full` (256 outstanding requests) | Other |
+//!
+//! Errors that do **not** produce `Err` (they arrive as `Ok(Message)`)
+//! because a valid DNS response was received:
+//!
+//! | DNS rcode       | Meaning                        | Handler responsibility |
+//! |-----------------|--------------------------------|------------------------|
+//! | SERVFAIL        | Upstream resolver failed       | Propagated as-is; caller may return SERVFAIL |
+//! | NXDOMAIN        | Name does not exist            | Cached as negative (NxDomain) in `cache_upstream_response` |
+//! | REFUSED         | Upstream refused the query     | Propagated as-is |
+//! | FORMERR         | Upstream rejected query format | Propagated as-is |
+//! | NoError (empty) | No records of requested type   | Cached as negative (NoData) in `cache_upstream_response` |
+//!
+//! `UpstreamGroup` retry semantics:
+//!
+//! - **Serial mode**: iterates clients; first `Ok` response wins; on `Err`,
+//!   moves to the next client.  Returns the last error if all clients fail.
+//! - **Parallel mode**: races all clients concurrently; first `Ok` wins;
+//!   on `Err`, waits for remaining.  Returns the last error if all fail.
+//!
+//! In both modes, retry is at the **server** (UpstreamClient) granularity,
+//! not at the connection level.  Connection-level retry (same server,
+//! different address) is handled internally by `ConnectionPool::checkout()`.
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hickory_proto::op::{DnsRequest, DnsRequestOptions, Message};
-use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::rr::{DNSClass, Name};
 use std::io;
 use std::sync::Arc;
 
@@ -106,13 +147,14 @@ impl UpstreamGroup {
     }
 
     async fn query_parallel(&self, msg: &Message) -> io::Result<Message> {
+        let msg_arc = Arc::new(msg.clone());
         let mut futs: FuturesUnordered<_> = self
             .clients
             .iter()
             .map(|client| {
                 let client = client.clone();
-                let msg_owned = msg.clone();
-                async move { client.query(&msg_owned).await }
+                let m = msg_arc.clone();
+                async move { client.query(&m).await }
             })
             .collect();
 
@@ -138,11 +180,7 @@ impl UpstreamGroup {
         let mut msg = Message::new(0, hickory_proto::op::MessageType::Query, hickory_proto::op::OpCode::Query);
         let mut q = hickory_proto::op::Query::new();
         q.set_name(Name::from_utf8(&cache_key.name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
-        q.set_query_type(match cache_key.qtype {
-            28 => RecordType::AAAA,
-            1 => RecordType::A,
-            _ => RecordType::A,
-        });
+        q.set_query_type(cache_key.qtype);
         q.set_query_class(DNSClass::IN);
         msg.queries.push(q);
         msg.metadata.recursion_desired = true;

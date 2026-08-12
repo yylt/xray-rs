@@ -282,15 +282,10 @@ pub async fn build_cloneable(
     dns_timeout: Duration,
     connect_timeout: Duration,
 ) -> io::Result<CloneableSender> {
-    let result: io::Result<BoxedDnsSender> = tokio::time::timeout(connect_timeout, factory(addr))
+    let sender = tokio::time::timeout(connect_timeout, factory(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))?
-        .map_err(|e| io::Error::other(e.to_string()));
-
-    let sender = match result {
-        Ok(s) => s,
-        Err(e) => return Err(e),
-    };
+        .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(CloneableSender::new(sender, dns_timeout))
 }
 

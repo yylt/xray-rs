@@ -117,13 +117,16 @@ rules:
       type: block
       response: nxdomain
 
-  # CNAME rewrite: resolve target and return its IP
+  # CNAME rewrite: resolve target via upstream and return its IP
+  # upstream is required; optionally deny certain query types
   - match: foo
     qtype: ANY
     action:
       type: cname
       target: site.182682.xyz
       ttl: 600
+      upstream: default
+      # deny_qtypes: ["AAAA"]
 
   # Forward intranet to default upstream, skip cache
   - match: intranet
@@ -153,4 +156,4 @@ rules:
       type: forward
       upstream: default
       keep_ttl: true
-      deny_qtypes: [65]
+      deny_qtypes: ["HTTPS"]

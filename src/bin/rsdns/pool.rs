@@ -320,7 +320,7 @@ impl ConnectionPool {
     /// 4. If no candidates pass the primary filters, fall back to
     ///    `pick_addr_fallback()` (relaxes cool-down, keeps family filter).
     fn pick_addr(&self) -> Option<SocketAddr> {
-        let mut candidates: Vec<(SocketAddr, f64)> = Vec::new();
+        let mut candidates: Vec<(SocketAddr, f64)> = Vec::with_capacity(self.addresses.len());
         for state in self.addresses.iter() {
             if state.in_cooldown() {
                 continue;
@@ -356,7 +356,7 @@ impl ConnectionPool {
 
     /// Fallback: relax cool-down filter, still respect `PreferFamily`.
     fn pick_addr_fallback(&self) -> Option<SocketAddr> {
-        let mut candidates: Vec<SocketAddr> = Vec::new();
+        let mut candidates: Vec<SocketAddr> = Vec::with_capacity(self.addresses.len());
         for state in self.addresses.iter() {
             match self.config.prefer_family {
                 PreferFamily::Ipv4 if !state.addr.is_ipv4() => continue,

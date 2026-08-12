@@ -1,20 +1,20 @@
-use lru::LruCache;
+use ahash::RandomState;
+use hickory_proto::rr::rdata::svcb::SVCB;
+use hickory_proto::rr::RecordType;
+use moka::future::Cache;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub name: String,
-    pub qtype: u16,
+    pub qtype: RecordType,
 }
 
 impl CacheKey {
-    pub fn new(name: &str, qtype: u16) -> Self {
+    pub fn new(name: impl Into<String>, qtype: RecordType) -> Self {
         Self {
-            name: name.to_string(),
+            name: name.into(),
             qtype,
         }
     }
@@ -24,6 +24,11 @@ impl CacheKey {
 pub enum CacheRecord {
     A(Ipv4Addr),
     Aaaa(Ipv6Addr),
+    Cname(String),
+    Mx { preference: u16, exchange: String },
+    Txt(Vec<String>),
+    Https(SVCB),
+    NxDomain,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +43,10 @@ impl CacheEntry {
         if self.records.is_empty() {
             return "forward-cache-fail";
         }
-        "forward-cache"
+        match &self.records[0] {
+            CacheRecord::NxDomain => "forward-cache-nxdomain",
+            _ => "forward-cache",
+        }
     }
 
     pub fn remaining_ttl(&self, keep_ttl: bool) -> u32 {
@@ -61,7 +69,7 @@ pub enum CacheResult {
 
 #[derive(Clone)]
 pub struct DnsCache {
-    inner: Arc<Mutex<LruCache<CacheKey, CacheEntry>>>,
+    inner: Cache<CacheKey, CacheEntry, RandomState>,
     min_ttl: Duration,
     max_ttl: Duration,
     serve_expired: bool,
@@ -70,9 +78,11 @@ pub struct DnsCache {
 
 impl DnsCache {
     pub fn new(size: usize, min_ttl: u32, max_ttl: u32, serve_expired: bool, keep_ttl: bool) -> Self {
-        let cap = NonZeroUsize::new(size).unwrap_or_else(|| NonZeroUsize::new(1024).unwrap());
+        let cache = Cache::builder()
+            .max_capacity(size as u64)
+            .build_with_hasher(RandomState::new());
         Self {
-            inner: Arc::new(Mutex::new(LruCache::new(cap))),
+            inner: cache,
             min_ttl: Duration::from_secs(min_ttl as u64),
             max_ttl: Duration::from_secs(max_ttl as u64),
             serve_expired,
@@ -81,16 +91,14 @@ impl DnsCache {
     }
 
     pub async fn get_cached(&self, key: &CacheKey) -> CacheResult {
-        let mut cache = self.inner.lock().await;
-        if let Some(entry) = cache.get(key) {
+        if let Some(entry) = self.inner.get(key).await {
             let now = Instant::now();
             if entry.expires_at > now {
-                return CacheResult::Fresh(entry.clone());
+                return CacheResult::Fresh(entry);
             }
             if self.serve_expired {
-                return CacheResult::Stale(entry.clone());
+                return CacheResult::Stale(entry);
             }
-            cache.pop(key);
         }
         CacheResult::Miss
     }
@@ -107,8 +115,7 @@ impl DnsCache {
             expires_at: now + ttl_duration,
             ttl,
         };
-        let mut cache = self.inner.lock().await;
-        cache.put(key, entry);
+        self.inner.insert(key, entry).await;
     }
 }
 
@@ -120,7 +127,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_fresh() {
         let cache = DnsCache::new(10, 60, 3600, false, false);
-        let key = CacheKey::new("example.com", 1);
+        let key = CacheKey::new("example.com", RecordType::A);
         let records = vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))];
         cache.put(key.clone(), records.clone(), 300).await;
 
@@ -131,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_stale() {
         let cache = DnsCache::new(10, 0, 1, true, false);
-        let key = CacheKey::new("stale.com", 1);
+        let key = CacheKey::new("stale.com", RecordType::A);
         cache.put(key.clone(), vec![], 0).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -142,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_miss() {
         let cache = DnsCache::new(10, 60, 3600, false, false);
-        let key = CacheKey::new("miss.com", 1);
+        let key = CacheKey::new("miss.com", RecordType::A);
         let result = cache.get_cached(&key).await;
         assert!(matches!(result, CacheResult::Miss));
     }
@@ -150,7 +157,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_empty_entry() {
         let cache = DnsCache::new(10, 60, 3600, false, false);
-        let key = CacheKey::new("block.test", 1);
+        let key = CacheKey::new("block.test", RecordType::A);
         cache.put(key.clone(), vec![], 300).await;
         let result = cache.get_cached(&key).await;
         assert!(matches!(result, CacheResult::Fresh(_)));
@@ -159,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_remaining_ttl_decrement() {
         let cache = DnsCache::new(10, 0, 3600, false, false);
-        let key = CacheKey::new("ttl.test", 1);
+        let key = CacheKey::new("ttl.test", RecordType::A);
         let records = vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))];
         cache.put(key.clone(), records, 5).await;
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -175,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn test_remaining_ttl_keepttl() {
         let cache = DnsCache::new(10, 0, 3600, false, true);
-        let key = CacheKey::new("keepttl.test", 1);
+        let key = CacheKey::new("keepttl.test", RecordType::A);
         let records = vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))];
         cache.put(key.clone(), records, 5).await;
         tokio::time::sleep(Duration::from_millis(1100)).await;

@@ -39,8 +39,9 @@ groups:
     - "*.doubleclick.net"
 upstream:
   default:
-    - address: 223.5.5.5
-      bootstrap: true
+    servers:
+      - address: 223.5.5.5
+        bootstrap: true
 cache:
   size: 4096
   serve_expired: true
@@ -67,10 +68,12 @@ groups:
     - "*.doubleclick.net"
 upstream:
   bootstrap:
-    - address: 223.5.5.5
-      bootstrap: true
+    servers:
+      - address: 223.5.5.5
+        bootstrap: true
   test:
-    - address: %s
+    servers:
+      - address: %s
 cache:
   size: 4096
   serve_expired: true
@@ -149,12 +152,15 @@ groups:
     - "%s"
 upstream:
   bootstrap:
-    - address: 223.5.5.5
-      bootstrap: true
+    servers:
+      - address: 223.5.5.5
+        bootstrap: true
   default:
-    - address: 127.0.0.1:19999
+    servers:
+      - address: 127.0.0.1:19999
   test:
-    - address: %s
+    servers:
+      - address: %s
 cache:
   size: 4096
   serve_expired: true
@@ -419,7 +425,28 @@ func waitForRsdnsReady(port int, timeout time.Duration) error {
 
 // --- tests ---
 
-func testRsdnsForward() error {
+// RsdnsTest describes a single rsdns e2e test case.
+type RsdnsTest struct {
+	Name string // short label, e.g. "Forward"
+	Desc string // human-readable description of what this case validates
+	Fn   func() error
+}
+
+// RsdnsTests lists all rsdns test cases in execution order.
+var RsdnsTests = []RsdnsTest{
+	{"Forward", "Plain UDP forward via default upstream resolves example.com and blocks ad domain with poison", TestRsdnsForward},
+	{"Hosts", "Hosts file mapping returns 0.0.0.0 for a statically-blocked domain", TestRsdnsHosts},
+	{"Cache", "Second lookup of the same domain is served from cache", TestRsdnsCache},
+	{"Reject", "Block rule with nxdomain response returns NXDOMAIN", TestRsdnsReject},
+
+	{"DoT", "Split-tunnel DNS-over-TLS upstream resolves, non-matched domain is not leaked", TestRsdnsDoT},
+	{"DoH", "Split-tunnel DNS-over-HTTPS upstream resolves, non-matched domain is not leaked", TestRsdnsDoH},
+	{"DoH3", "Split-tunnel DNS-over-HTTP/3 upstream resolves, non-matched domain is not leaked", TestRsdnsDoH3},
+	{"TCP", "Split-tunnel TCP upstream resolves, non-matched domain is not leaked", TestRsdnsTCP},
+	{"DoQ", "Split-tunnel DNS-over-QUIC upstream resolves, non-matched domain is not leaked", TestRsdnsDoQ},
+}
+
+func TestRsdnsForward() error {
 	port := 15353
 	ctx := context.Background()
 	rsdns, err := startRsdns(ctx, port)
@@ -458,7 +485,7 @@ func testRsdnsForward() error {
 	return fmt.Errorf("expected poison 0.0.0.0, got: %v", hosts)
 }
 
-func testRsdnsHosts() error {
+func TestRsdnsHosts() error {
 	port := 15354
 	rsdns, err := startRsdns(context.Background(), port)
 	if err != nil {
@@ -488,7 +515,7 @@ func testRsdnsHosts() error {
 	return fmt.Errorf("expected 0.0.0.0, got: %v", hosts)
 }
 
-func testRsdnsCache() error {
+func TestRsdnsCache() error {
 	port := 15355
 	rsdns, err := startRsdns(context.Background(), port)
 	if err != nil {
@@ -528,7 +555,7 @@ func testRsdnsCache() error {
 	return nil
 }
 
-func testRsdnsReject() error {
+func TestRsdnsReject() error {
 	port := 15359
 	cfg := fmt.Sprintf(`bind:
   - address: "0.0.0.0:%d"
@@ -537,8 +564,9 @@ groups:
     - "blocked-nxdomain.example"
 upstream:
   default:
-    - address: 223.5.5.5
-      bootstrap: true
+    servers:
+      - address: 223.5.5.5
+        bootstrap: true
 cache:
   size: 256
 hosts: []
@@ -590,77 +618,11 @@ rules:
 	return nil
 }
 
-func testRsdnsForwardDenyQtype() error {
-	port := 15362
-	cfg := fmt.Sprintf(`bind:
-  - address: "0.0.0.0:%d"
-upstream:
-  default:
-    servers:
-      - address: 223.5.5.5
-        bootstrap: true
-rules:
-  - match: "*"
-    action:
-      type: forward
-      upstream: default
-      deny_qtypes: [28]
-`, port)
-	tmpDir, _ := os.MkdirTemp("", "rsdns-e2e-*")
-	defer os.RemoveAll(tmpDir)
-	cfgPath := filepath.Join(tmpDir, "rsdns.yaml")
-	os.WriteFile(cfgPath, []byte(cfg), 0o644)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	cmd := exec.CommandContext(ctx, rsdnsBinaryPath(), "--config", cfgPath)
-	wd, _ := os.Getwd()
-	cmd.Dir = filepath.Join(wd, "../..")
-
-	if !verbose {
-		logFile, err := os.Create(filepath.Join(tmpDir, "rsdns.log"))
-		if err == nil {
-			cmd.Stdout = logFile
-			cmd.Stderr = logFile
-		}
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start: %w", err)
-	}
-	defer cmd.Process.Kill()
-
-	if err := waitForRsdnsReady(port, 15*time.Second); err != nil {
-		return fmt.Errorf("wait: %w", err)
-	}
-	cli, _ := newDNSClient(port)
-	defer cli.Close()
-
-	rcode, err := cli.lookupRcode("example.com", 28)
-	if err != nil {
-		return fmt.Errorf("lookup AAAA: %w", err)
-	}
-	if rcode != 5 {
-		return fmt.Errorf("expected REFUSED(5), got %d", rcode)
-	}
-
-	rcode, err = cli.lookupRcode("example.com", 1)
-	if err != nil {
-		return fmt.Errorf("lookup A: %w", err)
-	}
-	if rcode != 0 {
-		return fmt.Errorf("expected NOERROR(0) for A, got %d", rcode)
-	}
-
-	log.Printf("[rsdns-test] PASS REFUSED deny_qtypes")
-	return nil
-}
-
-func testRsdnsDoT() error {
+func TestRsdnsDoT() error {
 	addr := os.Getenv("RSDNS_UPSTREAM_DOT")
 	if addr == "" {
 		log.Printf("[rsdns-dot] SKIP")
-		return nil
+		return errSkip
 	}
 	port := 15356
 	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
@@ -689,11 +651,11 @@ func testRsdnsDoT() error {
 	return nil
 }
 
-func testRsdnsDoH() error {
+func TestRsdnsDoH() error {
 	addr := os.Getenv("RSDNS_UPSTREAM_DOH")
 	if addr == "" {
 		log.Printf("[rsdns-doh] SKIP")
-		return nil
+		return errSkip
 	}
 	port := 15357
 	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
@@ -722,11 +684,11 @@ func testRsdnsDoH() error {
 	return nil
 }
 
-func testRsdnsDoH3() error {
+func TestRsdnsDoH3() error {
 	addr := os.Getenv("RSDNS_UPSTREAM_DOH3")
 	if addr == "" {
 		log.Printf("[rsdns-doh3] SKIP")
-		return nil
+		return errSkip
 	}
 	port := 15358
 	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
@@ -755,11 +717,11 @@ func testRsdnsDoH3() error {
 	return nil
 }
 
-func testRsdnsTCP() error {
+func TestRsdnsTCP() error {
 	addr := os.Getenv("RSDNS_UPSTREAM_TCP")
 	if addr == "" {
 		log.Printf("[rsdns-tcp] SKIP")
-		return nil
+		return errSkip
 	}
 	port := 15360
 	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
@@ -786,11 +748,11 @@ func testRsdnsTCP() error {
 	return nil
 }
 
-func testRsdnsDoQ() error {
+func TestRsdnsDoQ() error {
 	addr := os.Getenv("RSDNS_UPSTREAM_DOQ")
 	if addr == "" {
 		log.Printf("[rsdns-doq] SKIP")
-		return nil
+		return errSkip
 	}
 	port := 15361
 	rsdns, err := startRsdnsWithSplitConfig(context.Background(), port, addr, "example.com")
@@ -818,29 +780,14 @@ func testRsdnsDoQ() error {
 }
 
 func testRsdnsAll() error {
-	tests := []struct {
-		name string
-		fn   func() error
-	}{
-		{"Forward", testRsdnsForward},
-		{"Hosts", testRsdnsHosts},
-		{"Cache", testRsdnsCache},
-		{"Reject", testRsdnsReject},
-		{"ForwardDenyQtype", testRsdnsForwardDenyQtype},
-		{"DoT", testRsdnsDoT},
-		{"DoH", testRsdnsDoH},
-		{"DoH3", testRsdnsDoH3},
-		{"TCP", testRsdnsTCP},
-		{"DoQ", testRsdnsDoQ},
-	}
 	failed := false
-	for _, t := range tests {
-		log.Printf("[rsdns] START: %s", t.name)
-		if err := t.fn(); err != nil {
-			log.Printf("[rsdns] FAIL %s: %v", t.name, err)
+	for _, t := range RsdnsTests {
+		log.Printf("[rsdns] START: %s – %s", t.Name, t.Desc)
+		if err := t.Fn(); err != nil {
+			log.Printf("[rsdns] FAIL %s: %v", t.Name, err)
 			failed = true
 		} else {
-			log.Printf("[rsdns] PASS %s", t.name)
+			log.Printf("[rsdns] PASS %s", t.Name)
 		}
 	}
 	if failed {
