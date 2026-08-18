@@ -13,7 +13,7 @@ fn main() {
 
     let _guard = rslog::init(log::LevelFilter::Info);
 
-    build_info::log_startup_info();
+    build_info::log_startup_info(env!("CARGO_PKG_NAME"));
 
     if let Err(e) = root::execute() {
         println!("execute error: {e}");
