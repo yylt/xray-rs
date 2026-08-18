@@ -20,7 +20,7 @@ const fn value_or_unknown(value: Option<&'static str>) -> &'static str {
 
 pub const BUILD_INFO: BuildInfo = BuildInfo {
     name: env!("CARGO_PKG_NAME"),
-    version: env!("CARGO_PKG_VERSION"),
+    version: env!("XRAY_RS_VERSION"),
     git_commit: value_or_unknown(option_env!("XRAY_RS_GIT_COMMIT")),
     git_branch: value_or_unknown(option_env!("XRAY_RS_GIT_BRANCH")),
     rustc_version: value_or_unknown(option_env!("XRAY_RS_RUSTC_VERSION")),
@@ -30,10 +30,10 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
 };
 
 impl BuildInfo {
-    pub fn summary_line(&self) -> String {
+    pub fn summary_line(&self, name: &str) -> String {
         format!(
             "{} {} (commit={}, branch={})",
-            self.name, self.version, self.git_commit, self.git_branch
+            name, self.version, self.git_commit, self.git_branch
         )
     }
 
@@ -57,8 +57,8 @@ impl fmt::Display for BuildInfo {
     }
 }
 
-pub fn log_startup_info() {
-    log::info!(target: "build", "starting {}", BUILD_INFO.name);
-    log::info!(target: "build", "{}", BUILD_INFO.summary_line());
+pub fn log_startup_info(name: &'static str) {
+    log::info!(target: "build", "starting {}", name);
+    log::info!(target: "build", "{}", BUILD_INFO.summary_line(name));
     log::info!(target: "build", "{}", BUILD_INFO.detail_line());
 }

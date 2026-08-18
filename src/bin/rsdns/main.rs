@@ -487,7 +487,7 @@ fn build_resolved_pool(cfg: &UpstreamConfig, addrs: Vec<SocketAddr>) -> io::Resu
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = rslog::init(log::LevelFilter::Info);
 
-    build_info::log_startup_info();
+    build_info::log_startup_info("rsdns");
 
     let args = Args::parse();
     let config_path = args.config.to_string_lossy();
