@@ -157,3 +157,11 @@ rules:
       upstream: default
       keep_ttl: true
       deny_qtypes: ["HTTPS"]
+
+# Query log (optional): per-query access log with template placeholders.
+# Placeholders: {type} {name} {proto} {remote} {action} {port} {size} {duration} {rcode} {answers}
+log:
+  # file: /var/log/rsdns-query.log   # unset = stdout
+  format: '{remote}:{port} {name} [{type}] {rcode} {action} {duration}'
+  # buf_size: 16384                  # bytes; write when accumulated log reaches this size
+  # flush_interval_secs: 5           # seconds; also write on this interval even if below buf_size

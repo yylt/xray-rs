@@ -250,16 +250,26 @@ pub struct LogConfig {
     pub file: Option<String>,
 
     /// Write buffer size in bytes, default 16384 (16 KB).
+    /// 查询日志先在写任务中累积，达到该字节数时写入一次。
     #[serde(default = "default_buf_size")]
     pub buf_size: usize,
+
+    /// Flush interval in seconds, default 5.
+    /// 即使未达到 `buf_size`，也按此间隔将累积的日志写入。
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: Option<u64>,
 }
 
 fn default_format() -> String {
-    "{remote}:{port} {name} \"{type}\" {rcode} [{answers}] \"{action}\" {duration}s".into()
+    "{remote} {name} \"{type}\" [{answers}] \"{action}\" {duration}s".into()
 }
 
 fn default_buf_size() -> usize {
     16384
+}
+
+fn default_flush_interval_secs() -> Option<u64> {
+    Some(5)
 }
 
 impl Default for LogConfig {
@@ -268,6 +278,7 @@ impl Default for LogConfig {
             format: default_format(),
             file: None,
             buf_size: default_buf_size(),
+            flush_interval_secs: default_flush_interval_secs(),
         }
     }
 }

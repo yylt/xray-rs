@@ -146,13 +146,12 @@ impl UpstreamGroup {
     }
 
     async fn query_parallel(&self, msg: &Message) -> io::Result<Message> {
-        let msg_arc = Arc::new(msg.clone());
         let mut futs: FuturesUnordered<_> = self
             .clients
             .iter()
             .map(|client| {
                 let client = client.clone();
-                let m = msg_arc.clone();
+                let m = msg.clone();
                 async move { client.query(&m).await }
             })
             .collect();

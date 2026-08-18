@@ -15,7 +15,6 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use xray_rs::build_info;
 use xray_rs::common::{
@@ -41,8 +40,26 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser, Debug)]
-#[command(name = "rsdns")]
-#[command(version, about, long_about = None)]
+#[command(
+    name = "rsdns",
+    version = concat!(
+        env!("XRAY_RS_VERSION"),
+        "\ncommit: ",
+        env!("XRAY_RS_GIT_COMMIT"),
+        "\nbranch: ",
+        env!("XRAY_RS_GIT_BRANCH"),
+        "\nrustc: ",
+        env!("XRAY_RS_RUSTC_VERSION"),
+        "\ntarget: ",
+        env!("XRAY_RS_BUILD_TARGET"),
+        "\nprofile: ",
+        env!("XRAY_RS_BUILD_PROFILE"),
+        "\nbuilt: ",
+        env!("XRAY_RS_BUILD_TIME"),
+    ),
+    about,
+    long_about = None
+)]
 struct Args {
     #[arg(short = 'c', long = "config", default_value = "rsdns.yaml")]
     config: PathBuf,
@@ -176,7 +193,7 @@ enum UpstreamConfig {
         server_name: String,
         port: u16,
         factory: conn::ConnFactory,
-        raw_pool: Option<config::RawPoolConfig>,
+        raw_pool: Box<Option<config::RawPoolConfig>>,
     },
 }
 
@@ -201,7 +218,7 @@ impl UpstreamConfig {
                     server_name: host,
                     port,
                     factory,
-                    raw_pool,
+                    raw_pool: Box::new(raw_pool),
                 })
             }
         }
@@ -234,7 +251,7 @@ impl UpstreamConfig {
                 server_name: host.to_string(),
                 port,
                 factory,
-                raw_pool,
+                raw_pool: Box::new(raw_pool),
             }),
         }
     }
@@ -256,7 +273,7 @@ impl UpstreamConfig {
                     server_name: host,
                     port,
                     factory,
-                    raw_pool,
+                    raw_pool: Box::new(raw_pool),
                 })
             }
         }
@@ -281,15 +298,16 @@ fn parse_host_port(s: &str) -> Option<(String, u16)> {
 
 fn parse_upstream(addr: &str, raw_pool: Option<config::RawPoolConfig>) -> Option<UpstreamConfig> {
     use UpstreamConfig as U;
-    let s = scheme(addr);
-    let rest = addr.get(s.len()..).unwrap_or(addr);
-    match s {
-        "udp://" => {
-            let sock_addr: SocketAddr = rest.parse().ok()?;
+    match scheme(addr) {
+        (Some("udp://"), rest) | (None, rest) => {
+            let sock_addr: SocketAddr = rest
+                .parse::<SocketAddr>()
+                .or_else(|_| format!("{}:53", rest).parse())
+                .ok()?;
             let pool = build_udp_pool(sock_addr, raw_pool);
             Some(U::Pool { pool })
         }
-        "tcp://" => {
+        (Some("tcp://"), rest) => {
             let sock_addr: SocketAddr = rest
                 .parse::<SocketAddr>()
                 .or_else(|_| format!("{}:53", rest).parse())
@@ -297,17 +315,10 @@ fn parse_upstream(addr: &str, raw_pool: Option<config::RawPoolConfig>) -> Option
             let pool = build_tcp_pool(sock_addr, raw_pool);
             Some(U::Pool { pool })
         }
-        "tls://" => U::from_tls_url(rest, raw_pool),
-        "https://" | "h3://" => U::from_http_url(addr, raw_pool),
-        "quic://" => U::from_quic_url(rest, raw_pool),
-        _ => {
-            let sock_addr: SocketAddr = addr
-                .parse::<SocketAddr>()
-                .or_else(|_| format!("{}:53", addr).parse())
-                .ok()?;
-            let pool = build_udp_pool(sock_addr, raw_pool);
-            Some(U::Pool { pool })
-        }
+        (Some("tls://"), rest) => U::from_tls_url(rest, raw_pool),
+        (Some("https://"), _) | (Some("h3://"), _) => U::from_http_url(addr, raw_pool),
+        (Some("quic://"), rest) => U::from_quic_url(rest, raw_pool),
+        _ => None,
     }
 }
 
@@ -387,7 +398,7 @@ fn build_bootstrap_pools(configs: &mut [UpstreamConfig], bootstrap_flags: &[bool
 fn build_resolved_pool(cfg: &UpstreamConfig, addrs: Vec<SocketAddr>) -> io::Result<Arc<pool::ConnectionPool>> {
     match cfg {
         UpstreamConfig::NeedResolve { factory, raw_pool, .. } => {
-            let pool_cfg = raw_pool.clone().unwrap_or_default().into_pool_config(false);
+            let pool_cfg = (**raw_pool).clone().unwrap_or_default().into_pool_config(false);
             Ok(pool::ConnectionPool::new(addrs, factory.clone(), pool_cfg))
         }
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a resolve config")),
@@ -505,8 +516,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let logger = Arc::new(QueryLogger::new(&config.log)?);
-    logger.start_flush_task(Duration::from_secs(5));
+    let logger = QueryLogger::new(&config.log).await?;
     let server = DnsServer::new(hosts_trie, groups_trie, rules, cache, upstreams, logger.clone());
 
     info!("listening on {} address(es)", config.bind.len());
@@ -537,27 +547,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("rsdns started, press Ctrl+C to stop");
     tokio::signal::ctrl_c().await?;
     info!("Shutting down");
-    logger.flush();
+    logger.flush().await;
     Ok(())
 }
 
-/// 提取地址的协议前缀（无前缀视为 UDP）。
-fn scheme(addr: &str) -> &str {
-    ["udp://", "tcp://", "tls://", "https://", "h3://", "quic://"]
-        .into_iter()
-        .find(|p| addr.starts_with(p))
-        .unwrap_or("udp://")
+/// 提取地址的协议前缀及剩余部分；无前缀时 `(None, addr)` 表示 UDP。
+fn scheme(addr: &str) -> (Option<&str>, &str) {
+    for p in ["udp://", "tcp://", "tls://", "https://", "h3://", "quic://"] {
+        if let Some(rest) = addr.strip_prefix(p) {
+            return (Some(p), rest);
+        }
+    }
+    (None, addr)
 }
 
 fn classify_upstream(addr: &str) -> &'static str {
-    match scheme(addr) {
-        "udp://" => "UDP",
-        "tcp://" => "TCP",
-        "tls://" => "TLS",
-        "https://" => "DoH",
-        "h3://" => "DoH3",
-        "quic://" => "DoQ",
-        _ => "UDP",
+    match scheme(addr).0 {
+        Some("udp://") | None => "UDP",
+        Some("tcp://") => "TCP",
+        Some("tls://") => "TLS",
+        Some("https://") => "DoH",
+        Some("h3://") => "DoH3",
+        Some("quic://") => "DoQ",
+        Some(_) => "UDP",
     }
 }
 
@@ -592,5 +604,68 @@ mod tests {
             }
             _ => panic!("expected forward rule"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_upstream_bare_ip_udp() {
+        let cfg = parse_upstream("223.5.5.5", None).expect("bare IP should parse as UDP");
+        assert!(matches!(cfg, UpstreamConfig::Pool { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_parse_upstream_bare_ip_port_udp() {
+        let cfg = parse_upstream("8.8.8.8:53", None).expect("IP:port should parse");
+        assert!(matches!(cfg, UpstreamConfig::Pool { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_parse_upstream_schemes() {
+        assert!(matches!(
+            parse_upstream("udp://223.5.5.5", None),
+            Some(UpstreamConfig::Pool { .. })
+        ));
+        assert!(matches!(
+            parse_upstream("tcp://8.8.8.8", None),
+            Some(UpstreamConfig::Pool { .. })
+        ));
+        assert!(matches!(
+            parse_upstream("tcp://1.1.1.1:853", None),
+            Some(UpstreamConfig::Pool { .. })
+        ));
+        assert!(matches!(
+            parse_upstream("tls://8.8.8.8", None),
+            Some(UpstreamConfig::Pool { .. })
+        ));
+        // 域名型需要 bootstrap 解析，属于 NeedResolve
+        assert!(matches!(
+            parse_upstream("tls://dot.pub", None),
+            Some(UpstreamConfig::NeedResolve { .. })
+        ));
+        assert!(matches!(
+            parse_upstream("https://dns.quad9.net/dns-query", None),
+            Some(UpstreamConfig::NeedResolve { .. })
+        ));
+        assert!(matches!(
+            parse_upstream("h3://mozilla.cloudflare-dns.com/dns-query", None),
+            Some(UpstreamConfig::NeedResolve { .. })
+        ));
+        assert!(matches!(
+            parse_upstream("quic://dns.adguard.com", None),
+            Some(UpstreamConfig::NeedResolve { .. })
+        ));
+    }
+
+    #[test]
+    fn test_scheme_extracts_prefix() {
+        assert_eq!(scheme("223.5.5.5"), (None, "223.5.5.5"));
+        assert_eq!(scheme("udp://1.1.1.1"), (Some("udp://"), "1.1.1.1"));
+        assert_eq!(scheme("tls://dot.pub"), (Some("tls://"), "dot.pub"));
+        assert_eq!(
+            scheme("https://dns.quad9.net/dns-query"),
+            (Some("https://"), "dns.quad9.net/dns-query")
+        );
+        assert_eq!(classify_upstream("223.5.5.5"), "UDP");
+        assert_eq!(classify_upstream("tls://dot.pub"), "TLS");
+        assert_eq!(classify_upstream("h3://x/dns-query"), "DoH3");
     }
 }
