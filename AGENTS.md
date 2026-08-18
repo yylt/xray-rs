@@ -47,7 +47,7 @@ Do **not** hand-edit `src/generated/grpc_generated.rs`.
 - **Listeners (inbound)**: UDP (`ip:port`) and TCP (`tcp://ip:port`), configured via `bind[]`.
 - **Upstream protocols (outbound)**: plain UDP/TCP, DoT (`tls://`), DoH (`https://`), DoH3 (`h3://`), DoQ (`quic://`).
 - **Query pipeline** (`server.rs:do_query`): hosts → cache → rules → upstream; fallback returns NXDOMAIN.
-  - **Cache records**: A, AAAA, and CNAME are cached. HTTPS records are not cached.
+  - **Cache records**: A, AAAA, CNAME, MX, TXT, and HTTPS are cached. NXDOMAIN is negatively cached.
 - **Rules**: ordered by priority. Actions: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional cache bypass/TTL override).
 - **Cache**: LRU with configurable capacity, TTL clamping, serve-expired with background refresh.
 - **Connection pool**: adaptive weighted address selection, cooldown on failure, SOA health probes, per-address-family preference.

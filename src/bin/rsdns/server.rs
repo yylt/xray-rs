@@ -95,18 +95,7 @@ fn format_answer_types(msg: &Message) -> String {
         if !s.is_empty() {
             s.push(',');
         }
-        s.push_str(match &r.data {
-            RData::A(_) => "A",
-            RData::AAAA(_) => "AAAA",
-            RData::CNAME(_) => "CNAME",
-            RData::HTTPS(_) => "HTTPS",
-            RData::SOA(_) => "SOA",
-            RData::NS(_) => "NS",
-            RData::PTR(_) => "PTR",
-            RData::MX(_) => "MX",
-            RData::TXT(_) => "TXT",
-            _ => "?",
-        });
+        s.push_str(r.record_type().to_string().as_str());
     }
     if s.is_empty() {
         "-".to_string()
@@ -115,37 +104,16 @@ fn format_answer_types(msg: &Message) -> String {
     }
 }
 
-enum LogWriter {
-    Stdout(BufWriter<std::io::Stdout>),
-    File(BufWriter<File>),
-}
-
-impl LogWriter {
-    fn write_line(&mut self, line: &str) -> io::Result<()> {
-        match self {
-            LogWriter::Stdout(w) => writeln!(w, "{}", line),
-            LogWriter::File(w) => writeln!(w, "{}", line),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            LogWriter::Stdout(w) => w.flush(),
-            LogWriter::File(w) => w.flush(),
-        }
-    }
-}
-
 pub struct QueryLogger {
-    writer: Arc<Mutex<LogWriter>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     template: String,
 }
 
 impl QueryLogger {
     pub fn new(cfg: &LogConfig) -> io::Result<Self> {
-        let writer = match &cfg.file {
-            Some(path) => LogWriter::File(BufWriter::with_capacity(cfg.buf_size, File::create(path)?)),
-            None => LogWriter::Stdout(BufWriter::with_capacity(cfg.buf_size, std::io::stdout())),
+        let writer: Box<dyn Write + Send> = match &cfg.file {
+            Some(path) => Box::new(BufWriter::with_capacity(cfg.buf_size, File::create(path)?)),
+            None => Box::new(BufWriter::with_capacity(cfg.buf_size, std::io::stdout())),
         };
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
@@ -156,7 +124,7 @@ impl QueryLogger {
     fn write(&self, qlog: &QueryLog) {
         let line = qlog.format(&self.template);
         if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_line(&line);
+            let _ = writeln!(w, "{}", line);
         }
     }
 
@@ -735,7 +703,7 @@ fn is_soft_upstream_error(err: &io::Error) -> bool {
 }
 
 /// 构造一个用于上游查询的 DNS Message
-fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Message> {
+pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Message> {
     let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     let mut q = Query::new();
     q.set_name(Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
@@ -762,7 +730,7 @@ fn sort_answers_cname_last(answers: &mut [Record]) {
     answers.sort_by_key(|r| matches!(r.data, RData::CNAME(_)));
 }
 
-/// 从上游应答中提取可缓存的记录（A / AAAA / CNAME / MX / TXT）
+/// 从上游应答中提取可缓存的记录（A / AAAA / CNAME / MX / TXT / HTTPS）
 fn extract_cache_records(msg: &Message) -> Option<Vec<CacheRecord>> {
     let mut records = Vec::new();
     for answer in &msg.answers {
