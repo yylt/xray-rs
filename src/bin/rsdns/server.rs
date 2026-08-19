@@ -1,13 +1,15 @@
 use ahash::AHashMap;
+use bytes::{BufMut, BytesMut};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, TXT};
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{Name, Record, RecordType};
 use log::{error, info, warn};
+use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -15,10 +17,14 @@ use std::os::fd::IntoRawFd;
 use std::os::unix::io::FromRawFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, MissedTickBehavior};
 
 use xray_rs::common::domain_trie::DomainSuffixTrie;
 
 use super::cache::{CacheEntry, CacheKey, CacheRecord, CacheResult, DnsCache};
+#[cfg(test)]
+use super::config;
 use super::config::LogConfig;
 use super::factory::is_h3_cleanup_error;
 use super::hosts::HostsTrie;
@@ -27,7 +33,7 @@ use super::upstream::UpstreamGroup;
 
 const MAX_DNS_SIZE: usize = 4096;
 
-pub struct QueryLog {
+pub struct QueryLog<'a> {
     pub qtype: RecordType,
     pub name: String,
     pub proto: &'static str,
@@ -37,44 +43,127 @@ pub struct QueryLog {
     pub duration: Duration,
     pub rcode: ResponseCode,
     pub action: String,
-    pub answers: String,
+    pub answers: &'a str,
 }
 
-impl QueryLog {
-    pub fn format(&self, template: &str) -> String {
-        let mut result = String::with_capacity(template.len() + 128);
-        let mut rest = template;
-        while let Some(start) = rest.find('{') {
-            result.push_str(&rest[..start]);
-            rest = &rest[start + 1..];
-            if let Some(end) = rest.find('}') {
-                self.write_field(&mut result, &rest[..end]);
-                rest = &rest[end + 1..];
-            } else {
-                result.push('{');
+/// 查询日志模板中的一个占位符字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Duration,
+    Proto,
+    Rcode,
+    Name,
+    QType,
+    Port,
+    Size,
+    Action,
+    Remote,
+    Answers,
+}
+
+impl Field {
+    /// 占位符名 → 字段；未识别的名字返回 `None`，原样保留为字面量。
+    fn parse(key: &str) -> Option<Self> {
+        Some(match key {
+            "duration" => Self::Duration,
+            "proto" => Self::Proto,
+            "rcode" => Self::Rcode,
+            "name" => Self::Name,
+            "type" => Self::QType,
+            "port" => Self::Port,
+            "size" => Self::Size,
+            "action" => Self::Action,
+            "remote" => Self::Remote,
+            "answers" => Self::Answers,
+            _ => return None,
+        })
+    }
+}
+
+/// 预编译的模板：字面量段落与字段占位符交替。
+/// 启动时由 [`compile_template`] 解析一次，此后每条查询只按序填充字段值。
+#[derive(Debug, Clone)]
+struct CompiledTemplate {
+    segments: Vec<Segment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Segment {
+    Text(String),
+    Field(Field),
+}
+
+/// 将用户模板预编译为段落序列，替代每次查询时的模板解析。
+fn compile_template(template: &str) -> CompiledTemplate {
+    let mut segments = Vec::new();
+    let mut rest = template;
+    let mut text = String::new();
+    loop {
+        let Some(start) = rest.find('{') else {
+            text.push_str(rest);
+            break;
+        };
+        text.push_str(&rest[..start]);
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('}') {
+            match Field::parse(&rest[..end]) {
+                Some(field) => {
+                    if !text.is_empty() {
+                        segments.push(Segment::Text(std::mem::take(&mut text)));
+                    }
+                    segments.push(Segment::Field(field));
+                }
+                None => text.push_str(&format!("{{{}}}", &rest[..end])),
+            }
+            rest = &rest[end + 1..];
+        } else {
+            text.push('{');
+            text.push_str(rest);
+            break;
+        }
+    }
+    if !text.is_empty() {
+        segments.push(Segment::Text(text));
+    }
+    CompiledTemplate { segments }
+}
+
+impl QueryLog<'_> {
+    /// 按预编译模板将字段填充进 `out`（先清空）。仅做段遍历与值写入，无模板解析。
+    fn format_into(&self, template: &CompiledTemplate, out: &mut BytesMut) {
+        out.clear();
+        for segment in &template.segments {
+            match segment {
+                Segment::Text(t) => out.extend_from_slice(t.as_bytes()),
+                Segment::Field(field) => match field {
+                    Field::Duration => {
+                        let _ = write!(out, "{:.5}", self.duration.as_secs_f64());
+                    }
+                    Field::Proto => out.extend_from_slice(self.proto.as_bytes()),
+                    Field::Rcode => out.extend_from_slice(format_rcode(self.rcode).as_bytes()),
+                    Field::Name => out.extend_from_slice(self.name.as_bytes()),
+                    Field::QType => {
+                        let _ = write!(out, "{}", self.qtype);
+                    }
+                    Field::Port => {
+                        let _ = write!(out, "{}", self.port);
+                    }
+                    Field::Size => {
+                        let _ = write!(out, "{}", self.size);
+                    }
+                    Field::Action => out.extend_from_slice(self.action.as_bytes()),
+                    Field::Remote => match &self.remote {
+                        IpAddr::V4(v4) => {
+                            let _ = write!(out, "{}", v4);
+                        }
+                        IpAddr::V6(v6) => {
+                            let _ = write!(out, "[{}]", v6);
+                        }
+                    },
+                    Field::Answers => out.extend_from_slice(self.answers.as_bytes()),
+                },
             }
         }
-        result.push_str(rest);
-        result
-    }
-
-    fn write_field(&self, w: &mut impl std::fmt::Write, key: &str) {
-        let _ = match key {
-            "duration" => write!(w, "{:.5}", self.duration.as_secs_f64()),
-            "proto" => w.write_str(self.proto),
-            "rcode" => w.write_str(format_rcode(self.rcode)),
-            "name" => w.write_str(&self.name),
-            "type" => write!(w, "{}", self.qtype),
-            "port" => write!(w, "{}", self.port),
-            "size" => write!(w, "{}", self.size),
-            "action" => w.write_str(&self.action),
-            "remote" => match &self.remote {
-                IpAddr::V4(v4) => write!(w, "{}", v4),
-                IpAddr::V6(v6) => write!(w, "[{}]", v6),
-            },
-            "answers" => w.write_str(&self.answers),
-            _ => write!(w, "{{{}}}", key),
-        };
     }
 }
 
@@ -89,91 +178,114 @@ fn format_rcode(rcode: ResponseCode) -> &'static str {
     }
 }
 
-fn format_answer_types(msg: &Message) -> String {
-    let mut s = String::new();
+fn format_answer_types(msg: &Message, out: &mut String) {
+    out.clear();
     for r in &msg.answers {
-        if !s.is_empty() {
-            s.push(',');
+        if !out.is_empty() {
+            out.push(',');
         }
-        s.push_str(match &r.data {
-            RData::A(_) => "A",
-            RData::AAAA(_) => "AAAA",
-            RData::CNAME(_) => "CNAME",
-            RData::HTTPS(_) => "HTTPS",
-            RData::SOA(_) => "SOA",
-            RData::NS(_) => "NS",
-            RData::PTR(_) => "PTR",
-            RData::MX(_) => "MX",
-            RData::TXT(_) => "TXT",
-            _ => "?",
-        });
+        out.push_str(&r.record_type().to_string());
     }
-    if s.is_empty() {
-        "-".to_string()
-    } else {
-        s
+    if out.is_empty() {
+        out.push('-');
     }
 }
 
-enum LogWriter {
-    Stdout(BufWriter<std::io::Stdout>),
-    File(BufWriter<File>),
-}
-
-impl LogWriter {
-    fn write_line(&mut self, line: &str) -> io::Result<()> {
-        match self {
-            LogWriter::Stdout(w) => writeln!(w, "{}", line),
-            LogWriter::File(w) => writeln!(w, "{}", line),
+fn flush_pending(pending: &mut BytesMut, writer: &mut Box<dyn Write + Send>) {
+    if !pending.is_empty() {
+        if let Err(e) = writer.write_all(pending) {
+            warn!("query log write failed: {}", e);
         }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            LogWriter::Stdout(w) => w.flush(),
-            LogWriter::File(w) => w.flush(),
-        }
+        pending.clear();
     }
 }
 
+/// 查询日志：预编译模板 + 异步 mpsc 写入 + `BytesMut` 累积缓冲 + 周期 flush 任务。
+///
+/// - 模板在 [`QueryLogger::new`] 时编译一次，热路径只做字段值填充。
+/// - 每条日志通过 mpsc 投递给后台写任务，由写任务累积到 `buf_size` 字节或
+///   `flush_interval` 到期才真正写盘，查询线程不被磁盘 IO 阻塞。
+/// - [`QueryLogger::new`] 内部启动一个 tokio 周期 flush 任务。
+/// - [`QueryLogger::flush`] 为异步方法，需 `await`；进程退出前调用以落盘剩余日志。
 pub struct QueryLogger {
-    writer: Arc<Mutex<LogWriter>>,
-    template: String,
+    template: CompiledTemplate,
+    tx: mpsc::Sender<WriteMsg>,
+}
+
+enum WriteMsg {
+    Line(BytesMut),
+    /// 携带 oneshot 应答：后台写任务完成落盘后通知调用方，保证 flush 返回即已写盘。
+    Flush(oneshot::Sender<()>),
 }
 
 impl QueryLogger {
-    pub fn new(cfg: &LogConfig) -> io::Result<Self> {
-        let writer = match &cfg.file {
-            Some(path) => LogWriter::File(BufWriter::with_capacity(cfg.buf_size, File::create(path)?)),
-            None => LogWriter::Stdout(BufWriter::with_capacity(cfg.buf_size, std::io::stdout())),
+    pub async fn new(cfg: &LogConfig) -> io::Result<Arc<Self>> {
+        let mut writer: Box<dyn Write + Send> = match &cfg.file {
+            Some(path) => Box::new(File::create(path)?),
+            None => Box::new(std::io::stdout()),
         };
-        Ok(Self {
-            writer: Arc::new(Mutex::new(writer)),
-            template: cfg.format.clone(),
-        })
-    }
 
-    fn write(&self, qlog: &QueryLog) {
-        let line = qlog.format(&self.template);
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_line(&line);
-        }
-    }
+        let buf_size = cfg.buf_size.max(1);
+        let flush_interval = Duration::from_secs(cfg.flush_interval_secs.unwrap_or(5));
 
-    pub fn flush(&self) {
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.flush();
-        }
-    }
+        let channel_size = 1024; // 或 cfg.buf_size * 4
+        let (tx, mut rx) = mpsc::channel::<WriteMsg>(channel_size);
 
-    pub fn start_flush_task(self: &Arc<Self>, interval: Duration) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                this.flush();
-            }
+        let logger = Arc::new(Self {
+            template: compile_template(&cfg.format),
+            tx,
         });
+
+        tokio::spawn(async move {
+            let mut pending = BytesMut::with_capacity(buf_size.min(64 * 1024));
+            let mut timer = interval(flush_interval);
+            timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(WriteMsg::Line(line)) => {
+                                pending.put_slice(&line);
+                                if pending.len() >= buf_size {
+                                    flush_pending(&mut pending, &mut writer);
+                                }
+                            }
+                            Some(WriteMsg::Flush(ack)) => {
+                                flush_pending(&mut pending, &mut writer);
+                                let _ = ack.send(());
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = timer.tick() => {
+                        flush_pending(&mut pending, &mut writer);
+                    }
+                }
+            }
+
+            flush_pending(&mut pending, &mut writer);
+        });
+
+        Ok(logger)
+    }
+
+    pub async fn write(&self, qlog: &QueryLog<'_>) {
+        let mut line = BytesMut::with_capacity(160);
+        qlog.format_into(&self.template, &mut line);
+        line.put_u8(b'\n');
+
+        // 异步发送，通道满时会等待
+        // 如果接收端关闭，会返回错误
+        let _ = self.tx.send(WriteMsg::Line(line)).await;
+    }
+
+    pub async fn flush(&self) {
+        let (ack, rx) = oneshot::channel();
+        if self.tx.send(WriteMsg::Flush(ack)).await.is_ok() {
+            // 等待后台任务完成写盘，确保 flush 返回时日志已落盘。
+            let _ = rx.await;
+        }
     }
 }
 
@@ -296,7 +408,8 @@ impl DnsServer {
             .first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no question"))?;
 
-        let name = query.name().to_ascii().to_lowercase().trim_end_matches('.').to_string();
+        let mut name = query.name().to_lowercase().to_ascii();
+        name.truncate(name.trim_end_matches('.').len());
         let qtype = query.query_type();
 
         let cache_key = CacheKey::new(name.clone(), qtype);
@@ -305,6 +418,8 @@ impl DnsServer {
         response.metadata.id = msg_id;
         let elapsed = start.elapsed();
 
+        let mut answers = String::new();
+        format_answer_types(&response, &mut answers);
         let qlog = QueryLog {
             qtype,
             name,
@@ -315,10 +430,9 @@ impl DnsServer {
             duration: elapsed,
             rcode: response.metadata.response_code,
             action,
-            answers: format_answer_types(&response),
+            answers: &answers,
         };
-        self.logger.write(&qlog);
-
+        self.logger.write(&qlog).await;
         response
             .to_vec()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -688,7 +802,7 @@ impl DnsServer {
         let name = query.name().clone();
         let reply_ttl = entry.remaining_ttl(self.cache.keep_ttl);
         let records = &entry.records;
-        for record in records {
+        for record in records.iter() {
             let r = match record {
                 CacheRecord::A(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::A(A(*ip))),
                 CacheRecord::Aaaa(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::AAAA(AAAA(*ip))),
@@ -722,7 +836,6 @@ impl DnsServer {
         Ok(response)
     }
 }
-
 fn is_soft_upstream_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -735,7 +848,7 @@ fn is_soft_upstream_error(err: &io::Error) -> bool {
 }
 
 /// 构造一个用于上游查询的 DNS Message
-fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Message> {
+pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Message> {
     let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     let mut q = Query::new();
     q.set_name(Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
@@ -762,7 +875,7 @@ fn sort_answers_cname_last(answers: &mut [Record]) {
     answers.sort_by_key(|r| matches!(r.data, RData::CNAME(_)));
 }
 
-/// 从上游应答中提取可缓存的记录（A / AAAA / CNAME / MX / TXT）
+/// 从上游应答中提取可缓存的记录（A / AAAA / CNAME / MX / TXT / HTTPS）
 fn extract_cache_records(msg: &Message) -> Option<Vec<CacheRecord>> {
     let mut records = Vec::new();
     for answer in &msg.answers {
@@ -842,4 +955,204 @@ async fn forward_to_upstream_bg(
     let response = group.query_bg(cache_key).await?;
     cache_upstream_response(cache, cache_key, &response, rewrite_ttl).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_template() -> CompiledTemplate {
+        compile_template(r#"{remote} {name} "{type}" [{answers}] "{action}" {duration}s"#)
+    }
+
+    fn sample_qlog<'a>(answers: &'a str) -> QueryLog<'a> {
+        QueryLog {
+            qtype: RecordType::A,
+            name: "www.example.com".into(),
+            proto: "udp",
+            remote: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
+            port: 5353,
+            size: 29,
+            duration: Duration::from_micros(1250),
+            rcode: ResponseCode::NoError,
+            action: "forward(default)".into(),
+            answers,
+        }
+    }
+
+    fn render(qlog: &QueryLog, template: &CompiledTemplate) -> String {
+        let mut out = BytesMut::new();
+        qlog.format_into(template, &mut out);
+        String::from_utf8(out.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn test_compile_template_parses_placeholders() {
+        let t = compile_template("{name} {type} {port} {size} {duration} {rcode} {remote} {action} {proto} {answers}");
+        assert_eq!(
+            t.segments,
+            vec![
+                Segment::Field(Field::Name),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::QType),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Port),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Size),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Duration),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Rcode),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Remote),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Action),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Proto),
+                Segment::Text(" ".into()),
+                Segment::Field(Field::Answers),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unknown_and_unclosed_placeholders_kept_as_literal() {
+        let t = compile_template("a{unknown}b{");
+        assert_eq!(t.segments, vec![Segment::Text("a{unknown}b{".into())]);
+        // 混合：已知字段正常解析，未知/孤立花括号保留为字面量
+        let t = compile_template("{name} {bogus} {");
+        assert_eq!(
+            t.segments,
+            vec![Segment::Field(Field::Name), Segment::Text(" {bogus} {".into()),]
+        );
+    }
+
+    #[test]
+    fn test_render_default_template() {
+        let t = test_template();
+        let qlog = sample_qlog("A");
+        let line = render(&qlog, &t);
+        assert_eq!(line, r#"192.168.1.100 www.example.com "A" [A] "forward(default)" 0.00125s"#);
+    }
+
+    #[test]
+    fn test_render_ipv6_brackets() {
+        let t = compile_template("{remote}:{port}");
+        let qlog = QueryLog {
+            remote: IpAddr::V6("2001:db8::1".parse().unwrap()),
+            port: 53,
+            ..sample_qlog("A")
+        };
+        assert_eq!(render(&qlog, &t), "[2001:db8::1]:53");
+    }
+
+    #[test]
+    fn test_render_unknown_rcode_and_no_answers() {
+        let t = compile_template("{rcode} [{answers}]");
+        let qlog = QueryLog {
+            rcode: ResponseCode::BADVERS,
+            answers: "-",
+            ..sample_qlog("-")
+        };
+        assert_eq!(render(&qlog, &t), "UNKNOWN [-]");
+    }
+
+    #[test]
+    fn test_format_answer_types_empty() {
+        let mut out = String::new();
+        let msg = Message::new(0, MessageType::Response, OpCode::Query);
+        format_answer_types(&msg, &mut out);
+        assert_eq!(out, "-");
+    }
+
+    #[tokio::test]
+    async fn test_logger_writes_and_flushes() {
+        // 临时文件：验证异步写盘 + flush 真正将行落盘。
+        let path = std::env::temp_dir().join(format!("rsdns-qlog-write-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = config::LogConfig {
+            format: "{name} {type} {rcode}".into(),
+            file: Some(path.to_string_lossy().into_owned()),
+            buf_size: 4096,
+            flush_interval_secs: Some(5),
+        };
+        let logger = QueryLogger::new(&cfg).await.unwrap();
+        logger.write(&sample_qlog("A")).await;
+        logger.write(&sample_qlog("A")).await;
+        logger.flush().await;
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "www.example.com A NOERROR\nwww.example.com A NOERROR\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_logger_multiple_flushes_are_ordered() {
+        let path = std::env::temp_dir().join(format!("rsdns-qlog-flush-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = config::LogConfig {
+            format: "{name}".into(),
+            file: Some(path.to_string_lossy().into_owned()),
+            buf_size: 4096,
+            flush_interval_secs: Some(5),
+        };
+        let logger = QueryLogger::new(&cfg).await.unwrap();
+        for _ in 0..3 {
+            logger.write(&sample_qlog("A")).await;
+            logger.flush().await;
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "www.example.com\nwww.example.com\nwww.example.com\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_logger_flushes_when_buf_size_reached() {
+        // buf_size 很小：写一条即达到阈值，无需 flush 或等待 interval 即可落盘。
+        let path = std::env::temp_dir().join(format!("rsdns-qlog-bufsize-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = config::LogConfig {
+            format: "{name}".into(),
+            file: Some(path.to_string_lossy().into_owned()),
+            buf_size: 10,
+            flush_interval_secs: Some(3600),
+        };
+        let logger = QueryLogger::new(&cfg).await.unwrap();
+        logger.write(&sample_qlog("A")).await;
+        // 后台写任务达到 buf_size 即写盘；轮询等待文件出现。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let content = loop {
+            // 文件在 `new()` 中即被创建，可能为空；须等到内容非空才算落盘。
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if !content.is_empty() {
+                    break content;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for query log flush");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(content, "www.example.com\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_logger_flushes_on_configured_interval() {
+        // flush_interval 很短：即使未达到 buf_size，也会按时落盘。
+        let path = std::env::temp_dir().join(format!("rsdns-qlog-interval-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = config::LogConfig {
+            format: "{name}".into(),
+            file: Some(path.to_string_lossy().into_owned()),
+            buf_size: 64 * 1024,
+            flush_interval_secs: Some(1),
+        };
+        let logger = QueryLogger::new(&cfg).await.unwrap();
+        logger.write(&sample_qlog("A")).await;
+        // 不调用 flush：等待 flush 任务按 interval 落盘。
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "www.example.com\n");
+        let _ = std::fs::remove_file(&path);
+    }
 }

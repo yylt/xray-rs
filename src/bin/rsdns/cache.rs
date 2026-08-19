@@ -3,6 +3,7 @@ use hickory_proto::rr::rdata::svcb::SVCB;
 use hickory_proto::rr::RecordType;
 use moka::future::Cache;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,7 +34,7 @@ pub enum CacheRecord {
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    pub records: Vec<CacheRecord>,
+    pub records: Arc<[CacheRecord]>,
     pub expires_at: Instant,
     pub ttl: u32,
 }
@@ -111,7 +112,7 @@ impl DnsCache {
             Duration::from_secs(ttl as u64).clamp(self.min_ttl, self.max_ttl)
         };
         let entry = CacheEntry {
-            records,
+            records: records.into(),
             expires_at: now + ttl_duration,
             ttl,
         };

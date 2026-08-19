@@ -7,3 +7,11 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
+    assignees:
+      - "yylt"
+    ignore:
+      # TODO: rsdns memory doubles after tikv-jemallocator upgrade; root cause not
+      # investigated, so pin it to 0.6 and do not upgrade.
+      - dependency-name: "tikv-jemallocator"
+        versions:
+          - ">=0.6"

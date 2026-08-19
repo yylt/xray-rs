@@ -204,6 +204,11 @@ pub struct RawPoolConfig {
     pub cool_down_secs: Option<u64>,
 }
 
+/// 将可选的秒数配置转换为 [`Duration`]，缺省时用 `default`。
+fn opt_dur(secs: Option<u64>, default: std::time::Duration) -> std::time::Duration {
+    secs.map(std::time::Duration::from_secs).unwrap_or(default)
+}
+
 impl RawPoolConfig {
     /// Converts the raw YAML config into a runtime [`PoolConfig`].
     ///
@@ -214,40 +219,19 @@ impl RawPoolConfig {
         PoolConfig {
             max_size: self.max_size.unwrap_or(if is_udp { 1 } else { defaults.max_size }),
             min_idle: self.min_idle.unwrap_or(defaults.min_idle),
-            idle_timeout: self
-                .idle_timeout
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(defaults.idle_timeout),
-            max_lifetime: self
-                .max_lifetime
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(defaults.max_lifetime),
-            health_interval: self
-                .health_interval
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(defaults.health_interval),
-            connect_timeout: self
-                .connect_timeout
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(defaults.connect_timeout),
-            dns_timeout: self
-                .dns_timeout
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(defaults.dns_timeout),
+            idle_timeout: opt_dur(self.idle_timeout, defaults.idle_timeout),
+            max_lifetime: opt_dur(self.max_lifetime, defaults.max_lifetime),
+            health_interval: opt_dur(self.health_interval, defaults.health_interval),
+            connect_timeout: opt_dur(self.connect_timeout, defaults.connect_timeout),
+            dns_timeout: opt_dur(self.dns_timeout, defaults.dns_timeout),
             prefer_family: match self.prefer_family.as_deref() {
                 Some("ipv4") => PreferFamily::Ipv4,
                 Some("ipv6") => PreferFamily::Ipv6,
                 _ => PreferFamily::Any,
             },
-            health_check_timeout: self
-                .health_check_timeout
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(defaults.health_check_timeout),
+            health_check_timeout: opt_dur(self.health_check_timeout, defaults.health_check_timeout),
             max_consecutive_fail: self.max_consecutive_fail.unwrap_or(defaults.max_consecutive_fail),
-            cool_down: self
-                .cool_down_secs
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(defaults.cool_down),
+            cool_down: opt_dur(self.cool_down_secs, defaults.cool_down),
             is_udp,
         }
     }
@@ -266,16 +250,26 @@ pub struct LogConfig {
     pub file: Option<String>,
 
     /// Write buffer size in bytes, default 16384 (16 KB).
+    /// 查询日志先在写任务中累积，达到该字节数时写入一次。
     #[serde(default = "default_buf_size")]
     pub buf_size: usize,
+
+    /// Flush interval in seconds, default 5.
+    /// 即使未达到 `buf_size`，也按此间隔将累积的日志写入。
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: Option<u64>,
 }
 
 fn default_format() -> String {
-    "{remote}:{port} {name} \"{type}\" {rcode} [{answers}] \"{action}\" {duration}s".into()
+    "{remote} {name} \"{type}\" [{answers}] \"{action}\" {duration}s".into()
 }
 
 fn default_buf_size() -> usize {
     16384
+}
+
+fn default_flush_interval_secs() -> Option<u64> {
+    Some(5)
 }
 
 impl Default for LogConfig {
@@ -284,6 +278,7 @@ impl Default for LogConfig {
             format: default_format(),
             file: None,
             buf_size: default_buf_size(),
+            flush_interval_secs: default_flush_interval_secs(),
         }
     }
 }

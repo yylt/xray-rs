@@ -317,12 +317,12 @@ impl ConnectionPool {
     /// 1. Filter out addresses in cool-down and non-preferred families.
     /// 2. Compute per-address weight: `1 / (1 + consecutive_failures)`.
     /// 3. Pick an address with probability proportional to weight.
-    /// 4. If no candidates pass the primary filters, fall back to
-    ///    `pick_addr_fallback()` (relaxes cool-down, keeps family filter).
-    fn pick_addr(&self) -> Option<SocketAddr> {
+    /// 4. If no candidates pass the primary filters, retry with
+    ///    `relax_cooldown = true` (ignores cool-down, keeps family filter).
+    fn pick_addr(&self, relax_cooldown: bool) -> Option<SocketAddr> {
         let mut candidates: Vec<(SocketAddr, f64)> = Vec::with_capacity(self.addresses.len());
         for state in self.addresses.iter() {
-            if state.in_cooldown() {
+            if !relax_cooldown && state.in_cooldown() {
                 continue;
             }
 
@@ -338,7 +338,11 @@ impl ConnectionPool {
         }
 
         if candidates.is_empty() {
-            return self.pick_addr_fallback();
+            return if relax_cooldown {
+                self.addresses.first().map(|s| s.addr)
+            } else {
+                None
+            };
         }
 
         let total_weight: f64 = candidates.iter().map(|(_, w)| w).sum();
@@ -352,24 +356,6 @@ impl ConnectionPool {
         }
 
         None
-    }
-
-    /// Fallback: relax cool-down filter, still respect `PreferFamily`.
-    fn pick_addr_fallback(&self) -> Option<SocketAddr> {
-        let mut candidates: Vec<SocketAddr> = Vec::with_capacity(self.addresses.len());
-        for state in self.addresses.iter() {
-            match self.config.prefer_family {
-                PreferFamily::Ipv4 if !state.addr.is_ipv4() => continue,
-                PreferFamily::Ipv6 if !state.addr.is_ipv6() => continue,
-                _ => {}
-            }
-            candidates.push(state.addr);
-        }
-        if candidates.is_empty() {
-            return self.addresses.first().map(|s| s.addr);
-        }
-        let idx = rand::random_range(0..candidates.len());
-        Some(candidates[idx])
     }
 
     // ── Address feedback ──────────────────────────────────────────
@@ -502,7 +488,7 @@ impl ConnectionPool {
                 return None;
             }
 
-            let addr = self.pick_addr()?;
+            let addr = self.pick_addr(false)?;
 
             match super::conn::build_cloneable(
                 &self.factory,
@@ -610,7 +596,7 @@ impl ConnectionPool {
             if self.active_count.load(Ordering::Relaxed) >= self.max_size {
                 break;
             }
-            let addr = match self.pick_addr() {
+            let addr = match self.pick_addr(true) {
                 Some(a) => a,
                 None => break,
             };

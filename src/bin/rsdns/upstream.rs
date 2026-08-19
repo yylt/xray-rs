@@ -48,7 +48,6 @@
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hickory_proto::op::{DnsRequest, DnsRequestOptions, Message};
-use hickory_proto::rr::{DNSClass, Name};
 use std::io;
 use std::sync::Arc;
 
@@ -147,13 +146,12 @@ impl UpstreamGroup {
     }
 
     async fn query_parallel(&self, msg: &Message) -> io::Result<Message> {
-        let msg_arc = Arc::new(msg.clone());
         let mut futs: FuturesUnordered<_> = self
             .clients
             .iter()
             .map(|client| {
                 let client = client.clone();
-                let m = msg_arc.clone();
+                let m = msg.clone();
                 async move { client.query(&m).await }
             })
             .collect();
@@ -177,13 +175,7 @@ impl UpstreamGroup {
     ///
     /// Used by the serve-expired background refresh path.
     pub async fn query_bg(&self, cache_key: &super::cache::CacheKey) -> io::Result<Message> {
-        let mut msg = Message::new(0, hickory_proto::op::MessageType::Query, hickory_proto::op::OpCode::Query);
-        let mut q = hickory_proto::op::Query::new();
-        q.set_name(Name::from_utf8(&cache_key.name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
-        q.set_query_type(cache_key.qtype);
-        q.set_query_class(DNSClass::IN);
-        msg.queries.push(q);
-        msg.metadata.recursion_desired = true;
+        let msg = super::server::make_query_msg(&cache_key.name, cache_key.qtype)?;
         self.query(&msg).await
     }
 }
