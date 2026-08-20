@@ -20,4 +20,4 @@ Cargo.lock
 # E2E test build artifacts (go build output in tests/e2e/)
 tests/e2e/test_runner
 tests/e2e/e2e
-
+benchmark-results/

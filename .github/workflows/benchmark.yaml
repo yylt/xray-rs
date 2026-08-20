@@ -33,9 +33,9 @@ on:
         required: false
         default: "30s"
       protocols:
-        description: "要测试的上游协议，逗号分隔（udp,dot,doh,doh3）"
+        description: "要测试的上游协议，逗号分隔（udp,tcp,dot,doh,doh3,quic）"
         required: false
-        default: "udp,dot,doh,doh3"
+        default: "udp,tcp,dot,doh,doh3,quic"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -45,13 +45,13 @@ env:
   RSDNS_PORT: 15353
   BENCH_DURATION: ${{ inputs.duration || '30s' }}
   BENCH_CONCURRENCY: ${{ inputs.concurrency || '64' }}
-  BENCH_PROTOCOLS: ${{ inputs.protocols || 'udp,dot,doh,doh3' }}
+  BENCH_PROTOCOLS: ${{ inputs.protocols || 'udp,tcp,dot,doh,doh3,quic' }}
   DNSPYRE_VERSION: v3.12.0
   ARTIFACT_DIR: benchmark-results
 
 jobs:
   benchmark:
-    name: rsdns benchmark (UDP/DoT/DoH/DoH3)
+    name: rsdns benchmark for many protocols
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
