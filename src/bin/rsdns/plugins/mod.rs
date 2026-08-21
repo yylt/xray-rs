@@ -19,4 +19,5 @@ pub mod hosts;
 pub mod logs;
 pub mod metrics;
 pub mod rules;
+pub mod speed;
 pub mod util;

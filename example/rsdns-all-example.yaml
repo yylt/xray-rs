@@ -32,6 +32,7 @@ groups:
     domains:
       - cloudflare.com
     skip_cache: true
+    # skip_speed: true   # also skip the speed plugin's latency sorting
     # https://... source + auto_reload:
     # remote: https://raw.example.com/domains.txt
     # auto_reload: 300
@@ -165,6 +166,21 @@ rules:
 # Output is always stdout (written directly via tokio async I/O); no file or flush settings.
 log:
   format: '{remote}:{port} {name} [{type}] {rcode} {action} {duration}'
+
+# Speed plugin (optional): latency-orders A/AAAA answers by TCP connect RTT.
+# Disabled by default — set enable: true to turn it on.
+#   type:          probe type, "syn" (default)
+#   port:          probe destination port, 443 (default)
+#   family:        record family to sort: ANY (default) / A / AAAA; a query
+#                  type only participates when it matches (A matches A/ANY,
+#                  AAAA matches AAAA/ANY)
+#   timeout:       per-IP probe timeout (bare number = seconds, or "500ms")
+speed:
+  enable: false
+  type: syn
+  port: 443
+  family: ANY
+  timeout: 1s
 
 # Prometheus metrics endpoint (optional).  Registered metrics:
 #   rsdns_logs_*, rsdns_hosts_*, rsdns_groups_*, rsdns_cache_*,

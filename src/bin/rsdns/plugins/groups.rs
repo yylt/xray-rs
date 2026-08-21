@@ -42,6 +42,7 @@ struct GroupTrie {
 struct GroupState {
     name: String,
     skip_cache: bool,
+    skip_speed: bool,
     auto_reload: Option<u64>,
     inline: Vec<String>,
     remote: Vec<GroupSource>,
@@ -74,6 +75,7 @@ impl GroupState {
         Self {
             name: cfg.name.clone(),
             skip_cache: cfg.skip_cache,
+            skip_speed: cfg.skip_speed,
             auto_reload: cfg.auto_reload,
             inline,
             remote,
@@ -331,6 +333,9 @@ impl Groups {
                 if state.skip_cache {
                     ctx.skip_cache = true;
                 }
+                if state.skip_speed {
+                    ctx.skip_speed = true;
+                }
                 if let Some(m) = self.metrics.get() {
                     m.hit_total.with_label_values(&[&state.name]).inc();
                 }
@@ -386,6 +391,7 @@ mod tests {
             ],
             auto_reload: Some(60),
             skip_cache: true,
+            skip_speed: true,
         };
         let state = GroupState::build_from(&cfg);
         assert_eq!(state.inline, vec!["inline.example".to_string()]);
@@ -394,6 +400,7 @@ mod tests {
         assert!(matches!(state.remote[1], GroupSource::Https(_)));
         assert_eq!(state.auto_reload, Some(60));
         assert!(state.skip_cache);
+        assert!(state.skip_speed);
     }
 
     #[test]
