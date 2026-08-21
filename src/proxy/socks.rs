@@ -531,6 +531,10 @@ impl Proxy {
             loop {
                 match tcp_listener.accept().await {
                     Ok((stream, peer_addr)) => {
+                        if let Err(e) = stream.set_nodelay(true) {
+                            log::error!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+                            continue;
+                        }
                         let tr_stream = transport::TrStream::Tcp(stream);
                         let peer_address = Address::Inet(peer_addr);
 
@@ -658,7 +662,7 @@ impl Proxy {
 /// and UDP data channel share a port.
 pub async fn bind_shared_port(addr: &SocketAddr) -> std::io::Result<(TcpListener, UdpSocket)> {
     // Bind TCP first
-    let tcp_listener = TcpListener::bind(addr).await?;
+    let tcp_listener = crate::transport::bind_tcp_listener(*addr)?;
     let tcp_addr = tcp_listener.local_addr()?;
 
     // Bind UDP to same port

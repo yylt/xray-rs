@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
@@ -426,7 +426,7 @@ impl Xhttp {
         addr: &std::net::SocketAddr,
     ) -> IoResult<BoxStream<(super::TrStream, Address), std::io::Error>> {
         let (stream_tx, stream_rx) = mpsc::channel(DEFAULT_CHANNEL_SERVER_CAPACITY);
-        let listener = TcpListener::bind(addr).await?;
+        let listener = super::bind_tcp_listener(*addr)?;
         let pending = self.pending_streams.clone();
         let stx = stream_tx.clone();
         let base_path = self.settings.path.clone();

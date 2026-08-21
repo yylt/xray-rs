@@ -12,7 +12,6 @@ use hyper::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 use crate::app::ConnectionSink;
 use crate::common::stats::SharedStats;
@@ -50,11 +49,15 @@ impl ApiInbound {
 
     /// Run the API server (daemon mode)
     pub async fn run(self, addr: SocketAddr) -> io::Result<()> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = crate::transport::bind_tcp_listener(addr)?;
         log::info!("API server listening on {}", addr);
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, peer_addr) = listener.accept().await?;
+            if let Err(e) = stream.set_nodelay(true) {
+                log::error!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+                continue;
+            }
             let io = hyper_util::rt::TokioIo::new(stream);
 
             // Create service function for this connection

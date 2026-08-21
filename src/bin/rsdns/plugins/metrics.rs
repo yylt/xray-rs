@@ -14,7 +14,6 @@ use hyper::{Request, Response, StatusCode};
 use log::{info, warn};
 use serde::Deserialize;
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::metrics::MetricsRegistry;
@@ -55,12 +54,16 @@ pub async fn serve_metrics(cfg: MetricsConfig, registry: MetricsRegistry) -> std
         .bind
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad bind: {}", e)))?;
-    let listener = TcpListener::bind(addr).await?;
+    let listener = xray_rs::transport::bind_tcp_listener(addr)?;
     info!("metrics listening on http://{}", addr);
     let path = cfg.path.clone();
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("metrics accept from {} failed to set TCP_NODELAY: {}", peer_addr, e);
+            continue;
+        }
         let io = hyper_util::rt::TokioIo::new(stream);
         let registry = registry.clone();
         let path = path.clone();
