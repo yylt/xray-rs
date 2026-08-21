@@ -2,24 +2,23 @@
 
 ## Build
 
+使用 make 目标构建（debug），**不主动构建 release 版本**——release 由 CI/release 流程负责。
+
 ```bash
-cargo build -r                         # release (default features: aws-lc-rs, mimalloc, tun)
-cargo build --no-default-features      # no tun/mimalloc/aws-lc-rs
-cargo run -- run -c config.yaml        # run proxy
-cargo run --bin rsdns -- -c rsdns.yaml # run DNS server
+make build-xray   # debug build xray-rs binary
+make build-rsdns  # debug build rsdns binary
 ```
 
-- `target/release/xray-rs` and `target/release/rsdns` are the two binaries.
-- Cross-compilation uses [`cross`](https://github.com/cross-rs/cross); see `Cross.toml` for target images.
+- `target/release/xray-rs` and `target/release/rsdns` are the two binaries (built by CI/release, not by hand).
 
 ## Lint & Test
 
 ```bash
-cargo fmt    # edition = 2024, max_width = 120, fn_call_width = 80
-cargo test   # runs unit tests
+make ci      # run fmt + clippy + check + test
 ```
 
-- E2E tests live in `tests/e2e/` and require **Go** + a pre-built `xray-rs` binary at `target/release/xray-rs`. Run: `./tests/e2e/run_tests.sh`.
+- `make ci` 是本地完整校验入口（fmt → clippy → workspace check → test），改动后必须通过。
+- 不主动做 smoke test / 手工起服务验证；只需通过 `make ci`。
 
 ## Code Generation
 
@@ -43,36 +42,20 @@ Do **not** hand-edit `src/generated/grpc_generated.rs`.
 
 ## rsdns (DNS Binary)
 
-- Source: `src/bin/rsdns/`. Entry: `main.rs`. Modules: `config.rs`, `server.rs`, `rule.rs`, `upstream.rs`, `conn.rs`, `cache.rs`, `hosts.rs`, `factory.rs`, `pool.rs`.
-- **Listeners (inbound)**: UDP (`ip:port`) and TCP (`tcp://ip:port`), configured via `bind[]`.
+- Source: `src/bin/rsdns/`. Entry: `main.rs`. Modules: `config.rs`, `server.rs`, `query.rs`, `metrics.rs`, `plugins/` (stages), `upstream/` (connection + pool + groups).
+- **Listeners (inbound)**: UDP (`ip:port`) and TCP (`tcp://ip:port`), configured via `binds[]`.
 - **Upstream protocols (outbound)**: plain UDP/TCP, DoT (`tls://`), DoH (`https://`), DoH3 (`h3://`), DoQ (`quic://`).
-- **Query pipeline** (`server.rs:do_query`): hosts → cache → rules → upstream; fallback returns NXDOMAIN.
-  - **Cache records**: A, AAAA, CNAME, MX, TXT, and HTTPS are cached. NXDOMAIN is negatively cached.
-- **Rules**: ordered by priority. Actions: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional cache bypass/TTL override).
-- **Cache**: LRU with configurable capacity, TTL clamping, serve-expired with background refresh.
+- **Query pipeline** (`server.rs:handle_query`): fixed stages `hosts → groups → cache → rules`; `upstream` is **not** a stage — it is assembled at startup into `upstream::Upstreams` (a concrete type holding the named groups) and held directly by the `rules` stage for forward/cname; fallback returns NXDOMAIN/SERVFAIL.
+  - **Cache records**: A, AAAA, CNAME, MX, TXT, and HTTPS are cached. NXDOMAIN is negatively cached. Stale hits (serve_expired) continue through the pipeline so rules can replace them with a fresh upstream answer. Hosts and block responses are never cached.
+- **Rules**: ordered by priority. Actions: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override).
+- **Cache**: LRU with configurable capacity, TTL clamping, serve-expired with in-pipeline refresh.
 - **Connection pool**: adaptive weighted address selection, cooldown on failure, SOA health probes, per-address-family preference.
-- Example config: `example/rsdns-all-example.yaml` (covers all features).
-- E2E tests: `tests/e2e/test_rsdns.go`, `tests/e2e/run_rsdns_tests.sh`.
-
-## Platform Notes
-
-- Unix domain sockets: only behind `#[cfg(unix)]` in `src/transport/raw.rs`.
-- `tun` feature: gated behind `#[cfg(feature = "tun")]` in `src/proxy/tun.rs`. Default on.
-- Windows: builds with `--no-default-features --features mimalloc,ring --profile release-with-symbols` (unix sockets + tun unavailable).
-
-## Release
-
-CI (`release.yaml`) builds 4 targets: x86_64-linux-musl, aarch64-linux-musl, aarch64-linux-android, x86_64-windows-msvc. Release packaging uses goreleaser with a Go stub (`goreleaser.go`) and `goreleaser_hook.sh` to swap in Rust-built binaries.
-
-## Config Reference
-
-See `example/` directory for working configs: TCP/Trojan, gRPC/Trojan, gRPC+TLS/Trojan, WebSocket/Trojan, load-balancer with fallback.
-
-## Testing
-
-- Unit tests: `cargo test` (Rust native, spread across `src/`).
-- E2E tests: live under `tests/e2e/`, require **Go** + a pre-built `xray-rs` binary at `target/release/xray-rs`. Run: `./tests/e2e/run_tests.sh`.
 
 ## Rules
 
 - **No annotation bypasses**: Do not suppress warnings/errors with `#[allow(...)]`, `#[cfg(...)]` hacks, or other annotation-based workarounds. Fix the root cause instead.
+- **先思考** — 明确假设。如有疑问，先问。
+- **简洁** — 最少代码。不为单次使用引入抽象。不添加未请求的功能。
+- **精确** — 只动必须改的。保持现有风格。只删自己留下的孤儿代码。
+- **目标驱动** — 先定义成功标准。验证后再声明完成。
+- **提案先行** — 任何重大修改（新增功能、API 变更、架构调整等）必须先提交提案文档到 `docs/design/` 进行审阅，审阅通过后再进行实现。

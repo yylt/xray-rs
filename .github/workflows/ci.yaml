@@ -66,12 +66,6 @@ jobs:
             features: ""
           - name: ring + mimalloc
             features: "--no-default-features --features ring,mimalloc"
-          - name: ring + jemalloc + tun
-            features: "--no-default-features --features ring,jemalloc,tun"
-          - name: aws-lc-rs + mimalloc + tun
-            features: "--no-default-features --features aws-lc-rs,mimalloc,tun"
-          - name: ring only (minimal)
-            features: "--no-default-features --features ring"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

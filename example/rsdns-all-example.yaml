@@ -1,90 +1,79 @@
-# rsdns example config — full feature set
+# rsdns example config — full feature set (plugin pipeline)
 # Usage: rsdns --config example/rsdns-all-example.yaml
+#
+# Top-level sections: binds[] / groups[] / upstreams[] + plugin sections
+# (hosts / cache / rules / log / metrics).  Each plugin owns its own config
+# section and initializes from it.
 
 # Listen addresses: plain IP:port = UDP, tcp:// prefix = TCP
-bind:
+binds:
   - address: "0.0.0.0:14453"          # UDP
   - address: "tcp://0.0.0.0:14453"    # TCP
 
-# Domain groups: name → list of suffixes (supports file: prefix)
+# Domain groups: name + optional domains list (inline), file:// or https://
+# sources, per-group auto_reload, skip_cache.
 groups:
-  ad:
-    - "*.doubleclick.net"
-    - "*.googlesyndication.com"
-    - "*.googleadservices.com"
-    #- "file:/etc/rsdns/ad-block.txt"
-  intranet:
-    - "*.corp.internal"
-    - "*.lan"
-  foo:
-    - foo.com
-    - "*.foo.org"
+  - name: ad
+    domains:
+      - doubleclick.net
+      - googlesyndication.com
+      - googleadservices.com
+    # file: /etc/rsdns/ad-block.txt
+    # auto_reload: 60
+  - name: intranet
+    domains:
+      - corp.internal
+      - lan
+  - name: foo
+    domains:
+      - foo.com
+      - foo.org
+  - name: cdn
+    domains:
+      - cloudflare.com
+    skip_cache: true
+    # https://... source + auto_reload:
+    # remote: https://raw.example.com/domains.txt
+    # auto_reload: 300
 
-# Upstream pools: name → servers or detailed group config.
-# Default mode is serial; mode: parallel opt-in preserves old fan-out behavior.
-# bootstrap=true servers are used only for resolving domain-based upstreams.
-# pool section enables connection pooling with adaptive address selection.
-upstream:
-  bootstrap:
-    servers:
-      - address: 223.5.5.5
-        bootstrap: true
-  default:
+# Upstream pools: named groups of servers.  mode: serial (default) |
+# parallel | random | round_robin.
+# cooldown (optional, per group): "<window>:<errors>:<cooldown>", e.g.
+# "1m:10:10s" = if a server fails 10 times within a 1-minute window, cool it
+# down for 10 seconds (skipped during queries).
+# IP-address servers are used directly and also serve as the bootstrap
+# resolvers for domain-address servers (which are resolved at startup and
+# use all resolved A+AAAA addresses).
+# server_name overrides the TLS SNI / certificate name for DoT/DoH/DoH3/DoQ
+# (defaults to the address host when absent).
+upstreams:
+  - name: bootstrap
     mode: serial
     servers:
-      - address: tls://dot.pub           # TLS — domain resolved via bootstrap, all A+AAAA IPs used
+      - address: 223.5.5.5
+  - name: default
+    mode: round_robin
+    cooldown: "1m:10:10s"
+    servers:
+      - address: tls://dot.pub           # TLS — domain resolved via IP servers, all A+AAAA IPs used
+        server_name: dns.alidns.com
         pool:
-          # DoT is the main target for pool tuning: it benefits most from
-          # multiple long-lived connections and a small warm pool.
-          # Suggested starting point:
-          #   max_size: 8
-          #   min_idle: 2
-          #   health_interval: 60
-          #   connect_timeout: 5
-          #   dns_timeout: 5
-          #   health_check_timeout: 3
-          #   max_consecutive_fail: 3
-          #   cool_down_secs: 30
+          # DoT benefits most from multiple long-lived connections.
           max_size: 8
-          min_idle: 2
           prefer_family: ipv4
           connect_timeout: 3
-          health_check_timeout: 3
-          max_consecutive_fail: 3
-          cool_down_secs: 30
-      - address: https://dns.quad9.net/dns-query  # DoH — domain resolved via bootstrap
+      - address: https://dns.quad9.net/dns-query  # DoH — domain resolved via IP servers
         pool:
-          # DoH already multiplexes well over HTTP/2, so keep the pool small.
-          # Suggested starting point:
-          #   max_size: 2~4
-          #   min_idle: 1
-          #   health_interval: 60
-          #   connect_timeout: 5
-          #   dns_timeout: 5
+          # DoH already multiplexes over HTTP/2; keep the pool small.
           max_size: 4
       - address: tls://1.1.1.1           # TLS with static IP
-  overseas:
+  - name: overseas
     mode: parallel
     servers:
       - address: tls://8.8.8.8
       - address: https://cloudflare-dns.com/dns-query
-        pool:
-          # Same guidance as DoH above.
-          # Small pool, stable warm connection, no need to over-scale.
-          max_size: 4
       - address: h3://mozilla.cloudflare-dns.com/dns-query  # DNS-over-HTTP/3
-        pool:
-          # DoH3 usually needs only a tiny pool because QUIC already carries
-          # concurrent streams. Keep it conservative unless you see saturation.
-          # Suggested starting point:
-          #   max_size: 1~4
-          #   min_idle: 1
-          max_size: 4
-      - address: quic://dns.adguard.com  # DNS-over-QUIC (new protocol support)
-        pool:
-          # DoQ has the same pooling shape as DoH3: keep it small unless the
-          # upstream or your traffic volume clearly needs more parallelism.
-          max_size: 4
+      - address: quic://dns.adguard.com  # DNS-over-QUIC
 
 # Cache configuration
 cache:
@@ -99,69 +88,87 @@ hosts:
   - "127.0.0.1 localhost"
   - "::1       localhost"
   - "192.168.1.1 router.lan"
-  - "0.0.0.0 *.ad-domain.com"     # wildcard: all subdomains → 0.0.0.0
+  - "0.0.0.0 ad-domain.com"        # exact + all subdomains → 0.0.0.0
   - "file:/etc/hosts"
 
-# Rules: matched in order, first hit stops
+# Rules: matched in order, first hit stops.
+# match syntax (no backward compat):
+#   (empty)         → match all
+#   group:{name}    → group reference
+#   {a.com,b.com}   → inline domain set (no braces, comma separated)
 rules:
   # Block ad group with poison (A=0.0.0.0, AAAA=::)
-  - match: ad
+  - match: "group:ad"
     action:
       type: block
       response: poison
 
   # Block with NXDOMAIN
-  - match: "*.banned.example"
+  - match: "banned.example"
     qtype: A
     action:
       type: block
       response: nxdomain
 
   # CNAME rewrite: resolve target via upstream and return its IP
-  # upstream is required; optionally deny certain query types
-  - match: foo
+  - match: "group:foo"
     qtype: ANY
     action:
       type: cname
       target: site.182682.xyz
       ttl: 600
       upstream: default
-      # deny_qtypes: ["AAAA"]
 
-  # Forward intranet to default upstream, skip cache
-  - match: intranet
+  # Forward intranet to default upstream, skip cache (group skip_cache)
+  - match: "group:intranet"
     action:
       type: forward
       upstream: default
-      cache: false
 
   # Forward to overseas upstream with custom TTL
-  - match: "*.google.com"
+  - match: "google.com"
     qtype: A
     action:
       type: forward
       upstream: overseas
       ttl: 60       # rewrite response TTL to 60s
+      max_answers: 5   # cap returned answers (default 5; 0 = no limit)
 
-  # Forward with upstream-original TTL (keep_ttl overrides ttl)
-  - match: "*.github.com"
+  # Forward a CDN group's subdomains (inline suffix match:
+  # cdn.cloudflare.com and below)
+  - match: "cdn.cloudflare.com"
     action:
       type: forward
       upstream: default
-      keep_ttl: true
+
+  # Rewrite: synthesize an A record for the query name, no upstream query.
+  # target is a literal dotted-quad IPv4 or a placeholder template filled
+  # from the match captures (each capture = one octet).
+  #   match "{1}.32.0.2.example.com" + target "{1}.32.0.2" → A <cap1>.32.0.2
+  #   match "{1}.example.com"        + target "10.10.0.0" → A 10.10.0.0
+  - match: "{1}.32.0.2.example.com"
+    qtype: A
+    action:
+      type: rewrite
+      target: "{1}.32.0.2"
+      ttl: 300
 
   # Default catch-all
-  - match: "*"
+  - match: ""
     action:
       type: forward
       upstream: default
-      keep_ttl: true
       deny_qtypes: ["HTTPS"]
 
 # Query log (optional): per-query access log with template placeholders.
 # Placeholders: {type} {name} {proto} {remote} {action} {port} {size} {duration} {rcode} {answers}
+# Output is always stdout (written directly via tokio async I/O); no file or flush settings.
 log:
-  # file: /var/log/rsdns-query.log   # unset = stdout
   format: '{remote}:{port} {name} [{type}] {rcode} {action} {duration}'
-  # buf_size: 16384                  # bytes; write when accumulated log reaches this size
-  # flush_interval_secs: 5           # seconds; also write on this interval even if below buf_size
+
+# Prometheus metrics endpoint (optional).  Registered metrics:
+#   rsdns_logs_*, rsdns_hosts_*, rsdns_groups_*, rsdns_cache_*,
+#   rsdns_rules_*, rsdns_upstream_*, rsdns_upstream_pool_*
+metrics:
+  bind: "0.0.0.0:9153"
+  path: /metrics

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # rsdns 性能基准脚本
 #
-# 对 rsdns 做并发性能测试，对比 UDP / DoT / DoH / DoH3 四种上游格式。
+# 对 rsdns 做并发性能测试，对比 UDP / TCP / DoT / DoH / DoH3 / DoQ 多种上游格式；
+# 每个上游用 dnspyre 分别以 UDP 与 TCP 两种客户端传输（--tcp）访问 rsdns，
+# 并在表头/表格中标注每个上游的实际地址。
 # 设计文档: docs/design/2026-08-20-rsdns-benchmark.md
 #
 # 用法:
@@ -9,35 +11,53 @@
 #       --rsdns <path-to-rsdns-binary> \
 #       --dnspyre <path-to-dnspyre-binary> \
 #       [--domains <domain-list-file>] \
-#       [--duration 30s] [--concurrency 64] \
+#       [--duration 30s] [--concurrency 32] \
 #       [--protocols udp,dot,doh,doh3] \
 #       [--port 15353] [--outdir benchmark-results]
 #
 # 输出:
-#   <outdir>/result-<proto>.json   dnspyre 原始 JSON
-#   <outdir>/result-<proto>.csv    dnspyre 直方图 CSV
-#   <outdir>/results.json          汇总 JSON
+#   <outdir>/result-<proto>-<udp|tcp>.json   dnspyre 原始 JSON
+#   <outdir>/result-<proto>-<udp|tcp>.csv    dnspyre 直方图 CSV
+#   <outdir>/results.json                    汇总 JSON
 #   stdout 打印 Markdown 摘要表格
 #
 # 说明:
 #   - 通过 cache.size: 0（moka 容量 0 = map 整体禁用）彻底关闭缓存，
 #     规则再叠加 cache: false 双保险；查询路径不触达缓存。
-#   - 客户端统一用 UDP 并发访问 rsdns，rsdns 上游依次切换四种协议。
+#   - rsdns 同时监听 UDP 与 TCP（同端口），dnspyre 分别用 UDP / TCP（--tcp）
+#     客户端传输测试；上游依次切换各种协议。
 #   - 任一协议失败不影响其余协议，失败行标记 ❌。
+
 set -euo pipefail
 
 RSDNS_BIN=""
 DNSPYRE_BIN=""
 DOMAINS_FILE=""
 DURATION="30s"
-CONCURRENCY="64"
-PROTOCOLS="udp,dot,doh,doh3"
+CONCURRENCY="32"
+PROTOCOLS="doh,doh3,udp,tcp,dot,quic"
 PORT="15353"
 OUTDIR="benchmark-results"
+# dnspyre 客户端传输：UDP（默认）与 TCP（--tcp）
+CLIENT_TRANSPORTS="udp tcp"
 
 usage() {
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
+}
+
+# 返回各上游协议对应的上游地址（供表头/表格展示）
+# dns.alidns.com, dns.google, 1.1.1.1
+upstream_of() {
+  case "$1" in
+    udp)  echo "udp://dns.google" ;;
+    tcp)  echo "tcp://dns.google" ;;
+    dot)  echo "tls://dns.google" ;;
+    doh)  echo "https://dns.google/dns-query" ;;
+    doh3) echo "h3://dns.google/dns-query" ;;
+    quic) echo "quic://dns.google:853" ;;
+    *)    echo "" ;;
+  esac
 }
 
 while [ $# -gt 0 ]; do
@@ -76,44 +96,44 @@ PROTO_LIST="$(echo "$PROTOCOLS" | tr ',' ' ')"
   echo "## rsdns benchmark 结果"
   echo ""
   echo "- rsdns: \`$RSDNS_BIN\`"
-  echo "- 并发: \`$CONCURRENCY\`, 时长/协议: \`$DURATION\`"
+  echo "- 并发: \`$CONCURRENCY\`, 时长/上游/传输: \`$DURATION\`"
   if [ -n "$DOMAINS_FILE" ]; then
-    echo "- 负载: dnspyre / @$DOMAINS_FILE, qtype=A, 缓存已禁用（cache.size: 0 + 规则 cache: false）"
+    echo "- 负载: dnspyre / @$DOMAINS_FILE, qtype=A, 缓存已禁用"
   else
-    echo "- 负载: dnspyre / example.com, qtype=A, 缓存已禁用（cache.size: 0 + 规则 cache: false）"
+    echo "- 负载: dnspyre / example.com, qtype=A, 缓存已禁用"
   fi
+  echo "- dnspyre 客户端传输: UDP 与 TCP（--tcp）分别压测"
   echo ""
-  echo "| 协议 | QPS | 平均(ms) | p50(ms) | p95(ms) | p99(ms) | 最大(ms) | IO错误 | DNS错误 | 状态 |"
-  echo "|------|-----:|--------:|--------:|--------:|--------:|---------:|-------:|--------:|------|"
+  echo "| 上游协议 | 上游地址 | 客户端传输 | QPS | 平均(ms) | p50(ms) | p95(ms) | p99(ms) | 最大(ms) | IO错误 | DNS错误 | 状态 |"
+  echo "|---------|---------|-----------|-----:|--------:|--------:|--------:|--------:|---------:|-------:|--------:|------|"
 }
 
 ROW_JSON='{}'
 for proto in $PROTO_LIST; do
-  case "$proto" in
-    udp)  upstream="223.5.5.5" ;;
-    dot)  upstream="tls://1.1.1.1" ;;
-    doh)  upstream="https://1.1.1.1/dns-query" ;;
-    doh3) upstream="h3://1.1.1.1/dns-query" ;;
-    *)    echo "::warning::unknown protocol $proto, skipped" >&2; continue ;;
-  esac
+  upstream="$(upstream_of "$proto")"
+  if [ -z "$upstream" ]; then
+    echo "::warning::unknown protocol $proto, skipped" >&2
+    continue
+  fi
 
   cfg="$OUTDIR/rsdns-$proto.yaml"
   cat > "$cfg" <<YAML
-bind:
+binds:
   - address: "0.0.0.0:${PORT}"
-upstream:
-  bootstrap:
+  - address: "tcp://0.0.0.0:${PORT}"
+upstreams:
+  - name: bootstrap
     servers:
       - address: 223.5.5.5
-        bootstrap: true
-  default:
+  - name: default
     servers:
       - address: ${upstream}
+        pool:
+          prefer_family: ipv4
 cache:
   size: 0
 rules:
-  - match: "*"
-    action:
+  - action:
       type: forward
       upstream: default
       cache: false
@@ -123,12 +143,12 @@ YAML
   "$RSDNS_BIN" --config "$cfg" > "$OUTDIR/rsdns-$proto.log" 2>&1 &
   RSDNS_PID=$!
 
-  # 就绪探测：最多 30s，每 1s 一次
+  # 就绪探测：最多 30s，每 1s 一次（UDP）
   READY=0
   for _ in $(seq 1 30); do
     if "$DNSPYRE_BIN" --server "127.0.0.1:${PORT}" \
          --number 1 --concurrency 1 --type A \
-         --json --silent --color false example.com >/dev/null 2>&1; then
+         --json --silent example.com >/dev/null 2>&1; then
       READY=1
       break
     fi
@@ -140,49 +160,55 @@ YAML
     kill "$RSDNS_PID" 2>/dev/null || true
     wait "$RSDNS_PID" 2>/dev/null || true
     ROW_JSON=$(echo "$ROW_JSON" | jq --arg p "$proto" '.[$p] = {"status":"failed"}')
-    printf "| %s | - | - | - | - | - | - | - | - | - | ❌ |\n" "$proto"
+    printf "| %s | %s | - | - | - | - | - | - | - | - | - | ❌ |\n" "$proto" "$upstream"
     echo "::endgroup::" >&2
     continue
   fi
 
-  set +e
-  "$DNSPYRE_BIN" \
-    --server "127.0.0.1:${PORT}" \
-    --duration "$DURATION" \
-    --concurrency "$CONCURRENCY" \
-    --type A \
-    --json \
-    --csv "$OUTDIR/result-$proto.csv" \
-    --color false \
-    $QUERY_ARG > "$OUTDIR/result-$proto.json" 2>"$OUTDIR/dnspyre-$proto.err"
-  RC=$?
-  set -e
+  # 同一上游分别用 UDP / TCP 客户端传输压测
+  for transport in $CLIENT_TRANSPORTS; do
+    transport_flag=()
+    [ "$transport" = "tcp" ] && transport_flag=(--tcp)
+    suffix="$proto-$transport"
+    set +e
+    "$DNSPYRE_BIN" \
+      --server "127.0.0.1:${PORT}" \
+      --duration "$DURATION" \
+      --concurrency "$CONCURRENCY" \
+      --type A \
+      --json \
+      --csv "$OUTDIR/result-$suffix.csv" \
+      "${transport_flag[@]}" \
+      $QUERY_ARG > "$OUTDIR/result-$suffix.json" 2>"$OUTDIR/dnspyre-$suffix.err"
+    RC=$?
+    set -e
+
+    if [ "$RC" -ne 0 ] || ! jq -e . "$OUTDIR/result-$suffix.json" >/dev/null 2>&1; then
+      echo "::error::$suffix dnspyre 失败 (rc=$RC): $(tail -2 "$OUTDIR/dnspyre-$suffix.err" || true)" >&2
+      ROW_JSON=$(echo "$ROW_JSON" | jq --arg p "$proto" --arg t "$transport" '.[$p][$t] = {"status":"failed"}')
+      printf "| %s | %s | %s | - | - | - | - | - | - | - | - | ❌ |\n" "$proto" "$upstream" "$transport"
+      continue
+    fi
+
+    # dnspyre --json 字段: queriesPerSecond, latencyStats.{minMs,meanMs,maxMs,p50Ms,p95Ms,p99Ms},
+    # totalIOErrors, totalErrorResponses
+    R=$(jq -r '
+      [.queriesPerSecond,
+       .latencyStats.meanMs, .latencyStats.p50Ms, .latencyStats.p95Ms, .latencyStats.p99Ms,
+       .latencyStats.maxMs, .totalIOErrors, .totalErrorResponses] | @tsv
+      ' "$OUTDIR/result-$suffix.json")
+    read -r QPS AVG P50 P95 P99 MAX IOERR DNSERR <<< "$R"
+    printf "| %s | %s | %s | %.1f | %.2f | %.2f | %.2f | %.2f | %.2f | %s | %s | ✅ |\n" \
+      "$proto" "$upstream" "$transport" "$QPS" "$AVG" "$P50" "$P95" "$P99" "$MAX" "$IOERR" "$DNSERR"
+
+    ROW_JSON=$(echo "$ROW_JSON" | jq --arg p "$proto" --arg t "$transport" \
+      --arg qps "$QPS" --arg avg "$AVG" --arg p50 "$P50" --arg p95 "$P95" --arg p99 "$P99" \
+      --arg max "$MAX" --arg io "$IOERR" --arg dns "$DNSERR" \
+      '.[$p][$t] = {"status":"ok","qps":($qps|tonumber),"avg_ms":($avg|tonumber),"p50_ms":($p50|tonumber),"p95_ms":($p95|tonumber),"p99_ms":($p99|tonumber),"max_ms":($max|tonumber),"io_errors":($io|tonumber),"dns_errors":($dns|tonumber)}')
+  done
+
   kill "$RSDNS_PID" 2>/dev/null || true
   wait "$RSDNS_PID" 2>/dev/null || true
-
-  if [ "$RC" -ne 0 ] || ! jq -e . "$OUTDIR/result-$proto.json" >/dev/null 2>&1; then
-    echo "::error::$proto dnspyre 失败 (rc=$RC): $(tail -2 "$OUTDIR/dnspyre-$proto.err" || true)" >&2
-    ROW_JSON=$(echo "$ROW_JSON" | jq --arg p "$proto" '.[$p] = {"status":"failed"}')
-    printf "| %s | - | - | - | - | - | - | - | - | - | ❌ |\n" "$proto"
-    echo "::endgroup::" >&2
-    continue
-  fi
-
-  # dnspyre --json 字段: queriesPerSecond, latencyStats.{minMs,meanMs,maxMs,p50Ms,p95Ms,p99Ms},
-  # totalIOErrors, totalErrorResponses
-  R=$(jq -r '
-    [.queriesPerSecond,
-     .latencyStats.meanMs, .latencyStats.p50Ms, .latencyStats.p95Ms, .latencyStats.p99Ms,
-     .latencyStats.maxMs, .totalIOErrors, .totalErrorResponses] | @tsv
-    ' "$OUTDIR/result-$proto.json")
-  read -r QPS AVG P50 P95 P99 MAX IOERR DNSERR <<< "$R"
-  printf "| %s | %.1f | %.2f | %.2f | %.2f | %.2f | %.2f | %s | %s | ✅ |\n" \
-    "$proto" "$QPS" "$AVG" "$P50" "$P95" "$P99" "$MAX" "$IOERR" "$DNSERR"
-
-  ROW_JSON=$(echo "$ROW_JSON" | jq --arg p "$proto" \
-    --arg qps "$QPS" --arg avg "$AVG" --arg p50 "$P50" --arg p95 "$P95" --arg p99 "$P99" \
-    --arg max "$MAX" --arg io "$IOERR" --arg dns "$DNSERR" \
-    '.[$p] = {"status":"ok","qps":($qps|tonumber),"avg_ms":($avg|tonumber),"p50_ms":($p50|tonumber),"p95_ms":($p95|tonumber),"p99_ms":($p99|tonumber),"max_ms":($max|tonumber),"io_errors":($io|tonumber),"dns_errors":($dns|tonumber)}')
   echo "::endgroup::" >&2
 done
 

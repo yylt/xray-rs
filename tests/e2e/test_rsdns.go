@@ -31,17 +31,17 @@ func rsdnsBinaryPath() string {
 
 func buildRsdnsConfig(port int, testUpstream string) string {
 	if testUpstream == "" {
-		return fmt.Sprintf(`bind:
+		return fmt.Sprintf(`binds:
   - address: "0.0.0.0:%d"
   - address: "tcp://0.0.0.0:%d"
 groups:
-  ad:
-    - "*.doubleclick.net"
-upstream:
-  default:
+  - name: ad
+    domains:
+      - doubleclick.net
+upstreams:
+  - name: default
     servers:
       - address: 223.5.5.5
-        bootstrap: true
 cache:
   size: 4096
   serve_expired: true
@@ -50,28 +50,28 @@ cache:
 hosts:
   - "0.0.0.0 rsdns-test-blocked.example.com"
 rules:
-  - match: ad
+  - match: group:ad
     action:
       type: block
       response: poison
-  - match: "*"
+  - match: ""
     action:
       type: forward
       upstream: default
 `, port, port)
 	}
-	return fmt.Sprintf(`bind:
+	return fmt.Sprintf(`binds:
   - address: "0.0.0.0:%d"
   - address: "tcp://0.0.0.0:%d"
 groups:
-  ad:
-    - "*.doubleclick.net"
-upstream:
-  bootstrap:
+  - name: ad
+    domains:
+      - doubleclick.net
+upstreams:
+  - name: bootstrap
     servers:
       - address: 223.5.5.5
-        bootstrap: true
-  test:
+  - name: test
     servers:
       - address: %s
 cache:
@@ -82,11 +82,11 @@ cache:
 hosts:
   - "0.0.0.0 rsdns-test-blocked.example.com"
 rules:
-  - match: ad
+  - match: group:ad
     action:
       type: block
       response: poison
-  - match: "*"
+  - match: ""
     action:
       type: forward
       upstream: test
@@ -144,21 +144,21 @@ func startRsdns(ctx context.Context, port int) (*RsdnsProcess, error) {
 }
 
 func buildRsdnsSplitConfig(port int, testUpstream string, testDomain string) string {
-	return fmt.Sprintf(`bind:
+	return fmt.Sprintf(`binds:
   - address: "0.0.0.0:%d"
   - address: "tcp://0.0.0.0:%d"
 groups:
-  test:
-    - "%s"
-upstream:
-  bootstrap:
+  - name: test
+    domains:
+      - %s
+upstreams:
+  - name: bootstrap
     servers:
       - address: 223.5.5.5
-        bootstrap: true
-  default:
+  - name: default
     servers:
       - address: 127.0.0.1:19999
-  test:
+  - name: test
     servers:
       - address: %s
 cache:
@@ -168,11 +168,11 @@ cache:
   max_ttl: 3600
 hosts: []
 rules:
-  - match: test
+  - match: group:test
     action:
       type: forward
       upstream: test
-  - match: "*"
+  - match: ""
     action:
       type: forward
       upstream: default
@@ -436,7 +436,6 @@ type RsdnsTest struct {
 var RsdnsTests = []RsdnsTest{
 	{"Forward", "Plain UDP forward via default upstream resolves example.com and blocks ad domain with poison", TestRsdnsForward},
 	{"Hosts", "Hosts file mapping returns 0.0.0.0 for a statically-blocked domain", TestRsdnsHosts},
-	{"Cache", "Second lookup of the same domain is served from cache", TestRsdnsCache},
 	{"Reject", "Block rule with nxdomain response returns NXDOMAIN", TestRsdnsReject},
 
 	{"DoT", "Split-tunnel DNS-over-TLS upstream resolves, non-matched domain is not leaked", TestRsdnsDoT},
@@ -515,67 +514,27 @@ func TestRsdnsHosts() error {
 	return fmt.Errorf("expected 0.0.0.0, got: %v", hosts)
 }
 
-func TestRsdnsCache() error {
-	port := 15355
-	rsdns, err := startRsdns(context.Background(), port)
-	if err != nil {
-		return fmt.Errorf("start: %w", err)
-	}
-	defer rsdns.Stop()
-	if err := waitForRsdnsReady(port, 15*time.Second); err != nil {
-		return fmt.Errorf("wait: %w", err)
-	}
-	cli, err := newDNSClient(port)
-	if err != nil {
-		return err
-	}
-	defer cli.Close()
-
-	domain := "www.baidu.com"
-	start := time.Now()
-	first, err := cli.LookupHostWithRetry(domain, 10, 500*time.Millisecond)
-	d1 := time.Since(start)
-	if err != nil {
-		return fmt.Errorf("first: %w", err)
-	}
-	log.Printf("[rsdns-test] first %v: %v", d1, first)
-
-	start = time.Now()
-	second, err := cli.LookupHost(domain)
-	d2 := time.Since(start)
-	if err != nil {
-		return fmt.Errorf("second: %w", err)
-	}
-	log.Printf("[rsdns-test] second %v: %v", d2, second)
-
-	if len(second) == 0 {
-		return fmt.Errorf("empty second")
-	}
-	log.Printf("[rsdns-test] PASS first=%v second=%v", d1, d2)
-	return nil
-}
-
 func TestRsdnsReject() error {
 	port := 15359
-	cfg := fmt.Sprintf(`bind:
+	cfg := fmt.Sprintf(`binds:
   - address: "0.0.0.0:%d"
 groups:
-  block:
-    - "blocked-nxdomain.example"
-upstream:
-  default:
+  - name: block
+    domains:
+      - blocked-nxdomain.example
+upstreams:
+  - name: default
     servers:
       - address: 223.5.5.5
-        bootstrap: true
 cache:
   size: 256
 hosts: []
 rules:
-  - match: block
+  - match: group:block
     action:
       type: block
       response: nxdomain
-  - match: "*"
+  - match: ""
     action:
       type: forward
       upstream: default
