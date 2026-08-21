@@ -5,31 +5,25 @@
 //! which group the queried name belongs to (first match by config order),
 //! sets `ctx.group` and `ctx.skip_cache`, then continues the pipeline.
 //!
-//! Groups can load domains from inline entries, `file://` paths and
-//! `https://` URLs; groups with remote sources and `auto_reload > 0`
-//! refresh them on a per-group period, atomically swapping the trie.
+//! Groups can load domains from inline entries and `file://` paths.  Each
+//! `file://` source is watched with the `notify` library; on change the
+//! group's trie is rebuilt and atomically swapped.
 
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use log::{info, warn};
+use notify::{EventKind, RecursiveMode, Watcher};
 use parking_lot::RwLock;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::{interval, Interval, MissedTickBehavior};
 
 use xray_rs::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
-use xray_rs::common::tls::default_tls_client_config;
 
 use crate::config::{Config, GroupConfig};
 use crate::metrics::{Counter, Gauge, MetricsRegistry};
 use crate::query::{QueryContext, Step};
 
-/// A remote (reloadable) domain source.
-#[derive(Debug, Clone)]
-enum GroupSource {
-    File(String),
-    Https(String),
-}
+/// A reloadable domain source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupFile(PathBuf);
 
 /// The currently-active trie for one group.
 struct GroupTrie {
@@ -38,31 +32,28 @@ struct GroupTrie {
     entry_count: usize,
 }
 
-/// Per-group state, shared with the reload task via `Arc`.
+/// Per-group state, shared with the watcher task via `Arc`.
 struct GroupState {
     name: String,
     skip_cache: bool,
     skip_speed: bool,
-    auto_reload: Option<u64>,
     inline: Vec<String>,
-    remote: Vec<GroupSource>,
+    files: Vec<GroupFile>,
     /// Active trie (atomically replaced on reload).
     current: RwLock<GroupTrie>,
-    /// Fingerprint of the last successfully loaded remote content.
-    last_remote: parking_lot::Mutex<Option<Vec<String>>>,
+    /// Fingerprint of the last successfully loaded file content.
+    last_files: parking_lot::Mutex<Option<Vec<String>>>,
 }
 
 impl GroupState {
     fn build_from(cfg: &GroupConfig) -> Self {
         let mut inline = Vec::new();
-        let mut remote = Vec::new();
+        let mut files = Vec::new();
         for item in &cfg.domains {
             if let Some(path) = item.strip_prefix("file://") {
-                remote.push(GroupSource::File(path.to_string()));
+                files.push(GroupFile(PathBuf::from(path)));
             } else if let Some(path) = item.strip_prefix("file:") {
-                remote.push(GroupSource::File(path.to_string()));
-            } else if let Some(url) = item.strip_prefix("https://") {
-                remote.push(GroupSource::Https(format!("https://{url}")));
+                files.push(GroupFile(PathBuf::from(path)));
             } else {
                 inline.push(item.trim_start_matches("*.").to_string());
             }
@@ -76,11 +67,10 @@ impl GroupState {
             name: cfg.name.clone(),
             skip_cache: cfg.skip_cache,
             skip_speed: cfg.skip_speed,
-            auto_reload: cfg.auto_reload,
             inline,
-            remote,
+            files,
             current: RwLock::new(initial),
-            last_remote: parking_lot::Mutex::new(None),
+            last_files: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -101,7 +91,7 @@ fn parse_domain_lines(content: &str, out: &mut Vec<String>) {
     }
 }
 
-/// 用内联域名 + 远程域名构建一张组 trie。
+/// 用内联域名 + 文件域名构建一张组 trie。
 fn build_group_trie(inline: &[String], remote: &[String], version: u64) -> GroupTrie {
     let mut builder = DomainSuffixTrieBuilder::new();
     let mut count = 0usize;
@@ -121,68 +111,19 @@ fn build_group_trie(inline: &[String], remote: &[String], version: u64) -> Group
     }
 }
 
-/// 拉取所有远程源（file 读盘 / https GET），返回合并后的域名列表。
-async fn fetch_remote_domains(sources: &[GroupSource]) -> std::io::Result<Vec<String>> {
+/// 读取所有文件源，返回合并后的域名列表。
+fn read_file_domains(files: &[GroupFile]) -> std::io::Result<Vec<String>> {
     let mut all = Vec::new();
-    for src in sources {
-        match src {
-            GroupSource::File(path) => {
-                let content = tokio::fs::read_to_string(path).await?;
-                parse_domain_lines(&content, &mut all);
-            }
-            GroupSource::Https(url) => {
-                let content = fetch_https(url).await?;
-                parse_domain_lines(&content, &mut all);
-            }
-        }
+    for f in files {
+        let content = std::fs::read_to_string(&f.0)?;
+        parse_domain_lines(&content, &mut all);
     }
     Ok(all)
 }
 
-/// 通过 hyper + hyper-rustls 拉取一个 https 文本源（限制大小与超时）。
-async fn fetch_https(url: &str) -> std::io::Result<String> {
-    const MAX_BODY: usize = 4 * 1024 * 1024;
-    const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-
-    let uri: hyper::Uri = url.parse().map_err(std::io::Error::other)?;
-    let tls = default_tls_client_config();
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config((*tls).clone())
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let client: hyper_util::client::legacy::Client<_, FullBody> =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
-
-    let resp = tokio::time::timeout(FETCH_TIMEOUT, client.get(uri))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("GET {url} timed out")))?
-        .map_err(std::io::Error::other)?;
-
-    if !resp.status().is_success() {
-        return Err(std::io::Error::other(format!("GET {url}: HTTP {}", resp.status())));
-    }
-
-    let body = tokio::time::timeout(FETCH_TIMEOUT, resp.into_body().collect())
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "reading body timed out"))?
-        .map_err(std::io::Error::other)?;
-    let bytes = body.to_bytes();
-    if bytes.len() > MAX_BODY {
-        return Err(std::io::Error::other(format!(
-            "GET {url}: body too large ({} bytes)",
-            bytes.len()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-type FullBody = http_body_util::Full<Bytes>;
-
-/// 单次组重载：拉取远程源，内容有变化则重建 trie 并原子替换。
-async fn reload_group(state: &Arc<GroupState>, metrics: &GroupsMetrics) {
-    let remote_domains = match fetch_remote_domains(&state.remote).await {
+/// 单次组重载：读取文件源，内容有变化则重建 trie 并原子替换。
+fn reload_group(state: &Arc<GroupState>, metrics: &GroupsMetrics) {
+    let file_domains = match read_file_domains(&state.files) {
         Ok(d) => d,
         Err(e) => {
             warn!("reload group '{}' failed: {}", state.name, e);
@@ -191,10 +132,10 @@ async fn reload_group(state: &Arc<GroupState>, metrics: &GroupsMetrics) {
     };
 
     // 内容指纹：排序后的域名列表。无变化则跳过重建。
-    let mut fingerprint = remote_domains.clone();
+    let mut fingerprint = file_domains.clone();
     fingerprint.sort_unstable();
     {
-        let mut last = state.last_remote.lock();
+        let mut last = state.last_files.lock();
         if last.as_ref() == Some(&fingerprint) {
             return;
         }
@@ -202,7 +143,7 @@ async fn reload_group(state: &Arc<GroupState>, metrics: &GroupsMetrics) {
     }
 
     let version = state.current.read().version + 1;
-    let new_trie = build_group_trie(&state.inline, &remote_domains, version);
+    let new_trie = build_group_trie(&state.inline, &file_domains, version);
     *state.current.write() = new_trie;
     metrics
         .entries
@@ -214,22 +155,6 @@ async fn reload_group(state: &Arc<GroupState>, metrics: &GroupsMetrics) {
         state.current.read().entry_count,
         version
     );
-}
-
-/// 组重载/初始加载任务：先立即加载一次（覆盖 https 首次拉取），
-/// 若 `auto_reload > 0` 则按周期循环。
-async fn reload_loop(state: Arc<GroupState>, metrics: Arc<GroupsMetrics>) {
-    reload_group(&state, &metrics).await;
-
-    let Some(secs) = state.auto_reload.filter(|&s| s > 0) else {
-        return; // 一次性初始加载完成
-    };
-    let mut iv: Interval = interval(Duration::from_secs(secs));
-    iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        iv.tick().await;
-        reload_group(&state, &metrics).await;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,28 +183,36 @@ pub struct Groups {
     metrics: std::sync::OnceLock<Arc<GroupsMetrics>>,
 }
 
+/// 校验 watch 事件：仅关注写入/重命名/删除/创建（含原子替换 tmp->target）。
+fn is_change_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) | EventKind::Any | EventKind::Other
+    )
+}
+
 /// Builds the groups stage from the top-level `groups[]` array, registering
-/// metrics and spawning remote reload tasks.
+/// metrics and spawning per-file notify watchers.
 pub fn init(config: &Config, registry: &MetricsRegistry) -> Groups {
     let metrics = Arc::new(GroupsMetrics::new(registry));
     let mut states: Vec<Arc<GroupState>> = Vec::new();
 
     for cfg in config.groups.iter() {
         let state = Arc::new(GroupState::build_from(cfg));
-        // 初始加载：同步读入内联 + file 源（https 由 reload_loop 首次异步拉取）。
-        match load_initial(&state) {
+        // 初始加载：同步读入内联 + file 源。
+        match read_file_domains(&state.files).map(|d| build_group_trie(&state.inline, &d, 0)) {
             Ok(trie) => {
                 *state.current.write() = trie;
                 info!(
-                    "group '{}': {} entries ({} inline, {} remote source(s))",
+                    "group '{}': {} entries ({} inline, {} file source(s))",
                     state.name,
                     state.current.read().entry_count,
                     state.inline.len(),
-                    state.remote.len()
+                    state.files.len()
                 );
             }
             Err(e) => {
-                // 保留空 trie，重载任务会再尝试；仅告警。
+                // 保留空 trie，文件变化时重载任务会再尝试；仅告警。
                 warn!("group '{}' initial load failed: {}", state.name, e);
             }
         }
@@ -287,13 +220,34 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Groups {
             .entries
             .with_label_values(&[&state.name])
             .set(state.current.read().entry_count as u64);
-        // 有远程源的组：spawn 初始加载 + 周期重载任务。
-        if !state.remote.is_empty() {
-            let state = state.clone();
-            let m = metrics.clone();
-            tokio::spawn(async move {
-                reload_loop(state, m).await;
-            });
+
+        // 有文件源的组：每个文件 spawn 一个 notify watcher，变化时重载。
+        for f in &state.files {
+            let path = f.0.clone();
+            let cb_state = state.clone();
+            let cb_metrics = metrics.clone();
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                if !is_change_event(&event.kind) || event.flag().is_some() {
+                    return;
+                }
+                reload_group(&cb_state, &cb_metrics);
+            }) {
+                Ok(mut watcher) => {
+                    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                        warn!("group '{}': failed to watch {}: {}", state.name, path.display(), e);
+                    } else {
+                        // 持有 watcher 直到进程退出，保持文件监控存活。
+                        tokio::spawn(async move {
+                            std::future::pending::<()>().await;
+                            drop(watcher);
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("group '{}': failed to watch {}: {}", state.name, path.display(), e);
+                }
+            };
         }
         states.push(state);
     }
@@ -302,21 +256,6 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Groups {
         groups: states,
         metrics: std::sync::OnceLock::from(metrics),
     }
-}
-
-/// 同步加载内联 + file 源；https 源留空（异步任务补拉）。
-fn load_initial(state: &Arc<GroupState>) -> std::io::Result<GroupTrie> {
-    let mut remote = Vec::new();
-    for src in &state.remote {
-        match src {
-            GroupSource::File(path) => {
-                let content = std::fs::read_to_string(path)?;
-                parse_domain_lines(&content, &mut remote);
-            }
-            GroupSource::Https(_) => {}
-        }
-    }
-    Ok(build_group_trie(&state.inline, &remote, 0))
 }
 
 impl Groups {
@@ -386,32 +325,18 @@ mod tests {
             name: "g".into(),
             domains: vec![
                 "file:///tmp/a.txt".into(),
-                "https://example.com/list.txt".into(),
+                "file:/tmp/b.txt".into(),
                 "inline.example".into(),
             ],
-            auto_reload: Some(60),
             skip_cache: true,
             skip_speed: true,
         };
         let state = GroupState::build_from(&cfg);
         assert_eq!(state.inline, vec!["inline.example".to_string()]);
-        assert_eq!(state.remote.len(), 2);
-        assert!(matches!(state.remote[0], GroupSource::File(_)));
-        assert!(matches!(state.remote[1], GroupSource::Https(_)));
-        assert_eq!(state.auto_reload, Some(60));
+        assert_eq!(state.files.len(), 2);
+        assert_eq!(state.files[0], GroupFile(PathBuf::from("/tmp/a.txt")));
+        assert_eq!(state.files[1], GroupFile(PathBuf::from("/tmp/b.txt")));
         assert!(state.skip_cache);
         assert!(state.skip_speed);
-    }
-
-    #[test]
-    fn test_http_client_type_is_send() {
-        // 编译期检查：fetch_https 内部使用的 client 类型可构造。
-        fn assert_send<T: Send>() {}
-        assert_send::<
-            hyper_util::client::legacy::Client<
-                hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-                FullBody,
-            >,
-        >();
     }
 }

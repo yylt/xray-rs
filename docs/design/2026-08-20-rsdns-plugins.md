@@ -11,6 +11,10 @@
 > 1. `groups` 每项新增 `auto_reload`（秒，仅对 `file://` / `https://` 数据源生效），支持按组周期重载；
 > 2. 每组建**独立 `DomainSuffixTrie`**（非共享单 trie），重载隔离、周期独立、指标按组天然可分；
 > 3. §6 细化 `{1}.{domain}` 占位符模板的全部具体形式与语法约束。
+>
+> v4 变更（按实现调整）：
+> 1. `groups` 与 `hosts` 的 `file://` 源改用 **`notify` 库文件监控**，文件变化时主动重建并原子替换 trie，**移除 `auto_reload` 周期重载**；
+> 2. **移除 `https://` 远程源**（`groups.domains` 仅支持内联域名与 `file://`）。
 
 ## 1. 动机
 
@@ -58,13 +62,11 @@ binds:                      # 数组：监听地址（非插件，server 使用�
   - address: "0.0.0.0:53"
   - address: "tcp://0.0.0.0:53"
 
-groups:                     # 数组：域名分组，带 name / skip_cache / auto_reload
+groups:                     # 数组：域名分组，带 name / skip_cache
   - name: ad
     domains:
-      - file:///etc/rsdns/ad.txt          # 文件源（支持 auto_reload）
-      - https://example.com/ad-list.txt   # HTTP(S) 源（支持 auto_reload）
+      - file:///etc/rsdns/ad.txt          # 文件源（notify 监控，变化自动重载）
       - doubleclick.net                   # 内联静态域名
-    auto_reload: 3600       # 秒；仅对 file:// / https:// 源生效；缺省/0 = 不自动重载
     skip_cache: true        # 可选，默认 false：命中该组时跳过缓存
   - name: intranet
     domains: [corp.internal, lan]
@@ -93,11 +95,9 @@ pub struct Config {
 
 pub struct GroupConfig {
     pub name: String,
-    /// 域名条目：内联域名、"file://..."、"https://..."。
+    /// 域名条目：内联域名、"file://..."。
     /// 数据层剥除 "*." 前缀；每行支持 "#" 注释与空行。
     pub domains: Vec<String>,
-    /// 自动重载周期（秒），仅对 file:// / https:// 源生效；None = 不重载。
-    pub auto_reload: Option<u64>,
     #[serde(default)]
     pub skip_cache: bool,
 }
@@ -268,6 +268,7 @@ Metrics：
 
 - 配置：`HostsConfig { entries: Vec<String> }`（顶层 `hosts:` 列表）。
 - 行为：查 `HostsTrie`（现有 FST 实现），命中 → 构造应答 `Respond`。
+- `file://` 源：启动期加载；随后用 `notify` 监控每个文件，变化时重建 trie 并原子替换（与 `groups` 相同机制）。
 - 迁移：`hosts.rs` 的 `HostsTrie/Builders` 移入，`main.rs::build_hosts_trie/parse_hosts_line` 移入插件。
 
 Metrics：
@@ -282,20 +283,19 @@ Metrics：
 
 ### 4.3 `groups` 插件（`plugins/groups.rs`）
 
-- 配置：`Vec<GroupConfig>`（顶层 `groups:` 数组，含 `name/domains/auto_reload/skip_cache`）。
+- 配置：`Vec<GroupConfig>`（顶层 `groups:` 数组，含 `name/domains/skip_cache`）。
 - 数据模型：**每个组一张独立的 `DomainSuffixTrie`**（`GroupTrie`，见下），不共享一张大 trie。
 - 行为：不短路。按配置顺序逐组 `lookup(domain)`，**首个命中组**设 `ctx.group = Some(name)`；若该组 `skip_cache` → 设 `ctx.skip_cache = true`；全不命中 → `ctx.group = None`，`skip_cache` 保持原值。
 - 迁移：`main.rs::build_groups_trie` 移入；`domain_trie` 复用现有 FST，每组一个实例。
 
 #### 4.3.1 每组独立 domain_trie（为何更好）
 
-引入 `auto_reload` 后，独立 trie 相对共享 trie 的优势：
+独立 trie 相对共享 trie 的优势：
 
 | 维度 | 共享单 trie | 每组独立 trie（采用） |
 |------|-------------|------------------------|
 | 重载隔离 | 任一组成员变更需**重建整棵树**并原子切换全局引用 | 只重建变更组，其余组引用不动 |
-| 重载周期 | 全局统一一个周期，无法按组差异化 | 每组 `auto_reload` 各自独立 |
-| 数据源 | 混合 file/https 后难按组管理 | 每组可独立管理 file/https 源与版本 |
+| 数据源 | 混合 file 后难按组管理 | 每组可独立管理 file 源与版本 |
 | 指标 | 按组计数需额外 tag 索引 | 天然按组（`rsdns_groups_hit_total{group}`） |
 | 构建失败 | 任一组失败影响全部 | 只影响该组（该组保留旧 trie，其余正常） |
 | 查询开销 | 1 次 lookup | G 次 lookup（G = 组数，通常 < 10，FST 为 ns 级，可接受） |
@@ -318,9 +318,8 @@ pub struct GroupsPlugin {
 pub struct GroupState {
     name: String,
     skip_cache: bool,
-    auto_reload: Option<u64>,    // 秒
-    sources: Vec<GroupSource>,   // 内联域名 / file:// / https://
-    current: RwLock<GroupTrie>,  // 当前生效 trie（auto_reload 时原子替换）
+    files: Vec<GroupFile>,       // 内联域名 / file:// 源
+    current: RwLock<GroupTrie>,  // 当前生效 trie（文件变化时原子替换）
 }
 ```
 
@@ -337,17 +336,18 @@ for g in &self.groups {
 next.call(ctx).await  // 未命中任何组
 ```
 
-#### 4.3.3 数据源加载与 `auto_reload`
+#### 4.3.3 数据源加载与 `notify` 文件监控
 
 - **内联域名**：启动期构建，永不重载。
-- **`file://` / `https://`**：启动期加载并构建；若 `auto_reload > 0`，为每个含远程源的组 spawn 一个 tokio 任务，按周期：
-  1. 重新拉取（文件 `read_to_string` / HTTP GET，带 `ETag`/`Last-Modified` 弱校验；拉取失败保留旧 trie 并计 `reload_errors_total`，不中断服务）；
+- **`file://` 源**：启动期加载并构建；随后用 **`notify`**（`recommended_watcher`）监控每个文件，文件变化时：
+  1. 重新读取文件（`read_to_string`；读取失败保留旧 trie 并告警，不中断服务）；
   2. 校验变更（内容指纹不同才重建）；
-  3. 解析（去空白/`#` 注释/空行、剥 `*.` 前缀）→ 构建新 `DomainSuffixTrie` → 原子替换 `current` → `version += 1`（计 `reloads_total`）。
-- 同一组可混合内联 + file + https 源；重载只替换远程源，内联部分保留。
-- 行格式：每行一个域名或 `*.domain`（剥前缀）；`#` 注释、空行忽略；`https://` 源每行同样按域名解析（与常见 adblock/allowlist 文本格式一致）。
+  3. 解析（去空白/`#` 注释/空行、剥 `*.` 前缀）→ 构建新 `DomainSuffixTrie` → 原子替换 `current` → `version += 1`。
+- 同一组可混合内联 + file 源；重载只替换 file 源，内联部分保留。
+- 行格式：每行一个域名或 `*.domain`（剥前缀）；`#` 注释、空行忽略。
+- watcher 句柄由 tokio 任务持有直到进程退出，保持监控存活。
 
-Metrics（新增 `auto_reload` 相关）：
+Metrics：
 
 | 指标 | 类型 | 说明 |
 |------|------|------|
@@ -356,8 +356,8 @@ Metrics（新增 `auto_reload` 相关）：
 | `rsdns_groups_miss_total` | Counter | 未命中任何组 |
 | `rsdns_groups_skip_cache_total{group}` | Counter | 因组 `skip_cache` 跳过缓存的次数 |
 | `rsdns_groups_groups` | Gauge | 组数量 |
-| `rsdns_groups_load_errors_total{group}` | Counter | 初始加载失败次数（file/https） |
-| `rsdns_groups_reloads_total{group}` | Counter | 自动重载成功次数 |
+| `rsdns_groups_load_errors_total{group}` | Counter | 初始加载失败次数（file） |
+| `rsdns_groups_reloads_total{group}` | Counter | 文件变化触发的重载成功次数 |
 | `rsdns_groups_reload_errors_total{group}` | Counter | 自动重载失败次数（保留旧 trie） |
 | `rsdns_groups_entries{group}` | Gauge | 各组当前 trie 条目数 |
 
@@ -602,14 +602,11 @@ binds:
 groups:
   - name: ad
     domains:
-      - file:///etc/rsdns/ad-block.txt      # 文件源，可自动重载
-      - https://example.com/ad-list.txt     # HTTP 源，可自动重载
+      - file:///etc/rsdns/ad-block.txt      # 文件源，notify 监控、变化自动重载
       - doubleclick.net                     # 内联静态域名
-    auto_reload: 3600                       # 每 3600s 重拉 file:// 与 https:// 源
     skip_cache: true                        # 命中该组直接绕缓存
   - name: intranet
     domains: [corp.internal, lan]
-    auto_reload: 0                          # 缺省：不自动重载
 
 upstreams:
   - name: default
@@ -660,11 +657,11 @@ rules:
 
 ## 9. 行为变化
 
-1. **配置形状**：`bind` → `binds`、`groups` 数组化（含 `skip_cache` / `auto_reload`）、`upstream` → `upstreams` 数组化（含 `name`）。旧配置不兼容，需迁移。
+1. **配置形状**：`bind` → `binds`、`groups` 数组化（含 `skip_cache`）、`upstream` → `upstreams` 数组化（含 `name`）。旧配置不兼容，需迁移。
 2. **缓存优先**：Fresh 命中在 rules 之前短路返回（与旧行为一致）；要绕过缓存用 `groups.skip_cache`，不再有规则级 `cache:false`（`forward.cache` 字段移除）。
 3. **match 语法**：仅四种形式；裸分组名 / `*.example.com` / `*` 报配置错误。
 4. **groups 提前解析**：域名归属组在 cache 之前解析（order 15），用于 `skip_cache` 与 rules 的 `group:` 匹配。
-5. **每组独立 trie + auto_reload**：组数据源支持 `file://` / `https://` 并按各自 `auto_reload` 周期重载；同域多组按配置顺序取首个命中组。
+5. **每组独立 trie + notify 文件监控**：`groups` 与 `hosts` 的 `file://` 源由 `notify` 监控，文件变化主动重建并原子替换 trie；不再有 `auto_reload` 周期，`groups` 不支持 `https://` 远程源。同域多组按配置顺序取首个命中组。
 
 **性能影响**：每次查询多 G 次 groups FST 查找（G = 组数，通常 < 10，FST 为 ns 级）；Fresh 命中时只经过 hosts + groups，不经过 rules。
 
@@ -677,18 +674,18 @@ rules:
 | P1 框架 | `plugin.rs`（新）、`metrics.rs`（新） | `Plugin / PluginFactory / PluginRegistry / PluginHub / QueryContext / Next / Decision`；手写 `MetricsRegistry`（§4.8） | ✅ |
 | P2 配置重构 | `config.rs` | `binds / groups / upstreams` 数组化；`plugin_sections` flatten；移除 `forward.cache` | ✅ |
 | P3 迁移 | `plugins/logs.rs`、`plugins/hosts.rs`、`plugins/groups.rs`、`plugins/rules.rs`、`plugins/cache.rs`、`plugins/upstream.rs` | 各插件拥有配置 + 初始化 + 链行为 + metrics；`server.rs::do_query` 改为 `run_chain`；`main.rs` 注册工厂组装链；groups 独立 trie + 加载器 | ✅ |
-| P3.5 组重载 | `plugins/groups.rs` | `auto_reload` 周期任务：file/https 拉取、内容指纹变更检测、原子替换 trie、reload metrics | ✅ |
+| P3.5 组重载 | `plugins/groups.rs` | `notify` 文件监控：file 读取、内容指纹变更检测、原子替换 trie、reload metrics | ✅ |
 | P4 规则扩展 | `plugins/rules.rs` | `MatchTarget` 新语法解析（无旧语法）；`TemplatePattern`；`PlaceholderResolver` 注册与匹配（当前 `{1}` = 组名） | ✅ |
 | P5 metrics 端点 | `plugins/metrics.rs`、`main.rs`、`pool.rs` | `metrics:` 配置 + hyper http1 `/metrics` 监听；`pool.rs` 埋点（checkout/connections/cooldown） | ✅ |
 | P6 收尾 | `example/rsdns-all-example.yaml`、`src/bin/rsdns/**` tests | 示例更新为新格式；单测 34 项全通过；冒烟验证 UDP/TCP + 指标 | ✅ |
 
-依赖变更：**未新增任何依赖**——metrics 采用手写文本编码（见 §4.8，离线构建无 `prometheus` crate）；hyper/hyper-util/hyper-rustls/moka 均为仓库既有依赖（hyper-rustls 增开 `http1` feature 供 DoH 与 metrics 客户端使用）。
+依赖变更：**新增 `notify`**（8.2，`default-features = false`，开启 `macos_kqueue` 使 macOS 上仍用内核事件而非轮询）——`groups` 与 `hosts` 的 `file://` 源用它做文件监控；metrics 采用手写文本编码（见 §4.8，离线构建无 `prometheus` crate）；hyper/hyper-util/hyper-rustls/moka 均为仓库既有依赖（hyper-rustls 增开 `http1` feature 供 DoH 与 metrics 客户端使用）。
 
 ## 11. 风险与权衡
 
-- **配置不兼容**：v2/v3 破坏性变更（数组化 + match 语法收紧 + `file:` → `file://` 源格式），示例与文档需同步重写；属有意为之。
+- **配置不兼容**：v2/v3/v4 破坏性变更（数组化 + match 语法收紧 + `file:` → `file://` 源格式 + 移除 `auto_reload` / `https://` 源），示例与文档需同步重写；属有意为之。
 - **每组独立 trie 的查询开销**：G 次 FST lookup（G 通常 < 10）；若未来组数上百需评估退化方案（如按命中率排序或合并索引）。
-- **`auto_reload` 的 https 拉取**：需 HTTP 客户端（仓库已有 hyper）；拉取失败保留旧 trie 不中断服务；应限制响应大小与超时，避免阻塞。
+- **`notify` 文件监控**：依赖平台文件系统事件；编辑器“另存为”（rename 替换）通过监听文件路径的 Create/Modify/Remove 事件覆盖，个别环境（如跨文件系统原子替换）可能收不到事件，此时可考虑回退到父目录监控或轮询。
 - **`prometheus` 依赖**：已采用手写编码（§4.8），`MetricsRegistry` 接口保持与 prometheus 客户端一致，未来可无缝替换。
 - **async trait**：采用 `BoxFuture` 风格避免新依赖；如可接受 `async-trait` 则更直观。
 - **moka eviction 计数**：`evict_total` 已通过 moka 0.12 `eviction_listener` 实现（确认可用）。
