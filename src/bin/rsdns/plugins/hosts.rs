@@ -3,10 +3,17 @@
 //! Looks up the queried name in the hosts trie; on hit, builds a response
 //! and short-circuits the pipeline (`Step::Respond`), mirroring the old
 //! `hosts`-first behaviour.
+//!
+//! Inline entries build the trie at startup; `file://` entries are loaded
+//! at startup and watched with the `notify` library, rebuilding the trie
+//! and atomically swapping it on change.
 
-use log::{error, info};
+use log::{error, info, warn};
+use notify::{EventKind, RecursiveMode, Watcher};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use xray_rs::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
@@ -90,10 +97,9 @@ fn parse_hosts_line(builder: &mut HostsTrieBuilder, line: &str) {
     }
 }
 
-/// 从配置条目（内联行或 `file://` 前缀）构建 hosts trie。
+/// 从内联条目 + 文件内容构建 hosts trie。文件读取失败视为空内容。
 fn build_hosts_trie(entries: &[String]) -> HostsTrie {
     let mut builder = HostsTrieBuilder::new();
-
     for entry in entries {
         if let Some(file_path) = entry.strip_prefix("file://") {
             match std::fs::read_to_string(file_path) {
@@ -120,7 +126,6 @@ fn build_hosts_trie(entries: &[String]) -> HostsTrie {
             parse_hosts_line(&mut builder, entry);
         }
     }
-
     builder.build()
 }
 
@@ -142,11 +147,20 @@ impl HostsMetrics {
 
 /// The hosts stage.
 pub struct Hosts {
-    trie: Arc<HostsTrie>,
-    metrics: std::sync::OnceLock<HostsMetrics>,
+    trie: Arc<RwLock<Arc<HostsTrie>>>,
+    metrics: Arc<HostsMetrics>,
 }
 
-/// Builds the hosts stage from the `hosts:` config section (or none).
+/// 校验 watch 事件：仅关注写入/重命名/删除/创建（含原子替换 tmp->target）。
+fn is_change_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) | EventKind::Any | EventKind::Other
+    )
+}
+
+/// Builds the hosts stage from the `hosts:` config section (or none),
+/// spawning a notify watcher per `file://` entry.
 pub fn init(config: &Config, registry: &MetricsRegistry) -> Hosts {
     let raw = config.plugin_sections.get("hosts").cloned().unwrap_or_default();
     let entries: Vec<String> = if raw.is_null() {
@@ -154,27 +168,57 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Hosts {
     } else {
         serde_yaml::from_value(raw).unwrap_or_default()
     };
-    let trie = build_hosts_trie(&entries);
-    let metrics = HostsMetrics::new(registry);
-    metrics.entries.set(entries.len() as u64);
-    Hosts {
-        trie: Arc::new(trie),
-        metrics: std::sync::OnceLock::from(metrics),
+    let trie = Arc::new(build_hosts_trie(&entries));
+    let metrics = Arc::new(HostsMetrics::new(registry));
+    metrics.entries.set(trie.ips.len() as u64);
+    let current = Arc::new(RwLock::new(trie));
+
+    // 为每个 file 源 spawn notify watcher：变化时重建 trie 并原子替换。
+    for entry in &entries {
+        let file_path = entry.strip_prefix("file://").or_else(|| entry.strip_prefix("file:"));
+        let Some(file_path) = file_path else { continue };
+        let path = PathBuf::from(file_path);
+        let cb_entries = entries.clone();
+        let cb_current = current.clone();
+        let cb_metrics = metrics.clone();
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            if !is_change_event(&event.kind) || event.flag().is_some() {
+                return;
+            }
+            let new_trie = build_hosts_trie(&cb_entries);
+            cb_metrics.entries.set(new_trie.ips.len() as u64);
+            *cb_current.write() = Arc::new(new_trie);
+        }) {
+            Ok(mut watcher) => {
+                if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                    warn!("hosts: failed to watch {}: {}", path.display(), e);
+                } else {
+                    // 持有 watcher 直到进程退出，保持文件监控存活。
+                    tokio::spawn(async move {
+                        std::future::pending::<()>().await;
+                        drop(watcher);
+                    });
+                }
+            }
+            Err(e) => {
+                warn!("hosts: failed to watch {}: {}", path.display(), e);
+            }
+        }
     }
+
+    Hosts { trie: current, metrics }
 }
 
 impl Hosts {
     /// Static mapping hit → `Respond`; miss → `Continue`.
     pub fn handle<'a>(&'a self, ctx: &'a mut QueryContext) -> Step {
-        if let Some(m) = self.metrics.get() {
-            m.lookup_total.inc();
-        }
+        self.metrics.lookup_total.inc();
         let name = ctx.name();
-        if let Some(ips) = self.trie.lookup(name) {
-            if let Some(m) = self.metrics.get() {
-                m.hit_total.inc();
-            }
-            match build_hosts_response(&ctx.msg, name, ctx.qtype(), ips) {
+        let ips = self.trie.read().lookup(name).map(|v| v.to_vec());
+        if let Some(ips) = ips {
+            self.metrics.hit_total.inc();
+            match build_hosts_response(&ctx.msg, name, ctx.qtype(), &ips) {
                 Ok(resp) => {
                     ctx.response = Some(resp);
                     ctx.action = "hosts".into();

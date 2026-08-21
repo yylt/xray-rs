@@ -40,20 +40,17 @@ pub struct BindConfig {
 
 /// A domain group.
 ///
-/// `domains` entries are inline domain names, `file://path`, or
-/// `https://url` sources.  Data-layer code strips `*.` prefixes; each line
-/// of a source file supports `#` comments and blank lines.
+/// `domains` entries are inline domain names or `file://path` sources.
+/// Data-layer code strips `*.` prefixes; each line of a source file
+/// supports `#` comments and blank lines.  `file://` sources are watched
+/// with the `notify` library and reloaded automatically on change.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GroupConfig {
     /// Group name, referenced by `match: group:{name}` rules.
     pub name: String,
-    /// Inline domains and/or `file://` / `https://` sources.
+    /// Inline domains and/or `file://` sources.
     #[serde(default)]
     pub domains: Vec<String>,
-    /// Auto-reload period in seconds for `file://` / `https://` sources;
-    /// `None` / `0` = no reload.
-    #[serde(default)]
-    pub auto_reload: Option<u64>,
     /// When a queried name belongs to this group, bypass the cache
     /// (both lookup and write-back).
     #[serde(default)]
@@ -299,7 +296,6 @@ groups:
     domains:
       - file:///etc/rsdns/ad.txt
       - doubleclick.net
-    auto_reload: 3600
     skip_cache: true
   - name: intranet
     domains: [corp.internal, lan]
@@ -339,7 +335,6 @@ metrics:
         assert_eq!(config.binds[1].address, "tcp://0.0.0.0:53");
         assert_eq!(config.groups.len(), 2);
         assert_eq!(config.groups[0].name, "ad");
-        assert_eq!(config.groups[0].auto_reload, Some(3600));
         assert!(config.groups[0].skip_cache);
         assert_eq!(config.groups[1].name, "intranet");
         assert_eq!(config.upstreams.len(), 3);

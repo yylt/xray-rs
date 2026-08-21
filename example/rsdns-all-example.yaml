@@ -10,16 +10,15 @@ binds:
   - address: "0.0.0.0:14453"          # UDP
   - address: "tcp://0.0.0.0:14453"    # TCP
 
-# Domain groups: name + optional domains list (inline), file:// or https://
-# sources, per-group auto_reload, skip_cache.
+# Domain groups: name + optional domains list (inline or file:// sources).
+# file:// sources are watched and reloaded automatically on change.
 groups:
   - name: ad
     domains:
       - doubleclick.net
       - googlesyndication.com
       - googleadservices.com
-    # file: /etc/rsdns/ad-block.txt
-    # auto_reload: 60
+    # file: /etc/rsdns/ad-block.txt   (reloaded automatically on change)
   - name: intranet
     domains:
       - corp.internal
@@ -33,9 +32,6 @@ groups:
       - cloudflare.com
     skip_cache: true
     # skip_speed: true   # also skip the speed plugin's latency sorting
-    # https://... source + auto_reload:
-    # remote: https://raw.example.com/domains.txt
-    # auto_reload: 300
 
 # Upstream pools: named groups of servers.  mode: serial (default) |
 # parallel | random | round_robin.
