@@ -248,6 +248,8 @@ impl Cache {
 
         match self.cache.get_cached(&ctx.key).await {
             CacheResult::Fresh(entry) => {
+                // 缓存命中：答案已在写回前按测速排序，跳过 speed 阶段重复探测。
+                ctx.skip_speed = true;
                 let action = entry.action_name();
                 match build_response_from_cache(&ctx.msg, &entry, self.cache.keep_ttl) {
                     Ok(resp) => {
@@ -264,6 +266,10 @@ impl Cache {
                 }
             }
             CacheResult::Stale(entry) => {
+                // 缓存命中（stale 兜底）：先以 stale 应答返回，同样跳过 speed
+                // 阶段；后续规则阶段会用上游新鲜结果替换（此时未命中缓存，
+                // skip_speed 保持原值，新鲜结果仍会走 speed 排序）。
+                ctx.skip_speed = true;
                 let response = match build_response_from_cache(&ctx.msg, &entry, self.cache.keep_ttl) {
                     Ok(r) => r,
                     Err(e) => {
