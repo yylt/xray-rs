@@ -83,6 +83,10 @@ impl DnsServer {
 
         loop {
             let (mut stream, src) = listener.accept().await?;
+            if let Err(e) = stream.set_nodelay(true) {
+                error!("TCP accept from {} failed to set TCP_NODELAY: {}", src, e);
+                continue;
+            }
             let self_clone = self.clone_inner();
             tokio::spawn(async move {
                 let mut len_buf = [0u8; 2];
@@ -226,13 +230,13 @@ impl DnsServer {
             sock.set_only_v6(false)?;
             sock.set_reuse_address(true)?;
             sock.bind(&socket2::SockAddr::from(addr))?;
-            sock.listen(1024)?;
+            sock.listen(xray_rs::transport::DEFAULT_LISTEN_BACKLOG as i32)?;
             sock.set_nonblocking(true)?;
             // SAFETY: sock is a valid fd we just created and configured
             let std_listener = unsafe { std::net::TcpListener::from_raw_fd(sock.into_raw_fd()) };
             TcpListener::from_std(std_listener)?
         } else {
-            TcpListener::bind(addr).await?
+            xray_rs::transport::bind_tcp_listener(addr)?
         };
         Ok(listener)
     }

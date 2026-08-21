@@ -184,7 +184,7 @@ impl WebSocket {
         addr: &std::net::SocketAddr,
     ) -> std::io::Result<crate::common::BoxStream<(TrStream, Address), std::io::Error>> {
         log::debug!("Starting WebSocket listener on {}", addr);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = super::bind_tcp_listener(*addr)?;
         log::debug!("WebSocket listener bound successfully to {}", addr);
 
         let opt = self.opt.clone();

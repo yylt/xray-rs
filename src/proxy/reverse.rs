@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
@@ -616,7 +616,10 @@ impl ReversInbound {
 
     async fn run_socks5_server(remote_port: u16, control_server: Arc<ControlServer>, client_id: String) -> Result<()> {
         let listen_addr = format!("0.0.0.0:{}", remote_port);
-        let listener = TcpListener::bind(&listen_addr).await?;
+        let socket_addr: std::net::SocketAddr = listen_addr
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let listener = super::super::transport::bind_tcp_listener(socket_addr)?;
 
         info!("SOCKS5 server listening on {}", listen_addr);
 
@@ -624,6 +627,11 @@ impl ReversInbound {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     debug!("SOCKS5 connection from {}", peer_addr);
+
+                    if let Err(e) = stream.set_nodelay(true) {
+                        error!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+                        continue;
+                    }
 
                     let control_server = control_server.clone();
                     let client_id = client_id.clone();

@@ -1,6 +1,6 @@
 use super::*;
 use log::warn;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
@@ -137,7 +137,7 @@ impl Raw {
 
     // TCP 监听辅助方法
     async fn listen_tcp(&self, addr: &std::net::SocketAddr) -> Result<BoxStream<(TrStream, Address), std::io::Error>> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = super::bind_tcp_listener(*addr)?;
         let opt = self.opt.clone();
         let tls_server = self.tls_server.clone();
 

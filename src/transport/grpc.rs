@@ -458,9 +458,7 @@ impl Grpc {
         &self,
         addr: &std::net::SocketAddr,
     ) -> IoResult<crate::common::BoxStream<(super::TrStream, Address), std::io::Error>> {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind(addr).await?;
+        let listener = super::bind_tcp_listener(*addr)?;
         log::info!("gRPC listener bound successfully to {}", addr);
 
         let sockopt = self.sockopt.clone();
