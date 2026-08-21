@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use crate::plugins::cache::CacheKey;
 use crate::plugins::util::{build_servfail, sort_answers_cname_last};
-use crate::plugins::{cache, groups, hosts, logs, rules};
+use crate::plugins::{cache, groups, hosts, logs, rules, speed};
 use crate::query::{QueryContext, Step};
 
 const MAX_DNS_SIZE: usize = 4096;
@@ -37,6 +37,7 @@ pub struct Pipeline {
     pub groups: groups::Groups,
     pub cache: cache::Cache,
     pub rules: rules::Rules,
+    pub speed: speed::Speed,
 }
 
 pub struct DnsServer {
@@ -183,6 +184,9 @@ impl DnsServer {
         if ctx.response.is_none() {
             ctx.response = Some(build_servfail(&ctx.msg));
         }
+
+        // speed 阶段：对 A/AAAA 应答按测速 RTT 排序（后置 pass，不短路）。
+        self.pipeline.speed.handle(&mut ctx).await;
 
         // 仅 A/AAAA 查询：把 CNAME 排到末尾
         if qtype == RecordType::A || qtype == RecordType::AAAA {

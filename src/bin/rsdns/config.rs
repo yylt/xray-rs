@@ -58,6 +58,10 @@ pub struct GroupConfig {
     /// (both lookup and write-back).
     #[serde(default)]
     pub skip_cache: bool,
+    /// When a queried name belongs to this group, skip the speed plugin's
+    /// latency-ordered sorting of A/AAAA answers.
+    #[serde(default)]
+    pub skip_speed: bool,
 }
 
 impl Config {
@@ -92,6 +96,81 @@ pub struct CacheConfig {
     /// If `true`, preserve the upstream's original TTL (overrides `min_ttl`/`max_ttl`).
     #[serde(default)]
     pub keep_ttl: Option<bool>,
+}
+
+/// Speed plugin configuration (top-level `speed:` section).
+///
+/// Latency-measures A/AAAA answers and sorts them by RTT.  Disabled by
+/// default; see the design doc `docs/design/2026-08-21-rsdns-speed.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeedConfig {
+    /// Master switch; `false` (default) disables latency sorting entirely.
+    #[serde(default)]
+    pub enable: bool,
+    /// Probe type; currently only `"syn"` (default).
+    #[serde(default = "default_speed_type")]
+    pub r#type: String,
+    /// Probe destination port (default 443).
+    #[serde(default = "default_speed_port")]
+    pub port: u16,
+    /// Address family to sort: `"ANY"` (default) / `"A"` / `"AAAA"`.
+    #[serde(default = "default_speed_family")]
+    pub family: String,
+    /// Per-IP probe timeout: bare number = seconds, optional `ms`/`s`/`m`
+    /// suffix (default `"1s"`).
+    #[serde(default = "default_speed_timeout")]
+    pub timeout: String,
+}
+
+fn default_speed_type() -> String {
+    "syn".into()
+}
+
+fn default_speed_port() -> u16 {
+    443
+}
+
+fn default_speed_family() -> String {
+    "ANY".into()
+}
+
+fn default_speed_timeout() -> String {
+    "1s".into()
+}
+
+impl Default for SpeedConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            r#type: default_speed_type(),
+            port: default_speed_port(),
+            family: default_speed_family(),
+            timeout: default_speed_timeout(),
+        }
+    }
+}
+
+/// Parses a duration string (`"500ms"`, `"2s"`, `"1m"`, bare seconds) into
+/// [`std::time::Duration`].  Used by the speed plugin's `timeout`.
+pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1_000_000u64)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1_000_000_000u64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000_000_000u64)
+    } else {
+        (s, 1_000_000_000u64)
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_nanos(n.saturating_mul(mult)))
 }
 
 /// A single DNS routing rule.
