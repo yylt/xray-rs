@@ -36,11 +36,6 @@ pub(crate) fn make_response_base(msg: &Message) -> io::Result<Message> {
     Ok(response)
 }
 
-/// Sorts CNAME records last so A/AAAA answers come first.
-pub(crate) fn sort_answers_cname_last(answers: &mut [Record]) {
-    answers.sort_by_key(|r| matches!(r.data, RData::CNAME(_)));
-}
-
 /// Rewrites every answer TTL to `ttl`.
 pub(crate) fn rewrite_ttl_in_response(msg: &mut Message, ttl: u32) {
     for answer in &mut msg.answers {
