@@ -9,7 +9,6 @@
 //! construction/teardown around the pipeline.
 
 use hickory_proto::op::Message;
-use hickory_proto::rr::RecordType;
 
 use log::{error, info};
 use std::io;
@@ -24,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use crate::plugins::cache::CacheKey;
-use crate::plugins::util::{build_servfail, sort_answers_cname_last};
+use crate::plugins::util::build_servfail;
 use crate::plugins::{cache, groups, hosts, logs, rules, speed};
 use crate::query::{QueryContext, Step};
 
@@ -188,12 +187,6 @@ impl DnsServer {
         // speed 阶段：对 A/AAAA 应答按测速 RTT 排序（后置 pass，不短路）。
         self.pipeline.speed.handle(&mut ctx).await;
 
-        // 仅 A/AAAA 查询：把 CNAME 排到末尾
-        if qtype == RecordType::A || qtype == RecordType::AAAA {
-            if let Some(r) = ctx.response.as_mut() {
-                sort_answers_cname_last(&mut r.answers);
-            }
-        }
         if let Some(r) = ctx.response.as_mut() {
             r.metadata.id = msg_id;
         }
