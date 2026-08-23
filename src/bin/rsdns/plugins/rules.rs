@@ -10,6 +10,10 @@
 //!   assembled [`crate::upstream::Upstreams`] and fill `ctx.response`,
 //!   `Respond` (there is no separate upstream pipeline stage); `max_answers`
 //!   caps the number of answer records returned (default 5, `0` = no limit);
+//!   `resolve_cname: true` resolves the target when the response's first
+//!   answer is a CNAME (only the last CNAME of a pure CNAME chain is
+//!   resolved; A/AAAA replaces it with owner = queried name, empty drops
+//!   it and stops, CNAME keeps the original response);
 //! - `rewrite` → **terminal**: synthesize an A record for the query name
 //!   from the `target` (literal dotted-quad IPv4 or `{N}` placeholder
 //!   template filled from the match captures, e.g. `{1}.32.0.2`), `Respond`
@@ -195,6 +199,7 @@ pub enum RuleAction {
         ttl: Option<u32>,
         max_answers: usize,
         deny_qtypes: Vec<RecordType>,
+        resolve_cname: bool,
     },
     Rewrite {
         target: String,
@@ -444,11 +449,13 @@ pub fn init(config: &Config, registry: &MetricsRegistry, upstreams: Arc<crate::u
                 ttl,
                 max_answers,
                 deny_qtypes,
+                resolve_cname,
             } => RuleAction::Forward {
                 upstream: upstream.clone(),
                 ttl: *ttl,
                 max_answers: max_answers.unwrap_or(5),
                 deny_qtypes: deny_qtypes.iter().map(|qt| parse_qtype(qt)).collect(),
+                resolve_cname: *resolve_cname,
             },
             RuleActionConfig::Rewrite { target, ttl } => RuleAction::Rewrite {
                 target: target.clone(),
@@ -585,6 +592,7 @@ impl Rules {
                 ttl,
                 max_answers,
                 deny_qtypes,
+                resolve_cname,
             } => {
                 if deny_qtypes.contains(&ctx.qtype()) {
                     let action_label = format!("forward-nodata({upstream})");
@@ -609,7 +617,10 @@ impl Rules {
                     if let Some(m) = self.metrics.get() {
                         m.matched_total.with_label_values(&["forward"]).inc();
                     }
-                    match self.forward_query(ctx, upstream, *ttl, *max_answers).await {
+                    match self
+                        .forward_query(ctx, upstream, *ttl, *max_answers, *resolve_cname)
+                        .await
+                    {
                         Ok(()) => Step::Respond,
                         Err(e) => {
                             warn!("forward {} for {} failed: {}", upstream, ctx.name(), e);
@@ -648,23 +659,80 @@ impl Rules {
 
     /// 查询 `upstream` 并写入 `ctx.response`；应用 TTL 覆盖与 answer 数目
     /// 截断（`max_answers`，`0` = 不限）。返回 `Ok` 表示拿到了上游响应。
+    /// 当 `resolve_cname` 开启且上游应答首条为 CNAME 时，先按 §`resolve_cnames`
+    /// 主动解析 target（在 TTL 覆盖与截断之前）。
     async fn forward_query(
         &self,
         ctx: &mut QueryContext,
         upstream: &str,
         ttl: Option<u32>,
         max_answers: usize,
+        resolve_cname: bool,
     ) -> io::Result<()> {
         let resp = self.upstreams.query(upstream, &ctx.msg).await?;
         // 拿到上游新鲜结果：stale 兜底已被替换，允许写回缓存。
         ctx.served_stale = false;
         let mut resp = resp;
+        if resolve_cname {
+            self.resolve_cnames(ctx, upstream, &mut resp).await;
+        }
         if let Some(ttl) = ttl {
             rewrite_ttl_in_response(&mut resp, ttl);
         }
         truncate_answers(&mut resp, max_answers);
         ctx.response = Some(resp);
         Ok(())
+    }
+
+    /// `forward.resolve_cname`：当应答**首条**是 CNAME 时，用同一 upstream
+    /// 以原 qtype 主动解析其 target，按结果替换/丢弃/原样返回（见
+    /// `docs/design/2026-08-27-rsdns-forward-resolve-cname.md`）。
+    ///
+    /// 若开头连续多条都是 CNAME（纯 CNAME 链），**只处理最后一条**：直接解析
+    /// 最后一个 target，跳过多级中间链。解析返回 A/AAAA → 用其替换整条 CNAME
+    /// 链（owner 改写为原查询名）；返回空 → 丢弃该（最后一条）CNAME 并停止；
+    /// 返回 CNAME / 其他类型 / 解析出错 → 原样保留当前响应并结束（不追链）。
+    async fn resolve_cnames(&self, ctx: &QueryContext, upstream: &str, resp: &mut Message) {
+        let query_name = ctx.msg.queries.first().map(|q| q.name().clone()).unwrap_or_default();
+        let Some(idx) = last_cname_index(&resp.answers) else {
+            return;
+        };
+        let RData::CNAME(cname) = &resp.answers[idx].data else {
+            return;
+        };
+        let target = cname.0.to_utf8();
+        let target_msg = match make_query_msg(&target, ctx.qtype()) {
+            Ok(msg) => msg,
+            Err(e) => {
+                warn!("resolve_cname target {} for {} invalid: {}", target, ctx.name(), e);
+                return;
+            }
+        };
+        let resolved = match self.upstreams.query(upstream, &target_msg).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(
+                    "resolve_cname target {} for {} failed: {}, keep original response",
+                    target,
+                    ctx.name(),
+                    e
+                );
+                return;
+            }
+        };
+        match classify_resolved(&resolved) {
+            Resolved::Address => {
+                let replacement = address_records_with_owner(&resolved, &query_name);
+                resp.answers = replacement;
+            }
+            Resolved::Empty => {
+                // 丢弃该（最后一条）CNAME，停止处理，不检查下一条。
+                resp.answers.remove(idx);
+            }
+            Resolved::Cname | Resolved::Other => {
+                // 不丢弃，原样返回上游原始响应，停止处理。
+            }
+        }
     }
 
     /// CNAME 规则：返回 CNAME 记录，并通过指定 upstream 代查 target 的真实记录。
@@ -714,12 +782,71 @@ impl Rules {
 }
 
 // ---------------------------------------------------------------------------
+// resolve_cname 纯函数辅助
+// ---------------------------------------------------------------------------
+
+/// 解析结果按首条 answer 的分类（供 `resolve_cnames` 决策）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolved {
+    /// 首条是 A / AAAA（替换原 CNAME）。
+    Address,
+    /// 无 answer（丢弃该 CNAME，继续检查下一条）。
+    Empty,
+    /// 首条是 CNAME（不丢弃，原样返回，不追链）。
+    Cname,
+    /// 首条是其他类型（原样返回，不破坏数据）。
+    Other,
+}
+
+/// 按 `resolved` 的**首条 answer** 分类（`Empty` 表示无 answer）。
+fn classify_resolved(resolved: &Message) -> Resolved {
+    match resolved.answers.first().map(|r| r.record_type()) {
+        None => Resolved::Empty,
+        Some(RecordType::A) | Some(RecordType::AAAA) => Resolved::Address,
+        Some(RecordType::CNAME) => Resolved::Cname,
+        Some(_) => Resolved::Other,
+    }
+}
+
+/// 定位 `answers` 开头**连续 CNAME 链**的最后一个 CNAME 下标。
+///
+/// 仅当 `answers` 首条是 CNAME 时返回 `Some`；链被打断（出现非 CNAME 记录）
+/// 时，链的末尾就是该 CNAME 段落的最后一个。例如：
+/// `[CNAME, CNAME, A, A]` → 1（解析第二个 CNAME 的 target）。
+fn last_cname_index(answers: &[Record]) -> Option<usize> {
+    if answers.first().is_none_or(|r| r.record_type() != RecordType::CNAME) {
+        return None;
+    }
+    let idx = answers
+        .iter()
+        .take_while(|r| r.record_type() == RecordType::CNAME)
+        .count();
+    Some(idx - 1)
+}
+
+/// 从解析结果中过滤出 A/AAAA 记录，并把 owner name 改写为 `owner`（原查询名）。
+fn address_records_with_owner(resolved: &Message, owner: &Name) -> Vec<Record> {
+    resolved
+        .answers
+        .iter()
+        .filter(|r| matches!(r.record_type(), RecordType::A | RecordType::AAAA))
+        .map(|r| {
+            let mut rec = r.clone();
+            rec.name = owner.clone();
+            rec
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::rr::rdata::AAAA;
+    use std::net::Ipv6Addr;
 
     fn parse_ok(s: &str) -> MatchTarget {
         parse_match_target(s).unwrap()
@@ -929,5 +1056,112 @@ mod tests {
         }
         truncate_answers(&mut msg2, 0);
         assert_eq!(msg2.answers.len(), 8);
+    }
+
+    #[test]
+    fn test_classify_resolved() {
+        // 空应答
+        let empty = make_query_msg("example.com", RecordType::A).unwrap();
+        assert_eq!(classify_resolved(&empty), Resolved::Empty);
+
+        // A / AAAA
+        let mut a = make_query_msg("example.com", RecordType::A).unwrap();
+        a.answers.push(Record::from_rdata(
+            Name::from_utf8("example.com").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        assert_eq!(classify_resolved(&a), Resolved::Address);
+
+        let mut aaaa = make_query_msg("example.com", RecordType::AAAA).unwrap();
+        aaaa.answers.push(Record::from_rdata(
+            Name::from_utf8("example.com").unwrap(),
+            300,
+            RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+        ));
+        assert_eq!(classify_resolved(&aaaa), Resolved::Address);
+
+        // CNAME 首条
+        let mut cname = make_query_msg("example.com", RecordType::A).unwrap();
+        cname.answers.push(Record::from_rdata(
+            Name::from_utf8("example.com").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_utf8("target.example.com").unwrap())),
+        ));
+        assert_eq!(classify_resolved(&cname), Resolved::Cname);
+
+        // 其他类型（MX）首条
+        let mut mx = make_query_msg("example.com", RecordType::MX).unwrap();
+        mx.answers.push(Record::from_rdata(
+            Name::from_utf8("example.com").unwrap(),
+            300,
+            RData::MX(hickory_proto::rr::rdata::MX::new(
+                10,
+                Name::from_utf8("mail.example.com").unwrap(),
+            )),
+        ));
+        assert_eq!(classify_resolved(&mx), Resolved::Other);
+    }
+
+    #[test]
+    fn test_last_cname_index() {
+        let cname = |name: &str, target: &str| {
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                300,
+                RData::CNAME(CNAME(Name::from_utf8(target).unwrap())),
+            )
+        };
+        let a = |ip: Ipv4Addr| Record::from_rdata(Name::from_utf8("x.example.com").unwrap(), 300, RData::A(A(ip)));
+
+        // 首条非 CNAME → None
+        assert_eq!(last_cname_index(&[]), None);
+        assert_eq!(last_cname_index(&[a(Ipv4Addr::new(1, 2, 3, 4))]), None);
+
+        // 单条 CNAME → 0
+        let single = vec![cname("a.com", "b.com")];
+        assert_eq!(last_cname_index(&single), Some(0));
+
+        // 纯 CNAME 链（多条）→ 最后一条的下标
+        let chain = vec![
+            cname("a.com", "b.com"),
+            cname("b.com", "c.com"),
+            cname("c.com", "d.com"),
+        ];
+        assert_eq!(last_cname_index(&chain), Some(2));
+
+        // CNAME 链后接 A：只处理链段，最后一条 CNAME 下标 = 链长 - 1
+        let mixed = vec![
+            cname("a.com", "b.com"),
+            cname("b.com", "c.com"),
+            a(Ipv4Addr::new(10, 0, 0, 1)),
+        ];
+        assert_eq!(last_cname_index(&mixed), Some(1));
+    }
+
+    #[test]
+    fn test_address_records_with_owner() {
+        let target = Name::from_utf8("target.example.com").unwrap();
+        let mut resolved = make_query_msg("target.example.com", RecordType::A).unwrap();
+        // A + CNAME + AAAA 混合：只保留 A/AAAA，owner 全部改写为原查询名
+        resolved
+            .answers
+            .push(Record::from_rdata(target.clone(), 300, RData::A(A(Ipv4Addr::new(10, 0, 0, 1)))));
+        resolved.answers.push(Record::from_rdata(
+            Name::from_utf8("other.example.com").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_utf8("x.example.com").unwrap())),
+        ));
+        resolved
+            .answers
+            .push(Record::from_rdata(target.clone(), 300, RData::AAAA(AAAA(Ipv6Addr::LOCALHOST))));
+
+        let owner = Name::from_utf8("queried.example.com").unwrap();
+        let recs = address_records_with_owner(&resolved, &owner);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].record_type(), RecordType::A);
+        assert_eq!(recs[0].name, owner);
+        assert_eq!(recs[1].record_type(), RecordType::AAAA);
+        assert_eq!(recs[1].name, owner);
     }
 }
