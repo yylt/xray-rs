@@ -4,7 +4,7 @@
 //! (hosts / cache / rules / upstream) can reuse response construction,
 //! caching, and upstream queries without pulling in the server type.
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::op::{Message, MessageType, Metadata, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, TXT};
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{Name, Record, RecordType};
@@ -27,8 +27,13 @@ pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Messag
 }
 
 /// Basic response skeleton mirroring the query's id and question.
+///
+/// Flags: copies the request's opcode and the RD/CD bits into the response
+/// (per RFC 6895 only RD and CD are copied from query to response; RA/AA/AD
+/// are set by the server), so request flags are never cleared.
 pub(crate) fn make_response_base(msg: &Message) -> io::Result<Message> {
     let mut response = Message::new(msg.id, MessageType::Response, OpCode::Query);
+    response.metadata = Metadata::response_from_request(&msg.metadata);
     response.metadata.recursion_available = true;
     if let Some(q) = msg.queries.first() {
         response.queries.push(q.clone());
@@ -211,8 +216,10 @@ pub(crate) fn build_poison(msg: &Message, name: &str, qtype: RecordType) -> io::
 /// SERVFAIL response.
 pub(crate) fn build_servfail(msg: &Message) -> Message {
     let mut response = Message::new(0, MessageType::Response, OpCode::Query);
-    response.metadata = msg.metadata;
-    response.metadata.message_type = MessageType::Response;
+    // Copy the request's flags (opcode + RD/CD) and set RA, mirroring
+    // `make_response_base`; the response code is overwritten to SERVFAIL.
+    response.metadata = Metadata::response_from_request(&msg.metadata);
+    response.metadata.recursion_available = true;
     response.metadata.response_code = ResponseCode::ServFail;
     response.queries = msg.queries.clone();
     response
@@ -227,6 +234,53 @@ pub(crate) fn build_nodata(msg: &Message) -> io::Result<Message> {
 mod tests {
     use super::*;
     use crate::plugins::cache::{CacheResult, DnsCache};
+
+    /// 构造一个设置了 RD/CD 与自定义 opcode 的查询消息。
+    fn query_msg_with_flags() -> Message {
+        let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.metadata.checking_disabled = true;
+        msg.metadata.op_code = OpCode::Status;
+        let mut q = Query::new();
+        q.set_name(Name::from_utf8("flags.example.com").unwrap());
+        q.set_query_type(RecordType::A);
+        q.set_query_class(hickory_proto::rr::DNSClass::IN);
+        msg.queries.push(q);
+        msg
+    }
+
+    #[test]
+    fn test_response_preserves_request_flags() {
+        let msg = query_msg_with_flags();
+        let resp = make_response_base(&msg).unwrap();
+
+        // 请求的 flags（opcode + RD/CD）必须保留，不被服务端清除。
+        assert_eq!(resp.metadata.id, msg.metadata.id);
+        assert_eq!(resp.metadata.message_type, MessageType::Response);
+        assert_eq!(resp.metadata.op_code, msg.metadata.op_code);
+        assert!(resp.metadata.recursion_desired, "RD must be copied from request");
+        assert!(resp.metadata.checking_disabled, "CD must be copied from request");
+        // RA 由服务端设置；AA/AD 不复制。
+        assert!(resp.metadata.recursion_available);
+        assert!(!resp.metadata.authoritative);
+        assert!(!resp.metadata.authentic_data);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[test]
+    fn test_servfail_preserves_request_flags() {
+        let msg = query_msg_with_flags();
+        let resp = build_servfail(&msg);
+
+        assert_eq!(resp.metadata.id, msg.metadata.id);
+        assert_eq!(resp.metadata.message_type, MessageType::Response);
+        assert_eq!(resp.metadata.op_code, msg.metadata.op_code);
+        assert!(resp.metadata.recursion_desired, "RD must be copied from request");
+        assert!(resp.metadata.checking_disabled, "CD must be copied from request");
+        assert!(resp.metadata.recursion_available);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(resp.queries.len(), 1);
+    }
 
     #[tokio::test]
     async fn test_cache_upstream_response_nodata_a() {
