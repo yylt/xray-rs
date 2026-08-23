@@ -230,6 +230,13 @@ pub enum RuleActionConfig {
         /// Refuse these query types before forwarding upstream (e.g. ["A", "AAAA"]).
         #[serde(default)]
         deny_qtypes: Vec<String>,
+        /// When the upstream response's first answer is a CNAME, actively
+        /// resolve its target (same upstream, same qtype).  An A/AAAA result
+        /// replaces the CNAME (owner rewritten to the queried name); an empty
+        /// result drops it and continues with the next answer; a CNAME result
+        /// keeps the original response untouched (no further chaining).
+        #[serde(default)]
+        resolve_cname: bool,
     },
     /// Rewrite the query with a synthesized IPv4 A answer (no upstream
     /// query).  `target` is a dotted-quad IPv4 (`10.10.0.0`) or a
@@ -349,6 +356,29 @@ metrics:
         assert!(config.plugin_sections.contains_key("hosts"));
         assert!(config.plugin_sections.contains_key("rules"));
         assert!(config.plugin_sections.contains_key("metrics"));
+    }
+
+    #[test]
+    fn test_forward_resolve_cname_parse() {
+        let yaml = r#"
+rules:
+  - match: ""
+    action: { type: forward, upstream: default, resolve_cname: true }
+  - match: ""
+    action: { type: forward, upstream: default }
+"#;
+        let config = Config::from_yaml_str(yaml).expect("parse failed");
+        let raw = config.plugin_sections.get("rules").cloned().unwrap();
+        let configs: Vec<RuleConfig> = serde_yaml::from_value(raw).unwrap();
+        assert_eq!(configs.len(), 2);
+        match &configs[0].action {
+            RuleActionConfig::Forward { resolve_cname, .. } => assert!(*resolve_cname),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+        match &configs[1].action {
+            RuleActionConfig::Forward { resolve_cname, .. } => assert!(!*resolve_cname, "default must be false"),
+            other => panic!("expected Forward, got {other:?}"),
+        }
     }
 
     #[test]
