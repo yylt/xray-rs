@@ -64,7 +64,7 @@ pub struct QueryContext {
     /// Set by a responding stage (hosts / cache / rules).
     pub response: Option<Message>,
     /// Human-readable action label for logging/metrics (e.g. "hosts",
-    /// "forward(default)", "block-nxdomain", "forward-stale").
+    /// "forward(default)", "block-nxdomain").
     pub action: String,
     /// Domain group the queried name belongs to (set by the groups stage).
     pub group: Option<String>,
@@ -72,9 +72,6 @@ pub struct QueryContext {
     /// `match: "{1}.example.com"`); index = placeholder number - 1.  Set by
     /// the rules stage; reused by actions (e.g. `cname.target`).
     pub captures: Vec<String>,
-    /// Set by the cache stage when a stale entry was served as a fallback;
-    /// the rules stage tries to replace it with a fresh upstream answer.
-    pub served_stale: bool,
 }
 
 impl QueryContext {
@@ -100,7 +97,6 @@ impl QueryContext {
             action: String::new(),
             group: None,
             captures: Vec::new(),
-            served_stale: false,
         }
     }
 

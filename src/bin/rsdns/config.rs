@@ -87,9 +87,6 @@ pub struct CacheConfig {
     /// Maximum TTL to clamp responses to (seconds).
     #[serde(default)]
     pub max_ttl: Option<u32>,
-    /// If `true`, serve stale cache entries when the upstream is unreachable.
-    #[serde(default)]
-    pub serve_expired: Option<bool>,
     /// If `true`, preserve the upstream's original TTL (overrides `min_ttl`/`max_ttl`).
     #[serde(default)]
     pub keep_ttl: Option<bool>,

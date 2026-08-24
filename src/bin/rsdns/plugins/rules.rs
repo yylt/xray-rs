@@ -492,8 +492,7 @@ impl Rules {
 
     /// 顺序匹配规则并执行动作；无匹配 → NXDOMAIN。`forward` 是**终端**
     /// 动作：直接通过上游 provider 查询并把结果写入 `ctx.response`
-    /// （不再有独立的 upstream 管道阶段）。若当前查询是 stale 兜底
-    /// （`ctx.served_stale`），则用上游新鲜结果替换它。
+    /// （不再有独立的 upstream 管道阶段）。
     pub async fn handle<'a>(&'a self, ctx: &'a mut QueryContext) -> Step {
         if let Some(m) = self.metrics.get() {
             m.evaluated_total.inc();
@@ -516,10 +515,7 @@ impl Rules {
             }
         }
 
-        // 无匹配：stale 兜底时保留已构造的过期应答，否则 NXDOMAIN。
-        if ctx.served_stale {
-            return Step::Respond;
-        }
+        // 无匹配 → NXDOMAIN。
         match build_nxdomain(&ctx.msg) {
             Ok(resp) => {
                 ctx.response = Some(resp);
@@ -624,14 +620,9 @@ impl Rules {
                         Ok(()) => Step::Respond,
                         Err(e) => {
                             warn!("forward {} for {} failed: {}", upstream, ctx.name(), e);
-                            // stale 兜底时保留过期应答，否则 SERVFAIL。
-                            if ctx.served_stale {
-                                Step::Respond
-                            } else {
-                                ctx.response = Some(build_servfail(&ctx.msg));
-                                ctx.action = format!("forward-error({upstream})");
-                                Step::Respond
-                            }
+                            ctx.response = Some(build_servfail(&ctx.msg));
+                            ctx.action = format!("forward-error({upstream})");
+                            Step::Respond
                         }
                     }
                 }
@@ -670,8 +661,6 @@ impl Rules {
         resolve_cname: bool,
     ) -> io::Result<()> {
         let resp = self.upstreams.query(upstream, &ctx.msg).await?;
-        // 拿到上游新鲜结果：stale 兜底已被替换，允许写回缓存。
-        ctx.served_stale = false;
         let mut resp = resp;
         if resolve_cname {
             self.resolve_cnames(ctx, upstream, &mut resp).await;

@@ -77,7 +77,6 @@ cache:
   size: 4096                       # LRU capacity
   min_ttl: 60                      # clamp TTL lower bound (seconds)
   max_ttl: 3600                    # clamp TTL upper bound (seconds)
-  serve_expired: true              # serve stale cache when upstream fails
   keep_ttl: false                  # global default: clamp TTL
 
 # Hosts: suffix-matched static IP mapping (supports file: prefix and wildcard)

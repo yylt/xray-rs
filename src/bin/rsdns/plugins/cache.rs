@@ -4,12 +4,11 @@
 //! Pipeline position: after `groups`, before `rules`.  The stage splits
 //! into two calls driven by the server:
 //!
-//! - [`Cache::lookup`]: `ctx.skip_cache` → `Continue`; Fresh → build
-//!   response and `Respond` (short-circuits before rules); Stale
-//!   (serve_expired) → build fallback response from stale entry, mark
-//!   `ctx.served_stale`, `Continue` (the rules stage then re-runs through
-//!   the pipeline to refresh the entry with a fresh upstream answer);
-//!   Miss → `Continue`.
+//! - [`Cache::lookup`]: `ctx.skip_cache` → `Continue`; fresh hit → build
+//!   response and `Respond` (short-circuits before rules); miss →
+//!   `Continue`.  Expiry is handled by moka's per-entry TTL: expired
+//!   entries are excluded on read and evicted in the background, so a hit
+//!   is always fresh — there is no stale serving.
 //! - [`Cache::write_back`]: after the rules stage fills `ctx.response`, if
 //!   the response came from upstream (`ctx.action` starts with "forward")
 //!   and `!ctx.skip_cache`, it is written to cache.
@@ -19,6 +18,7 @@ use hickory_proto::rr::rdata::svcb::SVCB;
 use hickory_proto::rr::RecordType;
 use log::warn;
 use moka::future::Cache as MokaCache;
+use moka::Expiry;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,7 +66,10 @@ pub enum CacheRecord {
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub records: Arc<[CacheRecord]>,
-    pub expires_at: Instant,
+    /// Insertion time; `expires_at = created_at + entry TTL`.  Used only to
+    /// compute the remaining TTL for responses — expiry/eviction is owned
+    /// by moka's per-entry TTL.
+    pub created_at: Instant,
     pub ttl: u32,
 }
 
@@ -86,17 +89,53 @@ impl CacheEntry {
         if keep_ttl {
             return self.ttl;
         }
+        let expires_at = self.created_at + Duration::from_secs(self.ttl as u64);
         let now = Instant::now();
-        if now >= self.expires_at {
+        if now >= expires_at {
             return 0;
         }
-        (self.expires_at - now).as_secs() as u32
+        (expires_at - now).as_secs() as u32
+    }
+}
+
+/// Per-entry TTL policy for moka.  Computes each entry's lifetime from its
+/// `CacheEntry.ttl` (clamped by `min_ttl`/`max_ttl` unless `keep_ttl`).
+/// `expire_after_update` is overridden so a re-insert restarts the full TTL
+/// (the trait default keeps the previous remaining duration instead).
+struct TtlExpiry {
+    min_ttl: Duration,
+    max_ttl: Duration,
+    keep_ttl: bool,
+}
+
+impl TtlExpiry {
+    fn duration_for(&self, value: &CacheEntry) -> Duration {
+        if self.keep_ttl {
+            Duration::from_secs(value.ttl as u64)
+        } else {
+            Duration::from_secs(value.ttl as u64).clamp(self.min_ttl, self.max_ttl)
+        }
+    }
+}
+
+impl Expiry<CacheKey, CacheEntry> for TtlExpiry {
+    fn expire_after_create(&self, _key: &CacheKey, value: &CacheEntry, _created_at: Instant) -> Option<Duration> {
+        Some(self.duration_for(value))
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &CacheKey,
+        value: &CacheEntry,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(self.duration_for(value))
     }
 }
 
 pub enum CacheResult {
     Fresh(CacheEntry),
-    Stale(CacheEntry),
     Miss,
 }
 
@@ -106,7 +145,6 @@ pub enum CacheResult {
 pub struct CacheMetrics {
     pub lookup_total: Option<Counter>,
     pub entries: Option<Gauge>,
-    pub serve_expired_total: Option<Counter>,
 }
 
 impl CacheMetrics {
@@ -115,7 +153,6 @@ impl CacheMetrics {
         Self {
             lookup_total: Some(registry.counter("rsdns_cache_lookup_total", "Cache lookups", &["result"])),
             entries: Some(registry.gauge("rsdns_cache_entries", "Current cache entries", &[])),
-            serve_expired_total: Some(registry.counter("rsdns_cache_serve_expired_total", "Stale entries served", &[])),
         }
     }
 }
@@ -123,9 +160,6 @@ impl CacheMetrics {
 #[derive(Clone)]
 pub struct DnsCache {
     inner: MokaCache<CacheKey, CacheEntry, RandomState>,
-    min_ttl: Duration,
-    max_ttl: Duration,
-    serve_expired: bool,
     pub keep_ttl: bool,
     metrics: Arc<std::sync::OnceLock<CacheMetrics>>,
 }
@@ -133,16 +167,20 @@ pub struct DnsCache {
 impl DnsCache {
     /// Builds a cache with a shared metrics slot (filled in by the cache
     /// stage's `register_metrics`).
-    pub fn new_metric(size: usize, min_ttl: u32, max_ttl: u32, serve_expired: bool, keep_ttl: bool) -> Self {
+    pub fn new_metric(size: usize, min_ttl: u32, max_ttl: u32, keep_ttl: bool) -> Self {
         let metrics: Arc<std::sync::OnceLock<CacheMetrics>> = Arc::new(std::sync::OnceLock::new());
+        let min_ttl = Duration::from_secs(min_ttl as u64);
+        let max_ttl = Duration::from_secs(max_ttl as u64);
         let cache = MokaCache::builder()
             .max_capacity(size as u64)
+            .expire_after(TtlExpiry {
+                min_ttl,
+                max_ttl,
+                keep_ttl,
+            })
             .build_with_hasher(RandomState::new());
         Self {
             inner: cache,
-            min_ttl: Duration::from_secs(min_ttl as u64),
-            max_ttl: Duration::from_secs(max_ttl as u64),
-            serve_expired,
             keep_ttl,
             metrics,
         }
@@ -159,15 +197,9 @@ impl DnsCache {
     }
 
     pub async fn get_cached(&self, key: &CacheKey) -> CacheResult {
+        // moka excludes expired entries on read, so a hit is always fresh.
         let result = if let Some(entry) = self.inner.get(key).await {
-            let now = Instant::now();
-            if entry.expires_at > now {
-                CacheResult::Fresh(entry)
-            } else if self.serve_expired {
-                CacheResult::Stale(entry)
-            } else {
-                CacheResult::Miss
-            }
+            CacheResult::Fresh(entry)
         } else {
             CacheResult::Miss
         };
@@ -175,32 +207,19 @@ impl DnsCache {
         if let Some(m) = self.metrics.get() {
             let label = match &result {
                 CacheResult::Fresh(_) => "fresh",
-                CacheResult::Stale(_) => "stale",
                 CacheResult::Miss => "miss",
             };
             if let Some(c) = &m.lookup_total {
                 c.with_label_values(&[label]).inc();
-            }
-            if matches!(result, CacheResult::Stale(_)) {
-                if let Some(c) = &m.serve_expired_total {
-                    c.inc();
-                }
             }
         }
         result
     }
 
     pub async fn put(&self, key: CacheKey, records: Vec<CacheRecord>, ttl: u32) {
-        let now = Instant::now();
-        let ttl_duration = if self.keep_ttl {
-            Duration::from_secs(ttl as u64)
-        } else {
-            let d = Duration::from_secs(ttl as u64);
-            d.clamp(self.min_ttl, self.max_ttl)
-        };
         let entry = CacheEntry {
             records: records.into(),
-            expires_at: now + ttl_duration,
+            created_at: Instant::now(),
             ttl,
         };
         self.inner.insert(key, entry).await;
@@ -224,7 +243,6 @@ pub fn init(config: &Config, registry: &MetricsRegistry) -> Cache {
         cfg.size.unwrap_or(4096),
         cfg.min_ttl.unwrap_or(60),
         cfg.max_ttl.unwrap_or(3600),
-        cfg.serve_expired.unwrap_or(false),
         cfg.keep_ttl.unwrap_or(false),
     );
     let metrics = CacheMetrics::register(registry);
@@ -239,8 +257,8 @@ pub struct Cache {
 
 impl Cache {
     /// Cache-first lookup.  Returns `Respond` when a fresh cached entry
-    /// answers; `Continue` on miss or stale (stale sets `ctx.served_stale`
-    /// so the server spawns a background pipeline re-run).
+    /// answers; `Continue` on miss.  Expired entries are excluded by moka
+    /// on read, so there is no stale serving.
     pub async fn lookup(&self, ctx: &mut QueryContext) -> Step {
         if ctx.skip_cache {
             return Step::Continue;
@@ -265,35 +283,15 @@ impl Cache {
                     }
                 }
             }
-            CacheResult::Stale(entry) => {
-                // 缓存命中（stale 兜底）：先以 stale 应答返回，同样跳过 speed
-                // 阶段；后续规则阶段会用上游新鲜结果替换（此时未命中缓存，
-                // skip_speed 保持原值，新鲜结果仍会走 speed 排序）。
-                ctx.skip_speed = true;
-                let response = match build_response_from_cache(&ctx.msg, &entry, self.cache.keep_ttl) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("building cache stale for {} failed: {}", ctx.name(), e);
-                        build_servfail(&ctx.msg)
-                    }
-                };
-                // 先以 stale 应答兜底，并标记 `served_stale`；规则阶段会尝试
-                // 用上游的新鲜结果替换它（`refresh_stale`），成功则写回缓存。
-                ctx.response = Some(response);
-                ctx.action = "forward-stale".into();
-                ctx.served_stale = true;
-                Step::Continue
-            }
             CacheResult::Miss => Step::Continue,
         }
     }
 
     /// Writes an upstream response back into the cache (positive records +
-    /// NXDOMAIN negative), unless `ctx.skip_cache` was set, the response
-    /// did not come from upstream, or it is still an unreplaced stale
-    /// fallback (`ctx.served_stale`).
+    /// NXDOMAIN negative), unless `ctx.skip_cache` was set or the response
+    /// did not come from upstream.
     pub async fn write_back(&self, ctx: &QueryContext) {
-        if ctx.skip_cache || ctx.served_stale {
+        if ctx.skip_cache {
             return;
         }
         if let Some(response) = ctx.response.as_ref() {
@@ -317,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_fresh() {
-        let cache = DnsCache::new_metric(10, 60, 3600, false, false);
+        let cache = DnsCache::new_metric(10, 60, 3600, false);
         let key = CacheKey::new("example.com", RecordType::A);
         let records = vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))];
         cache.put(key.clone(), records.clone(), 300).await;
@@ -327,19 +325,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_stale() {
-        let cache = DnsCache::new_metric(10, 0, 1, true, false);
-        let key = CacheKey::new("stale.com", RecordType::A);
-        cache.put(key.clone(), vec![], 0).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    async fn test_cache_auto_expire() {
+        // 每条目 TTL 由 moka 自动过期：短 TTL 写入后，超过 TTL 即 miss。
+        let cache = DnsCache::new_metric(10, 0, 1, false);
+        let key = CacheKey::new("expire.com", RecordType::A);
+        cache
+            .put(key.clone(), vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))], 1)
+            .await;
 
         let result = cache.get_cached(&key).await;
-        assert!(matches!(result, CacheResult::Stale(_)));
+        assert!(matches!(result, CacheResult::Fresh(_)));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let result = cache.get_cached(&key).await;
+        assert!(matches!(result, CacheResult::Miss));
+    }
+
+    #[tokio::test]
+    async fn test_cache_put_resets_ttl() {
+        // 同 key 重新 put 后 TTL 从新值重新计时（expire_after_update 覆盖生效）。
+        let cache = DnsCache::new_metric(10, 0, 3600, false);
+        let key = CacheKey::new("refresh.com", RecordType::A);
+        cache
+            .put(key.clone(), vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))], 1)
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cache
+            .put(key.clone(), vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))], 1)
+            .await;
+        // 重新插入后仍应命中，且剩余 TTL 接近 1s（而非只剩 0.5s）。
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        if let CacheResult::Fresh(entry) = cache.get_cached(&key).await {
+            assert_eq!(entry.remaining_ttl(false), 0, "remaining TTL after 600ms of 1s TTL");
+        } else {
+            panic!("expected Fresh after re-insert");
+        }
     }
 
     #[tokio::test]
     async fn test_cache_miss() {
-        let cache = DnsCache::new_metric(10, 60, 3600, false, false);
+        let cache = DnsCache::new_metric(10, 60, 3600, false);
         let key = CacheKey::new("miss.com", RecordType::A);
         let result = cache.get_cached(&key).await;
         assert!(matches!(result, CacheResult::Miss));
@@ -347,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_empty_entry() {
-        let cache = DnsCache::new_metric(10, 60, 3600, false, false);
+        let cache = DnsCache::new_metric(10, 60, 3600, false);
         let key = CacheKey::new("block.test", RecordType::A);
         cache.put(key.clone(), vec![], 300).await;
         let result = cache.get_cached(&key).await;
@@ -356,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_nodata_action_name() {
-        let cache = DnsCache::new_metric(10, 60, 3600, false, false);
+        let cache = DnsCache::new_metric(10, 60, 3600, false);
         let key = CacheKey::new("nodata.test", RecordType::A);
         cache.put(key.clone(), vec![CacheRecord::NoData], 300).await;
         if let CacheResult::Fresh(entry) = cache.get_cached(&key).await {
@@ -368,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remaining_ttl_decrement() {
-        let cache = DnsCache::new_metric(10, 0, 3600, false, false);
+        let cache = DnsCache::new_metric(10, 0, 3600, false);
         let key = CacheKey::new("ttl.test", RecordType::A);
         let records = vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))];
         cache.put(key.clone(), records, 5).await;
@@ -384,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remaining_ttl_keepttl() {
-        let cache = DnsCache::new_metric(10, 0, 3600, false, true);
+        let cache = DnsCache::new_metric(10, 0, 3600, true);
         let key = CacheKey::new("keepttl.test", RecordType::A);
         let records = vec![CacheRecord::A(Ipv4Addr::new(1, 2, 3, 4))];
         cache.put(key.clone(), records, 5).await;
