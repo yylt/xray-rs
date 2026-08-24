@@ -284,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_upstream_response_nodata_a() {
-        let cache = DnsCache::new_metric(10, 60, 3600, false, false);
+        let cache = DnsCache::new_metric(10, 60, 3600, false);
         let key = CacheKey::new("nodata.example.com", RecordType::A);
         // 上游返回 NOERROR 空应答（NoData）
         let mut resp = make_query_msg("nodata.example.com", RecordType::A).unwrap();
@@ -310,7 +310,7 @@ mod tests {
             ("mx.example.com", RecordType::MX),
             ("https.example.com", RecordType::HTTPS),
         ] {
-            let cache = DnsCache::new_metric(10, 60, 3600, false, false);
+            let cache = DnsCache::new_metric(10, 60, 3600, false);
             let key = CacheKey::new(name, qtype);
             // 上游返回 NOERROR 空应答（NoData）
             let mut resp = make_query_msg(name, qtype).unwrap();

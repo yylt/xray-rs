@@ -126,7 +126,7 @@ logs(0) → hosts(10) → groups(15) → cache(20) → rules(30) → upstream(40
 | 0 | `logs` | 外层包裹：进入时计时，回卷时按 `ctx.skip_log` 决定是否打印；本身不短路 |
 | 10 | `hosts` | 静态映射命中 → `Respond`（硬性覆盖，语义同现在） |
 | 15 | `groups` | 解析域名归属组，设 `ctx.group` / `ctx.skip_cache`，**不短路** |
-| 20 | `cache` | 缓存优先：`skip_cache` → 直接 `Continue`；Fresh → `Respond`；Stale → `Respond` + 后台刷新；Miss → `Continue`；回卷后按 `ctx.skip_cache` 决定是否写入 |
+| 20 | `cache` | 缓存优先：`skip_cache` → 直接 `Continue`；Fresh → `Respond`；Miss → `Continue`；回卷后按 `ctx.skip_cache` 决定是否写入 |
 | 30 | `rules` | 顺序匹配：block/cname → `Respond`；forward → 设 `ctx.upstream` 并 `Continue`；无匹配 → NXDOMAIN `Respond` |
 | 40 | `upstream` | 终端：按 `ctx.upstream` 查询上游，写 `ctx.response`；经 `PluginHub` 提供给 rules 的 forward/cname 使用 |
 
@@ -365,7 +365,7 @@ Metrics：
 
 - 配置：`CacheConfig`（现有字段不变）。
 - 行为（缓存优先）：
-  - 查询：`ctx.skip_cache` → 直接 `Continue`；否则 `get_cached`：Fresh → 构造应答 `Respond`；Stale → 构造应答 + 用 `ctx.upstream` 后台刷新 `Respond`；Miss → `Continue`。
+  - 查询：`ctx.skip_cache` → 直接 `Continue`；否则 `get_cached`：Fresh → 构造应答 `Respond`；Miss → `Continue`。
   - 写入：`next.call` 回卷后，若 `!ctx.skip_cache` 且响应来自上游（`ctx.action` 为 forward 系列）→ `cache_upstream_response`。
 - 迁移：`cache.rs` 的 `DnsCache` 移入，`server.rs` 的 `cache_upstream_response / forward_to_upstream_bg` 移入。
 
@@ -373,12 +373,11 @@ Metrics：
 
 | 指标 | 类型 | 说明 |
 |------|------|------|
-| `rsdns_cache_lookup_total{result}` | Counter | 查询结果：fresh / stale / miss |
+| `rsdns_cache_lookup_total{result}` | Counter | 查询结果：fresh / miss |
 | `rsdns_cache_bypass_total` | Counter | 因 `skip_cache` 跳过查询/写入的次数 |
 | `rsdns_cache_insert_total` | Counter | 写入次数 |
 | `rsdns_cache_evict_total` | Counter | LRU 淘汰次数（moka `eviction_listener`） |
 | `rsdns_cache_entries` | Gauge | 当前条目数 |
-| `rsdns_cache_serve_expired_total` | Counter | 返回过期数据的次数 |
 | `rsdns_cache_ttl_clamped_total` | Counter | TTL 被 min/max 钳制次数 |
 
 ### 4.5 `rules` 插件（`plugins/rules.rs`）
@@ -624,7 +623,6 @@ cache:
   size: 4096
   min_ttl: 60
   max_ttl: 3600
-  serve_expired: true
 
 hosts:
   - "127.0.0.1 localhost"

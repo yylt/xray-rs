@@ -46,9 +46,9 @@ Do **not** hand-edit `src/generated/grpc_generated.rs`.
 - **Listeners (inbound)**: UDP (`ip:port`) and TCP (`tcp://ip:port`), configured via `binds[]`.
 - **Upstream protocols (outbound)**: plain UDP/TCP, DoT (`tls://`), DoH (`https://`), DoH3 (`h3://`), DoQ (`quic://`).
 - **Query pipeline** (`server.rs:handle_query`): fixed stages `hosts → groups → cache → rules`; `upstream` is **not** a stage — it is assembled at startup into `upstream::Upstreams` (a concrete type holding the named groups) and held directly by the `rules` stage for forward/cname; fallback returns NXDOMAIN/SERVFAIL.
-  - **Cache records**: A, AAAA, CNAME, MX, TXT, and HTTPS are cached. NXDOMAIN is negatively cached. Stale hits (serve_expired) continue through the pipeline so rules can replace them with a fresh upstream answer. Hosts and block responses are never cached.
+  - **Cache records**: A, AAAA, CNAME, MX, TXT, and HTTPS are cached. NXDOMAIN is negatively cached. Hosts and block responses are never cached.
 - **Rules**: ordered by priority. Actions: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override).
-- **Cache**: LRU with configurable capacity, TTL clamping, serve-expired with in-pipeline refresh.
+- **Cache**: LRU with configurable capacity, TTL clamping; per-entry TTL via moka `Expiry` — expired entries are evicted automatically (no stale serving; upstream failure → SERVFAIL).
 - **Connection pool**: adaptive weighted address selection, cooldown on failure, SOA health probes, per-address-family preference.
 
 ## Rules

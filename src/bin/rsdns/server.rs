@@ -138,9 +138,9 @@ impl DnsServer {
 
     /// Runs the fixed pipeline: logs → hosts → groups → cache → rules,
     /// then writes the upstream response back to cache and serializes the
-    /// response.  A stale cache hit (`ctx.served_stale`) continues through
-    /// the pipeline so the rules stage can replace it with a fresh upstream
-    /// answer.
+    /// response.  Cache hits are always fresh (moka evicts expired entries
+    /// on read), so a cache hit short-circuits and a miss continues to the
+    /// rules stage.
     async fn handle_query(&self, data: &[u8], client_addr: SocketAddr, proto: &'static str) -> io::Result<Vec<u8>> {
         let start = Instant::now();
         let msg = Message::from_vec(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -162,8 +162,8 @@ impl DnsServer {
         // Fixed pipeline.  Stage order is intentional:
         //   hosts   (static overrides, may short-circuit)
         //   groups  (resolve group, sets skip_cache — never short-circuits)
-        //   cache   (cache-first lookup; fresh may short-circuit, stale
-        //            continues with a fallback response to be refreshed)
+        //   cache   (cache-first lookup; fresh short-circuits, miss
+        //            continues — expired entries are evicted by moka)
         //   rules   (routing rules, terminal: block/cname/forward/nxdomain)
         // Upstream is queried directly by the rules stage via its own
         // `Arc<Upstreams>`.
@@ -191,7 +191,7 @@ impl DnsServer {
             r.metadata.id = msg_id;
         }
 
-        // 回卷：cache 写入（原 TTL；stale 刷新时已由 forward 写回）→ 查询日志。
+        // 回卷：cache 写入（原 TTL）→ 查询日志。
         self.pipeline.cache.write_back(&ctx).await;
         self.pipeline.logs.log_query(&ctx).await;
 

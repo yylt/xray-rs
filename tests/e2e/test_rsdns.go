@@ -44,7 +44,6 @@ upstreams:
       - address: 223.5.5.5
 cache:
   size: 4096
-  serve_expired: true
   min_ttl: 0
   max_ttl: 3600
 hosts:
@@ -76,7 +75,6 @@ upstreams:
       - address: %s
 cache:
   size: 4096
-  serve_expired: true
   min_ttl: 0
   max_ttl: 3600
 hosts:
@@ -163,7 +161,6 @@ upstreams:
       - address: %s
 cache:
   size: 4096
-  serve_expired: true
   min_ttl: 0
   max_ttl: 3600
 hosts: []
