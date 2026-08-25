@@ -10,7 +10,7 @@
 - 出站：`freedom`、`blackhole`、`socks`、`trojan`、`vless`、`reverse`
 - 路由：支持 `domain`、`ip`、`inboundTag` 与 fallback
 - 传输：支持 `tcp`、`ws`、`grpc`，并支持 `tls`
-- DNS：内置 `DnsResolver`，并提供独立二进制 `rsdns`
+- DNS：内置 `DnsResolver`（独立 DNS 程序 `rsdns` 已迁移至独立仓库）
 
 ## 快速开始
 
@@ -23,7 +23,6 @@ cargo build --release
 生成：
 
 - `target/release/xray-rs`
-- `target/release/rsdns`
 
 ### 运行主程序
 
@@ -139,38 +138,6 @@ dns:
 - 架构说明（中文）：[`docs/arch.zh.md`](./docs/arch.zh.md)
 - Architecture (English): [`docs/arch.en.md`](./docs/arch.en.md)
 
-## rsdns
-
-独立 DNS 服务器，支持丰富的入站协议和上游查询通道：
-
-### 入站
-
-- UDP (`ip:port`)
-- TCP (`tcp://ip:port`)
-
-### 上游
-
-- UDP / TCP（原生 DNS）
-- DoT (`tls://`)
-- DoH (`https://`)
-- DoH3 (`h3://`)
-- DoQ (`quic://`)
-
-### 功能
-
-- **查询管道**：hosts → cache → rules → upstream，未命中规则返回 NXDOMAIN
-- **规则**：支持 `block`（NXDomain/毒化 IP）、`cname`（重写 + 递归解析）、`forward`（转发到上游池，可配置绕过缓存/TTL 覆盖）
-- **缓存**：LRU，可配置容量、TTL 范围、过期回退（返回过期结果 + 后台刷新）
-- **连接池**：自适应加权地址选择、故障冷却、SOA 健康探测、地址族偏好
-
-运行：
-
-```bash
-cargo run --bin rsdns -- -c rsdns.yaml
-```
-
-完整示例配置：`example/rsdns-all-example.yaml`
-
 ## 开发
 
 ```bash
@@ -184,6 +151,10 @@ cargo test
 - `jemalloc`
 - `aws-lc-rs`
 - `ring`
+
+## rsdns
+
+独立 DNS 服务器已迁移至独立仓库：[`rsdns`](https://github.com/yylt/xray-rs/tree/main/rsdns)（`rsdns/` 目录内为独立 crate，含完整 README、CI、测试与设计文档）。
 
 ## 说明
 

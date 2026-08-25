@@ -2,14 +2,15 @@
 
 Default language: English | [中文](./arch.zh.md)
 
-This document explains the main architecture of `xray-rs`, the responsibilities of its modules, and the runtime flows of both the main program and `rsdns`, based on the current `src/` implementation.
+This document explains the main architecture of `xray-rs`, the responsibilities of its modules, and the runtime flow, based on the current `src/` implementation.
 
 ## 1. Overview
 
-From the current code structure, the project has two main runtime paths:
+From the current code structure, the project has one main runtime path:
 
 1. **Main proxy program**: reads config, builds inbounds, outbounds, routing, and DNS, then forwards connections
-2. **Standalone DNS program `rsdns`**: reads YAML config, builds a rule engine, cache, and upstream DNS clients, and serves DNS requests
+
+(The standalone DNS program `rsdns` has moved to an independent crate under the `rsdns/` directory of this repository; see that directory's docs for its architecture.)
 
 Overall, the main program acts like an “assembler + runtime coordinator”, while protocol details, routing logic, and transport abstractions are placed in separate modules.
 
@@ -23,7 +24,6 @@ According to `src/lib.rs` and the directory structure, the core modules are:
 - `src/route/`
 - `src/transport/`
 - `src/common/`
-- `src/bin/rsdns/`
 - `src/generated/`
 
 ### 2.1 `command`
@@ -92,15 +92,11 @@ Main contents:
 
 - `resolver.rs`: DNS resolver
 - `router.rs`: router for the main proxy program
-- `dns.rs`: DNS rule engine used by `rsdns`
 - `matcher.rs`: matchers for domain/group and related logic
 - `trie.rs`: index structures for domain and IP rules
 - `cache.rs`: DNS cache-related functionality
 
-`route` serves two distinct roles in the project:
-
-1. **Main-program traffic routing**: choose an outbound tag for a connection
-2. **Standalone DNS decision making**: choose an action for a DNS query, such as forward, block, or rewrite
+`route` serves the main-program traffic routing role: choose an outbound tag for a connection.
 
 ### 2.5 `transport`
 
@@ -129,17 +125,9 @@ This document does not enumerate everything there, but from the call graph it co
 - stream forwarder `StreamForwarder`
 - parsing helpers and general networking utilities
 
-### 2.7 `src/bin/rsdns`
+### 2.7 `rsdns`
 
-Responsibility: standalone DNS executable.
-
-Key files:
-
-- `src/bin/rsdns/main.rs`
-- `src/bin/rsdns/server.rs`
-- `src/bin/rsdns/upstream.rs`
-
-It does not go through the `command/run.rs` main proxy flow. Instead, it runs its own DNS-serving path.
+The standalone DNS program has moved to an independent crate under the `rsdns/` directory of this repository. Its architecture, query pipeline (`hosts → groups → cache → rules`), upstream protocols, and connection pool are described in that directory's docs.
 
 ## 3. Main program startup flow
 
@@ -416,63 +404,9 @@ The benefit of this unified abstraction is:
 
 It effectively acts as the link-layer configuration below the proxy protocol layer.
 
-## 9. `rsdns` architecture
+## 9. Data-flow view
 
-`rsdns` shares some `route` capabilities with the main proxy program, but its runtime target is different: it processes DNS packets rather than proxy connection streams.
-
-### 9.1 Startup flow
-
-The flow in `src/bin/rsdns/main.rs` is roughly:
-
-```text
-main
-  -> read rsdns.yaml
-  -> build_groups
-  -> build_hosts
-  -> build_rules
-  -> build_upstreams
-  -> create DnsCache
-  -> create RuleEngine
-  -> create DnsServer
-  -> start listeners from listen config
-```
-
-### 9.2 Core components
-
-- `RuleEngine`: decides which action should be applied to a DNS query
-- `HostsTable`: static hosts mapping
-- `DnsCache`: DNS response cache
-- `UpstreamClient`: sends queries to upstream DNS servers
-- `DnsServer`: listens for and handles client DNS requests
-
-### 9.3 Rule actions
-
-In `src/route/dns.rs`, the visible actions are currently:
-
-- `Forward { upstream, outbound_tag }`
-- `Block`
-- `Rewrite { ip }`
-- `Hosts`
-
-Among them:
-
-- `Hosts` has the highest priority; if hosts matches, the result comes from hosts directly
-- other rules are matched in declaration order
-- if nothing matches, behavior falls back to a default `Forward`
-
-### 9.4 groups and matchers
-
-In `rsdns`, rules can combine:
-
-- exact domain matching
-- domain suffix matching
-- group matching
-
-A group can be loaded from a file or defined inline. It is then used by `RuleEngine` in a unified way.
-
-## 10. Data-flow view
-
-### 10.1 Main proxy program data flow
+### 9.1 Main proxy program data flow
 
 ```text
 config file
@@ -484,18 +418,9 @@ config file
   -> forwarder does bidirectional forwarding
 ```
 
-### 10.2 `rsdns` data flow
+(The `rsdns` data flow moved with its independent repository; see the `rsdns/` directory docs.)
 
-```text
-rsdns.yaml
-  -> groups/hosts/rules/upstreams
-  -> RuleEngine
-  -> DnsServer receives query
-  -> hosts / rule / default forward
-  -> DNS response returned
-```
-
-## 11. Current architectural characteristics
+## 10. Current architectural characteristics
 
 ### Strengths
 
@@ -508,10 +433,9 @@ rsdns.yaml
 
 - full field-level documentation for all protocol-specific config is still to be extracted from individual protocol modules
 - the `version` subcommand is currently almost empty
-- `rsdns` listening is mainly implemented for UDP; `tcp://`, `tls://`, and `https://` remain TODOs
 - some capabilities depend on features or dependency-version constraints, such as `tun` and the exact DoT/DoH support range
 
-## 12. Recommended source-reading order
+## 11. Recommended source-reading order
 
 If you want to continue reading the source, a good order is:
 
@@ -523,17 +447,16 @@ If you want to continue reading the source, a good order is:
 6. `src/proxy/mod.rs`
 7. `src/route/mod.rs` / `src/route/router.rs` / `src/route/resolver.rs`
 8. `src/transport/mod.rs`
-9. `src/bin/rsdns/main.rs`
 
 This makes it easier to understand the main flow first, then dive into implementation details.
 
-## 13. Related docs
+## 12. Related docs
 
 - README (Chinese): [`../README.md`](../README.md)
 - README (English): [`../README.en.md`](../README.en.md)
 - Usage Guide (Chinese): [`./usage.zh.md`](./usage.zh.md)
 - Usage Guide (English): [`./usage.en.md`](./usage.en.md)
 
-## 14. Notes
+## 13. Notes
 
 This is an architecture description of the current implementation, not a future roadmap. If module responsibilities or startup flows change later, the documentation should be updated to match the source.

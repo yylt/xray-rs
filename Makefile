@@ -5,7 +5,7 @@ CARGO_BIN_DIR := $(HOME)/.cargo/bin
 PROTOC_GEN_PROST := $(CARGO_BIN_DIR)/protoc-gen-prost
 PROTOC_GEN_TONIC := $(CARGO_BIN_DIR)/protoc-gen-tonic
 
-.PHONY: tools generate build build-rsdns build-xray fmt test check clippy ci clean-generated
+.PHONY: tools generate build build-xray fmt test check clippy ci clean-generated
 
 tools:
 	cargo install protoc-gen-prost --locked
@@ -13,9 +13,6 @@ tools:
 
 build:
 	cargo build -r --bin xray-rs
-
-build-rsdns:
-	cargo build --bin rsdns
 
 build-xray:
 	cargo build --bin xray-rs
