@@ -10,7 +10,7 @@ A lightweight proxy core implemented in Rust, with composable inbound, outbound,
 - Outbounds: `freedom`, `blackhole`, `socks`, `trojan`, `vless`, `reverse`
 - Routing: supports `domain`, `ip`, `inboundTag`, and fallback
 - Transport: supports `tcp`, `ws`, `grpc`, with optional `tls`
-- DNS: built-in `DnsResolver` and standalone `rsdns` binary
+- DNS: built-in `DnsResolver` (the standalone `rsdns` binary has moved to its own repository)
 
 ## Quick Start
 
@@ -23,7 +23,6 @@ cargo build --release
 Produces:
 
 - `target/release/xray-rs`
-- `target/release/rsdns`
 
 ### Run the main program
 
@@ -114,20 +113,6 @@ Other architectures depend on dependency support, enabled features, and target p
 - Architecture (Chinese): [`docs/arch.zh.md`](./docs/arch.zh.md)
 - Architecture (English): [`docs/arch.en.md`](./docs/arch.en.md)
 
-## rsdns
-
-The repository also includes a standalone DNS binary:
-
-```bash
-cargo run --bin rsdns -- -c rsdns.yaml
-```
-
-From the current source:
-
-- default config file: `rsdns.yaml`
-- supports `forward`, `block`, and `rewrite`
-- listening is currently implemented mainly for `udp://`
-
 ## Development
 
 ```bash
@@ -141,6 +126,10 @@ Common features:
 - `jemalloc`
 - `aws-lc-rs`
 - `ring`
+
+## rsdns
+
+The standalone DNS server has moved to its own repository: [`rsdns`](https://github.com/yylt/xray-rs/tree/main/rsdns) (the `rsdns/` directory is an independent crate with its own README, CI, tests, and design docs).
 
 ## Notes
 

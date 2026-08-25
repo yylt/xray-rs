@@ -15,7 +15,6 @@ cargo build --release
 生成的常用二进制：
 
 - `target/release/xray-rs`
-- `target/release/rsdns`
 
 ### 1.2 运行主程序
 
@@ -440,25 +439,9 @@ config.yaml
 - 若域名路由不符合预期，检查 `domainStrategy`
 - 若代理出站连接失败，检查是否配置了 `fallback.tags`
 
-## 11. rsdns 简要使用
+## 11. rsdns
 
-仓库内还包含独立 DNS 程序：
-
-```bash
-cargo run --bin rsdns -- -c rsdns.yaml
-```
-
-从 `src/bin/rsdns/main.rs` 可见：
-
-- 默认配置文件：`rsdns.yaml`
-- 支持 `listen`、`groups`、`upstreams`、`cache`、`hosts`、`rules`
-- 规则动作包括：
-  - `block`
-  - `rewrite`
-  - `forward`
-- 当前监听实现主要是 `udp://`
-
-如果你需要把 `rsdns` 作为项目主能力使用，建议另写更细的 DNS 专项文档。
+独立 DNS 程序 `rsdns` 已迁移至独立仓库（本仓库 `rsdns/` 目录内为独立 crate），相关使用与设计文档见该仓库的 README 与 `docs/design/`。
 
 ## 12. 相关文档
 

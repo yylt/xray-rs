@@ -20,7 +20,6 @@ var (
 	projectRoot string
 	binaryPath  string
 	verbose     bool
-	suite       string
 )
 
 // errSkip is a sentinel error that signals a test was skipped.
@@ -28,7 +27,6 @@ var errSkip = errors.New("SKIP")
 
 func init() {
 	flag.BoolVar(&verbose, "v", false, "verbose output")
-	flag.StringVar(&suite, "suite", "all", "test suite: xray, rsdns, all")
 	flag.Parse()
 
 	wd, err := os.Getwd()
@@ -36,52 +34,27 @@ func init() {
 		log.Fatal(err)
 	}
 	projectRoot = filepath.Join(wd, "../..")
-
-	if suite == "rsdns" {
-		binaryPath = filepath.Join(projectRoot, "target/debug/rsdns")
-	} else {
-		binaryPath = filepath.Join(projectRoot, "target/debug/xray-rs")
-	}
 }
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	log.Printf("[main] Starting E2E tests suite=%s", suite)
+	log.Printf("[main] Starting E2E tests suite=xray")
 	log.Printf("[main] projectRoot=%s binaryPath=%s verbose=%v", projectRoot, binaryPath, verbose)
 
-	if suite == "rsdns" {
-		rsdnsBin := filepath.Join(projectRoot, "target/debug/rsdns")
-		if _, err := os.Stat(rsdnsBin); err != nil {
-			rsdnsBin = filepath.Join(projectRoot, "target/release/rsdns")
-			if _, err := os.Stat(rsdnsBin); err != nil {
-				log.Fatalf("[main] rsdns binary not found at target/debug/rsdns or target/release/rsdns. Build first.")
-			}
-		}
-		binaryPath = rsdnsBin
-		log.Printf("[main] Using rsdns binary: %s", binaryPath)
-	} else {
+	binaryPath = filepath.Join(projectRoot, "target/debug/xray-rs")
+	if _, err := os.Stat(binaryPath); err != nil {
+		log.Printf("[main] Debug binary not found, trying release...")
+		binaryPath = filepath.Join(projectRoot, "target/release/xray-rs")
 		if _, err := os.Stat(binaryPath); err != nil {
-			log.Printf("[main] Debug binary not found, trying release...")
-			binaryPath = filepath.Join(projectRoot, "target/release/xray-rs")
-			if _, err := os.Stat(binaryPath); err != nil {
-				log.Fatalf("[main] Binary not found at %s. Build first.", binaryPath)
-			}
+			log.Fatalf("[main] Binary not found at %s. Build first.", binaryPath)
 		}
-		log.Printf("[main] Using binary: %s", binaryPath)
 	}
+	log.Printf("[main] Using binary: %s", binaryPath)
 
 	results := &TestResults{}
 
-	if suite == "all" || suite == "xray" {
-		runTest(results, "WebSocket+TLS+Trojan", testWSTLSTrojan)
-		runTest(results, "gRPC+TLS+Trojan", testGRPCTLSTrojan)
-	}
-
-	if suite == "all" || suite == "rsdns" {
-		for _, t := range RsdnsTests {
-			runTest(results, "rsdns/"+t.Name, t.Fn)
-		}
-	}
+	runTest(results, "WebSocket+TLS+Trojan", testWSTLSTrojan)
+	runTest(results, "gRPC+TLS+Trojan", testGRPCTLSTrojan)
 
 	results.PrintSummary()
 

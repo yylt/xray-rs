@@ -2,14 +2,15 @@
 
 默认语言：中文 | [English](./arch.en.md)
 
-本文基于当前 `src/` 源码，说明 `xray-rs` 的主要架构、模块职责，以及主程序与 `rsdns` 的运行链路。
+本文基于当前 `src/` 源码，说明 `xray-rs` 的主要架构、模块职责与运行链路。
 
 ## 1. 总览
 
-从当前代码结构看，项目可以分成两条主要运行线：
+从当前代码结构看，项目是一条主要运行线：
 
 1. **主代理程序**：读取配置，构建入站、出站、路由与 DNS，然后进行连接转发
-2. **独立 DNS 程序 `rsdns`**：读取 YAML 配置，构建规则引擎、缓存与上游 DNS，提供规则驱动的 DNS 服务
+
+（独立 DNS 程序 `rsdns` 已迁移至本仓库 `rsdns/` 目录下的独立 crate，相关架构见该目录的文档。）
 
 整体上，主程序更像一个“装配器 + 运行时协调器”，而协议细节、路由逻辑、传输抽象分别放在独立模块中。
 
@@ -23,7 +24,6 @@
 - `src/route/`
 - `src/transport/`
 - `src/common/`
-- `src/bin/rsdns/`
 - `src/generated/`
 
 ### 2.1 `command`
@@ -92,15 +92,11 @@
 
 - `resolver.rs`：DNS 解析器
 - `router.rs`：主代理程序的路由器
-- `dns.rs`：`rsdns` 使用的 DNS 规则引擎
 - `matcher.rs`：域名/组等匹配器
 - `trie.rs`：域名与 IP 规则索引结构
 - `cache.rs`：DNS 缓存相关能力
 
-`route` 在项目中承担两类职责：
-
-1. **主程序流量路由**：给连接选一个 outbound tag
-2. **独立 DNS 决策**：给 DNS 查询选一个动作，如转发、阻断、重写
+`route` 在项目中承担主程序流量路由职责：给连接选一个 outbound tag。
 
 ### 2.5 `transport`
 
@@ -129,17 +125,9 @@
 - 数据转发器 `StreamForwarder`
 - 解析辅助与网络公共逻辑
 
-### 2.7 `src/bin/rsdns`
+### 2.7 `rsdns`
 
-职责：独立 DNS 可执行程序。
-
-关键文件：
-
-- `src/bin/rsdns/main.rs`
-- `src/bin/rsdns/server.rs`
-- `src/bin/rsdns/upstream.rs`
-
-它不走 `command/run.rs` 那套代理主流程，而是单独完成 DNS 规则服务。
+独立 DNS 程序已迁移至本仓库 `rsdns/` 目录（独立 crate）。其架构、查询管道（`hosts → groups → cache → rules`）、上游协议与连接池说明见 `rsdns/` 目录内的文档与设计文档。
 
 ## 3. 主程序启动链路
 
@@ -416,63 +404,9 @@ fallback 机制不是“备用默认路由”，而是“主路由标签已选�
 
 它相当于“协议之下的链路配置层”。
 
-## 9. `rsdns` 架构
+## 9. 数据流视角
 
-`rsdns` 与主代理程序共享一部分 `route` 能力，但它的运行目标不同：它处理的是 DNS 查询报文，而不是代理连接流。
-
-### 9.1 启动流程
-
-`src/bin/rsdns/main.rs` 的流程大致为：
-
-```text
-main
-  -> 读取 rsdns.yaml
-  -> build_groups
-  -> build_hosts
-  -> build_rules
-  -> build_upstreams
-  -> 创建 DnsCache
-  -> 创建 RuleEngine
-  -> 创建 DnsServer
-  -> 按 listen 启动监听
-```
-
-### 9.2 核心组件
-
-- `RuleEngine`：判断 DNS 查询应执行什么动作
-- `HostsTable`：静态 hosts 映射
-- `DnsCache`：DNS 响应缓存
-- `UpstreamClient`：对上游 DNS 发起查询
-- `DnsServer`：监听并处理客户端 DNS 请求
-
-### 9.3 规则动作
-
-`src/route/dns.rs` 当前可见的动作有：
-
-- `Forward { upstream, outbound_tag }`
-- `Block`
-- `Rewrite { ip }`
-- `Hosts`
-
-其中：
-
-- `Hosts` 优先级最高，只要 hosts 命中就直接返回 hosts 结果
-- 其余规则按声明顺序匹配
-- 若都不命中，则回退到默认 `Forward`
-
-### 9.4 groups 与 matcher
-
-`rsdns` 中的 rules 可以结合：
-
-- 域名精确匹配
-- 域名后缀匹配
-- group 匹配
-
-group 可以从文件加载，也可以 inline 定义。最终统一进入 `RuleEngine` 使用。
-
-## 10. 数据流视角
-
-### 10.1 主代理程序数据流
+### 9.1 主代理程序数据流
 
 ```text
 配置文件
@@ -484,18 +418,9 @@ group 可以从文件加载，也可以 inline 定义。最终统一进入 `Rule
   -> forwarder 双向转发
 ```
 
-### 10.2 rsdns 数据流
+（`rsdns` 的数据流已随其独立仓库迁移，见 `rsdns/` 目录文档。）
 
-```text
-rsdns.yaml
-  -> groups/hosts/rules/upstreams
-  -> RuleEngine
-  -> DnsServer 接收查询
-  -> 命中 hosts / rule / default forward
-  -> 返回 DNS 响应
-```
-
-## 11. 当前架构特点
+## 10. 当前架构特点
 
 ### 优点
 
@@ -508,10 +433,9 @@ rsdns.yaml
 
 - 一些配置字段的完整文档仍需进一步从协议模块中提炼
 - `version` 子命令当前基本为空实现
-- `rsdns` 的监听目前主要实现了 UDP，`tcp://`、`tls://`、`https://` 仍是 TODO
 - 某些底层实现能力存在 feature 或依赖版本限制，例如 `tun`、DoT/DoH 支持范围
 
-## 12. 适合理解源码的阅读顺序
+## 11. 适合理解源码的阅读顺序
 
 如果你准备继续读源码，推荐顺序如下：
 
@@ -523,17 +447,16 @@ rsdns.yaml
 6. `src/proxy/mod.rs`
 7. `src/route/mod.rs` / `src/route/router.rs` / `src/route/resolver.rs`
 8. `src/transport/mod.rs`
-9. `src/bin/rsdns/main.rs`
 
 这样最容易先理解“主流程”，再深入到“具体实现”。
 
-## 13. 相关文档
+## 12. 相关文档
 
 - README（中文）：[`../README.md`](../README.md)
 - README (English): [`../README.en.md`](../README.en.md)
 - 使用说明（中文）：[`./usage.zh.md`](./usage.zh.md)
 - Usage Guide (English): [`./usage.en.md`](./usage.en.md)
 
-## 14. 说明
+## 13. 说明
 
 本文是面向当前实现的架构说明，不是未来规划文档。若后续模块职责或启动流程发生变化，请以源码为准同步更新。
