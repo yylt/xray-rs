@@ -44,7 +44,7 @@ use xray_rs::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
 use crate::config::{BlockResponse as CfgBlockResponse, Config, RuleActionConfig, RuleConfig};
 use crate::metrics::{Counter, MetricsRegistry};
 use crate::plugins::util::{
-    build_nodata, build_nxdomain, build_poison, build_servfail, make_query_msg, make_response_base,
+    build_nodata, build_nxdomain, build_poison, build_servfail, make_query_msg, make_response_base, parse_name,
     rewrite_ttl_in_response,
 };
 use crate::query::{QueryContext, Step};
@@ -364,7 +364,7 @@ fn build_rewrite_response(
     let ip: Ipv4Addr = substitute_placeholders(target, captures)
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "target is not a valid IPv4"))?;
-    let rr_name = Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let rr_name = parse_name(name)?;
     let mut response = make_response_base(msg)?;
     response.answers.push(Record::from_rdata(rr_name, ttl, RData::A(A(ip))));
     Ok(response)
@@ -679,10 +679,9 @@ impl Rules {
     ///
     /// 若开头连续多条都是 CNAME（纯 CNAME 链），**只处理最后一条**：直接解析
     /// 最后一个 target，跳过多级中间链。解析返回 A/AAAA → 用其替换整条 CNAME
-    /// 链（owner 改写为原查询名）；返回空 → 丢弃该（最后一条）CNAME 并停止；
-    /// 返回 CNAME / 其他类型 / 解析出错 → 原样保留当前响应并结束（不追链）。
+    /// 链（owner 改写为原查询名.
+    /// 返回空 / 返回 CNAME / 其他类型 / 解析出错 → 原样保留当前响应并结束（不追链）。
     async fn resolve_cnames(&self, ctx: &QueryContext, upstream: &str, resp: &mut Message) {
-        let query_name = ctx.msg.queries.first().map(|q| q.name().clone()).unwrap_or_default();
         let Some(idx) = last_cname_index(&resp.answers) else {
             return;
         };
@@ -709,17 +708,15 @@ impl Rules {
                 return;
             }
         };
+
         match classify_resolved(&resolved) {
             Resolved::Address => {
-                let replacement = address_records_with_owner(&resolved, &query_name);
+                let query_name = ctx.msg.queries.first().map(|q| q.name()).unwrap();
+                let replacement = address_records_with_owner(&resolved, query_name);
                 resp.answers = replacement;
             }
-            Resolved::Empty => {
-                // 丢弃该（最后一条）CNAME，停止处理，不检查下一条。
-                resp.answers.remove(idx);
-            }
-            Resolved::Cname | Resolved::Other => {
-                // 不丢弃，原样返回上游原始响应，停止处理。
+            Resolved::Empty | Resolved::Cname | Resolved::Other => {
+                // 原样返回上游原始响应，停止处理。
             }
         }
     }
@@ -739,7 +736,7 @@ impl Rules {
         }
         let target = substitute_placeholders(target, &ctx.captures);
         let query_name = ctx.msg.queries.first().map(|q| q.name().clone()).unwrap_or_default();
-        let cname_name = Name::from_utf8(&target).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let cname_name = parse_name(&target)?;
         let cname_record = Record::from_rdata(query_name.clone(), ttl, RData::CNAME(CNAME(cname_name)));
 
         let target_msg = make_query_msg(&target, ctx.qtype())?;
@@ -755,7 +752,6 @@ impl Rules {
                 );
                 let mut resp = make_response_base(&ctx.msg)?;
                 resp.answers.push(cname_record);
-                resp.metadata.id = ctx.msg.id;
                 return Ok(resp);
             }
         };

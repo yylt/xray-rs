@@ -10,7 +10,7 @@
 //! group's trie is rebuilt and atomically swapped.
 
 use log::{info, warn};
-use notify::{EventKind, RecursiveMode, Watcher};
+use notify::{RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use xray_rs::common::domain_trie::{DomainSuffixTrie, DomainSuffixTrieBuilder};
 
 use crate::config::{Config, GroupConfig};
 use crate::metrics::{Counter, Gauge, MetricsRegistry};
+use crate::plugins::util::is_change_event;
 use crate::query::{QueryContext, Step};
 
 /// A reloadable domain source file.
@@ -50,9 +51,7 @@ impl GroupState {
         let mut inline = Vec::new();
         let mut files = Vec::new();
         for item in &cfg.domains {
-            if let Some(path) = item.strip_prefix("file://") {
-                files.push(GroupFile(PathBuf::from(path)));
-            } else if let Some(path) = item.strip_prefix("file:") {
+            if let Some(path) = item.strip_prefix("file://").or_else(|| item.strip_prefix("file:")) {
                 files.push(GroupFile(PathBuf::from(path)));
             } else {
                 inline.push(item.trim_start_matches("*.").to_string());
@@ -181,14 +180,6 @@ impl GroupsMetrics {
 pub struct Groups {
     groups: Vec<Arc<GroupState>>,
     metrics: std::sync::OnceLock<Arc<GroupsMetrics>>,
-}
-
-/// 校验 watch 事件：仅关注写入/重命名/删除/创建（含原子替换 tmp->target）。
-fn is_change_event(kind: &EventKind) -> bool {
-    matches!(
-        kind,
-        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) | EventKind::Any | EventKind::Other
-    )
 }
 
 /// Builds the groups stage from the top-level `groups[]` array, registering

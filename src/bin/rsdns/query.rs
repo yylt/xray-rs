@@ -72,6 +72,11 @@ pub struct QueryContext {
     /// `match: "{1}.example.com"`); index = placeholder number - 1.  Set by
     /// the rules stage; reused by actions (e.g. `cname.target`).
     pub captures: Vec<String>,
+    /// The client-queried name before a hosts alias rewrite.  Set by the
+    /// hosts stage when an alias without an IP mapping rewrites the query
+    /// target to the original domain; the server restores the queried name
+    /// on the final answer (question + answer owners).
+    pub original_name: Option<String>,
 }
 
 impl QueryContext {
@@ -97,6 +102,7 @@ impl QueryContext {
             action: String::new(),
             group: None,
             captures: Vec::new(),
+            original_name: None,
         }
     }
 
@@ -107,5 +113,50 @@ impl QueryContext {
 
     pub fn qtype(&self) -> RecordType {
         self.key.qtype
+    }
+
+    /// Rewrites the query target to `name` (hosts alias: alias → original
+    /// domain).  Updates both the cache key and the message question so the
+    /// remaining pipeline stages (groups / cache / rules / upstream) all
+    /// operate on the new target.
+    pub fn rewrite_name(&mut self, name: &str) {
+        self.key.name = name.to_string();
+        if let Ok(n) = hickory_proto::rr::Name::from_utf8(name) {
+            if let Some(q) = self.msg.queries.first_mut() {
+                q.set_name(n);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::util::make_query_msg;
+    use hickory_proto::rr::RecordType;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::time::Instant;
+
+    fn ctx(name: &str) -> QueryContext {
+        let msg = make_query_msg(name, RecordType::A).unwrap();
+        QueryContext::new(
+            msg,
+            CacheKey::new(name, RecordType::A),
+            SocketAddr::from_str("127.0.0.1:5353").unwrap(),
+            "udp",
+            Instant::now(),
+            0,
+        )
+    }
+
+    #[test]
+    fn test_rewrite_name_updates_key_and_question() {
+        let mut c = ctx("cdn1.example.com");
+        c.rewrite_name("edge.example.com");
+        assert_eq!(c.key.name, "edge.example.com");
+        assert_eq!(c.name(), "edge.example.com");
+        let q = c.msg.queries.first().unwrap();
+        assert_eq!(q.name().to_utf8(), "edge.example.com");
     }
 }

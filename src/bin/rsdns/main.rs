@@ -14,7 +14,6 @@ use std::sync::Arc;
 use xray_rs::common::rslog;
 
 use config::Config;
-use plugins::metrics::MetricsConfig;
 use server::{DnsServer, Pipeline};
 
 #[cfg(feature = "mimalloc")]
@@ -147,7 +146,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // metrics 插件：配置了 metrics 段才启动 HTTP 端点。
-    if let Some(cfg) = metrics_config(&config) {
+    if let Some(cfg) = plugins::metrics::config(&config) {
         let registry = metrics.clone();
         tasks.spawn(async move {
             if let Err(e) = plugins::metrics::serve_metrics(cfg, registry).await {
@@ -169,8 +168,4 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 fn parse_bind(s: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
     let s = s.strip_prefix("tcp://").unwrap_or(s);
     s.parse::<SocketAddr>().map_err(|e| e.into())
-}
-
-fn metrics_config(config: &Config) -> Option<MetricsConfig> {
-    plugins::metrics::config(config)
 }

@@ -187,10 +187,24 @@ impl DnsServer {
         // speed 阶段：对 A/AAAA 应答按测速 RTT 排序（后置 pass，不短路）。
         self.pipeline.speed.handle(&mut ctx).await;
 
+        // hosts 别名无 IP 分支：解析目标被改写为原域名，最终应答按客户端
+        // 查询名（original_name）呈现 —— 恢复 question 与 answer owner。
+        if let Some(original) = ctx.original_name.take() {
+            if let Ok(n) = hickory_proto::rr::Name::from_utf8(&original) {
+                if let Some(resp) = ctx.response.as_mut() {
+                    if let Some(q) = resp.queries.first_mut() {
+                        q.set_name(n.clone());
+                    }
+                    for ans in &mut resp.answers {
+                        ans.name = n.clone();
+                    }
+                }
+            }
+        }
+
         if let Some(r) = ctx.response.as_mut() {
             r.metadata.id = msg_id;
         }
-
         // 回卷：cache 写入（原 TTL）→ 查询日志。
         self.pipeline.cache.write_back(&ctx).await;
         self.pipeline.logs.log_query(&ctx).await;
