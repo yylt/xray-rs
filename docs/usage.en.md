@@ -15,7 +15,6 @@ cargo build --release
 Common binaries produced:
 
 - `target/release/xray-rs`
-- `target/release/rsdns`
 
 ### 1.2 Run the main program
 
@@ -440,25 +439,9 @@ Suggestions:
 - if domain routing behaves unexpectedly, check `domainStrategy`
 - if proxy outbound connections fail, check whether `fallback.tags` is configured
 
-## 11. Brief `rsdns` usage
+## 11. `rsdns`
 
-The repository also includes a standalone DNS program:
-
-```bash
-cargo run --bin rsdns -- -c rsdns.yaml
-```
-
-From `src/bin/rsdns/main.rs`:
-
-- default config file: `rsdns.yaml`
-- supports `listen`, `groups`, `upstreams`, `cache`, `hosts`, and `rules`
-- supported rule actions:
-  - `block`
-  - `rewrite`
-  - `forward`
-- current listening implementation is mainly `udp://`
-
-If `rsdns` becomes a primary use case for your deployment, a dedicated DNS-focused document would be a good follow-up.
+The standalone DNS program `rsdns` has moved to its own repository (the `rsdns/` directory in this repo is an independent crate). See that repository's README and `docs/design/` for usage and design documentation.
 
 ## 12. Related docs
 

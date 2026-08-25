@@ -5,11 +5,11 @@
 使用 make 目标构建（debug），**不主动构建 release 版本**——release 由 CI/release 流程负责。
 
 ```bash
-make build-xray   # debug build xray-rs binary
-make build-rsdns  # debug build rsdns binary
+make build-xray  # debug build xray-rs binary
 ```
 
-- `target/release/xray-rs` and `target/release/rsdns` are the two binaries (built by CI/release, not by hand).
+- `target/release/xray-rs` is the release binary (built by CI/release, not by hand).
+- rsdns 已独立为 `rsdns/` 子仓库（独立 crate），不再在本仓库内构建。
 
 ## Lint & Test
 
@@ -31,7 +31,7 @@ Do **not** hand-edit `src/generated/grpc_generated.rs`.
 
 ## Architecture (high-signal)
 
-- **Single crate** (not a workspace). `src/main.rs` for `xray-rs`, `src/bin/rsdns/` for the DNS binary.
+- **Single crate** (not a workspace). `src/main.rs` for `xray-rs`. rsdns 已独立为 `rsdns/` 子仓库（见 `rsdns/AGENTS.md`）。
 - **Config format**: YAML by default (`.yaml`/`.yml`), JSON also supported. Config struct at `src/command/run.rs:Config`.
 - **Startup flow** (`src/command/run.rs:run_proxy`): DNS init → outbound sinks → router → inbound listeners → forwarding loop.
 - **Inbounds** produce `ProxyStream`s. **Router** picks an outbound tag via domain/IP/inboundTag rules. **Outbound sink** connects and pipes traffic via `StreamForwarder`.
@@ -39,17 +39,6 @@ Do **not** hand-edit `src/generated/grpc_generated.rs`.
 - **`src/proxy/reverse.rs`**: reverse proxy (p2p tunnel), daemon-mode only.
 - **`src/proxy/api.rs`**: management API inbound (requires router + stats + sinks deps).
 - **Generated gRPC**: re-exported as `xray_rs::grpc_transport`.
-
-## rsdns (DNS Binary)
-
-- Source: `src/bin/rsdns/`. Entry: `main.rs`. Modules: `config.rs`, `server.rs`, `query.rs`, `metrics.rs`, `plugins/` (stages), `upstream/` (connection + pool + groups).
-- **Listeners (inbound)**: UDP (`ip:port`) and TCP (`tcp://ip:port`), configured via `binds[]`.
-- **Upstream protocols (outbound)**: plain UDP/TCP, DoT (`tls://`), DoH (`https://`), DoH3 (`h3://`), DoQ (`quic://`).
-- **Query pipeline** (`server.rs:handle_query`): fixed stages `hosts → groups → cache → rules`; `upstream` is **not** a stage — it is assembled at startup into `upstream::Upstreams` (a concrete type holding the named groups) and held directly by the `rules` stage for forward/cname; fallback returns NXDOMAIN/SERVFAIL.
-  - **Cache records**: A, AAAA, CNAME, MX, TXT, and HTTPS are cached. NXDOMAIN is negatively cached. Hosts and block responses are never cached.
-- **Rules**: ordered by priority. Actions: `block` (NXDomain or poison IP), `cname` (rewrite + recursive resolve), `forward` (named upstream pool, optional TTL override).
-- **Cache**: LRU with configurable capacity, TTL clamping; per-entry TTL via moka `Expiry` — expired entries are evicted automatically (no stale serving; upstream failure → SERVFAIL).
-- **Connection pool**: adaptive weighted address selection, cooldown on failure, SOA health probes, per-address-family preference.
 
 ## Rules
 

@@ -10,7 +10,6 @@ concurrency:
 
 env:
   BIN_NAME: "xray-rs"
-  RSDNS_BIN_NAME: "rsdns"
 
 jobs:
   build:
@@ -59,7 +58,6 @@ jobs:
           JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
         run: |
           cargo build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
-          cargo build ${{ matrix.platform.build-args }} --bin ${{ env.RSDNS_BIN_NAME }} --target ${{ matrix.platform.target }}
 
       - name: Build with cross
         if: matrix.platform.builder == 'cross'
@@ -67,28 +65,18 @@ jobs:
           JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
         run: |
           cross build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
-          cross build ${{ matrix.platform.build-args }} --bin ${{ env.RSDNS_BIN_NAME }} --target ${{ matrix.platform.target }}
 
       - name: Package release artifacts
         run: |
           mkdir -p dist
           cp target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.BIN_NAME }} dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}
-          cp target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.RSDNS_BIN_NAME }} dist/${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}
           tar -C dist -czf dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.tar.gz ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
-          tar -C dist -czf dist/${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}.tar.gz ${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}
 
       - name: Store xray-rs artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
           path: dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.tar.gz
-          retention-days: 1
-
-      - name: Store rsdns artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}
-          path: dist/${{ env.RSDNS_BIN_NAME }}-${{ matrix.platform.target }}.tar.gz
           retention-days: 1
 
   release:
@@ -113,4 +101,3 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN }}
           files: |
             artifacts/**/${{ env.BIN_NAME }}-*.tar.gz
-            artifacts/**/${{ env.RSDNS_BIN_NAME }}-*.tar.gz
