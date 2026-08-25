@@ -1,12 +1,13 @@
 mod config;
 mod metrics;
+mod notify;
 mod plugins;
 mod query;
 mod server;
 mod upstream;
 
 use clap::Parser;
-use log::error;
+use log::{error, warn};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -124,43 +125,64 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
     let server = Arc::new(DnsServer::new(pipeline));
 
-    // 3. 并发启动：UDP/TCP 监听 + metrics HTTP 端点。
-    let mut tasks = tokio::task::JoinSet::new();
+    // 3. 先绑定全部监听器（UDP/TCP + 可选 metrics）。任一绑定失败 → 返回
+    //    错误，进程退出非零（配合 systemd notify：不发送 READY=1）。
+    let mut udp_binds = Vec::new();
+    let mut tcp_binds = Vec::new();
     for bind in &config.binds {
         let addr: SocketAddr = parse_bind(&bind.address)?;
-        let is_tcp = bind.address.starts_with("tcp://");
-        let server = server.clone();
-        if is_tcp {
-            tasks.spawn(async move {
-                if let Err(e) = server.serve_tcp(addr).await {
-                    error!("TCP listener on {} failed: {}", addr, e);
-                }
-            });
+        if bind.address.starts_with("tcp://") {
+            tcp_binds.push((server.bind_tcp(addr).await?, addr));
         } else {
-            tasks.spawn(async move {
-                if let Err(e) = server.serve_udp(addr).await {
-                    error!("UDP listener on {} failed: {}", addr, e);
-                }
-            });
+            udp_binds.push((server.bind_udp(addr).await?, addr));
         }
     }
 
-    // metrics 插件：配置了 metrics 段才启动 HTTP 端点。
-    if let Some(cfg) = plugins::metrics::config(&config) {
+    let metrics_listener = if let Some(cfg) = plugins::metrics::config(&config) {
+        Some((plugins::metrics::bind_listener(&cfg).await?, cfg))
+    } else {
+        None
+    };
+
+    // 4. 全部绑定成功 → 通知 systemd 服务已 ready（无 NOTIFY_SOCKET 时为空操作）。
+    if let Err(e) = notify::sd_notify_ready() {
+        warn!("systemd notify failed (non-fatal): {}", e);
+    }
+
+    // 5. 并发启动 accept 循环：UDP/TCP 监听 + metrics HTTP 端点。
+    let mut tasks = tokio::task::JoinSet::new();
+    for (sock, addr) in tcp_binds {
+        let server = server.clone();
+        tasks.spawn(async move {
+            if let Err(e) = server.serve_tcp(sock, addr).await {
+                error!("TCP listener on {} failed: {}", addr, e);
+            }
+        });
+    }
+    for (sock, addr) in udp_binds {
+        let server = server.clone();
+        tasks.spawn(async move {
+            if let Err(e) = server.serve_udp(sock, addr).await {
+                error!("UDP listener on {} failed: {}", addr, e);
+            }
+        });
+    }
+
+    if let Some((listener, cfg)) = metrics_listener {
         let registry = metrics.clone();
         tasks.spawn(async move {
-            if let Err(e) = plugins::metrics::serve_metrics(cfg, registry).await {
+            if let Err(e) = plugins::metrics::serve_metrics(listener, cfg, registry).await {
                 error!("metrics server failed: {}", e);
             }
         });
     }
 
-    // 4. 等待任意 listener 结束（通常不会）。
+    // 6. 等待任意 listener 结束（通常不会）。
     if let Some(Err(e)) = tasks.join_next().await {
         error!("listener task panicked: {}", e);
     }
 
-    // 5. 关闭前 flush 日志。
+    // 7. 关闭前 flush 日志。
     server.flush_logs().await;
     Ok(())
 }
