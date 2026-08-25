@@ -14,6 +14,7 @@ use hyper::{Request, Response, StatusCode};
 use log::{info, warn};
 use serde::Deserialize;
 use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::metrics::MetricsRegistry;
@@ -48,14 +49,25 @@ pub fn config(config: &Config) -> Option<MetricsConfig> {
     }
 }
 
-/// Binds the listener and serves `/metrics` forever.
-pub async fn serve_metrics(cfg: MetricsConfig, registry: MetricsRegistry) -> std::io::Result<()> {
+/// Resolves the optional `metrics:` section into a listener + config.
+/// Returns `None` when the section is absent; an invalid `bind` is a
+/// startup error (propagated via `?`).
+pub async fn bind_listener(cfg: &MetricsConfig) -> std::io::Result<TcpListener> {
     let addr: SocketAddr = cfg
         .bind
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad bind: {}", e)))?;
     let listener = xray_rs::transport::bind_tcp_listener(addr)?;
     info!("metrics listening on http://{}", addr);
+    Ok(listener)
+}
+
+/// Serves `/metrics` forever on an already-bound listener.
+pub async fn serve_metrics(
+    listener: TcpListener,
+    cfg: MetricsConfig,
+    registry: MetricsRegistry,
+) -> std::io::Result<()> {
     let path = cfg.path.clone();
 
     loop {

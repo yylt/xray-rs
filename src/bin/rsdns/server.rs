@@ -50,8 +50,7 @@ impl DnsServer {
         }
     }
 
-    pub async fn serve_udp(&self, addr: SocketAddr) -> io::Result<()> {
-        let socket = self.bind_udp_dual_stack(addr).await?;
+    pub async fn serve_udp(&self, socket: UdpSocket, addr: SocketAddr) -> io::Result<()> {
         let socket = Arc::new(socket);
         info!("rsdns listening on UDP {}", addr);
 
@@ -77,8 +76,7 @@ impl DnsServer {
         }
     }
 
-    pub async fn serve_tcp(&self, addr: SocketAddr) -> io::Result<()> {
-        let listener = self.bind_tcp_dual_stack(addr).await?;
+    pub async fn serve_tcp(&self, listener: TcpListener, addr: SocketAddr) -> io::Result<()> {
         info!("rsdns listening on TCP {}", addr);
 
         loop {
@@ -218,7 +216,7 @@ impl DnsServer {
 
     /// 绑定 UDP socket，若地址为 IPv6 则同时设置双栈（IPV6_V6ONLY=0），
     /// 使一个 socket 可同时处理 IPv4 和 IPv6 流量。
-    async fn bind_udp_dual_stack(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+    pub async fn bind_udp(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
         let socket = if addr.is_ipv6() {
             let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
             sock.set_only_v6(false)?;
@@ -235,7 +233,7 @@ impl DnsServer {
     }
 
     /// 绑定 TCP listener，若地址为 IPv6 则设置双栈（IPV6_V6ONLY=0）。
-    async fn bind_tcp_dual_stack(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+    pub async fn bind_tcp(&self, addr: SocketAddr) -> io::Result<TcpListener> {
         let listener = if addr.is_ipv6() {
             let sock = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
             sock.set_only_v6(false)?;
