@@ -12,12 +12,12 @@
 //!
 //! See `docs/design/2026-08-21-rsdns-speed.md` for the full design.
 
+use ahash::AHashMap;
 use futures::future::join_all;
 use hickory_proto::op::Message;
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{Record, RecordType};
 use log::warn;
-use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -171,7 +171,7 @@ async fn sort_addresses_by_latency(msg: &mut Message, types: SortTypes, port: u1
     let mut ips: Vec<IpAddr> = targets.iter().map(|&(_, ip)| ip).collect();
     ips.sort_unstable();
     ips.dedup();
-    let rtt: HashMap<IpAddr, io::Result<Duration>> =
+    let rtt: AHashMap<IpAddr, io::Result<Duration>> =
         measure_tcp_latencies(&ips, port, timeout).await.into_iter().collect();
 
     // 3. Stable sort by (failed, rtt); failures last, ties keep order.

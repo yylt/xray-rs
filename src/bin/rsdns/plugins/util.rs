@@ -8,6 +8,7 @@ use hickory_proto::op::{Message, MessageType, Metadata, OpCode, Query, ResponseC
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, TXT};
 use hickory_proto::rr::RData;
 use hickory_proto::rr::{Name, Record, RecordType};
+use notify::EventKind;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -24,6 +25,11 @@ pub(crate) fn make_query_msg(name: &str, qtype: RecordType) -> io::Result<Messag
     msg.queries.push(q);
     msg.metadata.recursion_desired = true;
     Ok(msg)
+}
+
+/// Parses a domain string into a hickory `Name`.
+pub(crate) fn parse_name(name: &str) -> io::Result<Name> {
+    Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Basic response skeleton mirroring the query's id and question.
@@ -119,26 +125,26 @@ pub(crate) fn build_response_from_cache(msg: &Message, entry: &CacheEntry, keep_
         .queries
         .first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no question"))?;
-    let name = query.name().clone();
     let reply_ttl = entry.remaining_ttl(keep_ttl);
     let records = &entry.records;
     for record in records.iter() {
         let r = match record {
-            CacheRecord::A(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::A(A(*ip))),
-            CacheRecord::Aaaa(ip) => Record::from_rdata(name.clone(), reply_ttl, RData::AAAA(AAAA(*ip))),
+            CacheRecord::A(ip) => Record::from_rdata(query.name().clone(), reply_ttl, RData::A(A(*ip))),
+            CacheRecord::Aaaa(ip) => Record::from_rdata(query.name().clone(), reply_ttl, RData::AAAA(AAAA(*ip))),
             CacheRecord::Cname(target) => {
-                let cname_name = Name::from_utf8(target).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Record::from_rdata(name.clone(), reply_ttl, RData::CNAME(CNAME(cname_name)))
+                let cname_name = parse_name(target)?;
+                Record::from_rdata(query.name().clone(), reply_ttl, RData::CNAME(CNAME(cname_name)))
             }
             CacheRecord::Mx { preference, exchange } => {
-                let exchange_name =
-                    Name::from_utf8(exchange).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Record::from_rdata(name.clone(), reply_ttl, RData::MX(MX::new(*preference, exchange_name)))
+                let exchange_name = parse_name(exchange)?;
+                Record::from_rdata(query.name().clone(), reply_ttl, RData::MX(MX::new(*preference, exchange_name)))
             }
             CacheRecord::Txt(txt_data) => {
-                Record::from_rdata(name.clone(), reply_ttl, RData::TXT(TXT::new(txt_data.clone())))
+                Record::from_rdata(query.name().clone(), reply_ttl, RData::TXT(TXT::new(txt_data.clone())))
             }
-            CacheRecord::Https(svcb) => Record::from_rdata(name.clone(), reply_ttl, RData::HTTPS(HTTPS(svcb.clone()))),
+            CacheRecord::Https(svcb) => {
+                Record::from_rdata(query.name().clone(), reply_ttl, RData::HTTPS(HTTPS(svcb.clone())))
+            }
             CacheRecord::NxDomain | CacheRecord::NoData => continue,
         };
         response.answers.push(r);
@@ -162,7 +168,7 @@ pub(crate) fn build_hosts_response(
     ips: &[IpAddr],
 ) -> io::Result<Message> {
     let mut response = make_response_base(msg)?;
-    let rr_name = Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let rr_name = parse_name(name)?;
 
     for ip in ips {
         let record = match (ip, qtype) {
@@ -190,7 +196,7 @@ pub(crate) fn build_nxdomain(msg: &Message) -> io::Result<Message> {
 /// Poison response (A=0.0.0.0, AAAA=::).
 pub(crate) fn build_poison(msg: &Message, name: &str, qtype: RecordType) -> io::Result<Message> {
     let mut response = make_response_base(msg)?;
-    let rr_name = Name::from_utf8(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let rr_name = parse_name(name)?;
 
     match qtype {
         RecordType::A | RecordType::ANY => {
@@ -213,21 +219,24 @@ pub(crate) fn build_poison(msg: &Message, name: &str, qtype: RecordType) -> io::
     Ok(response)
 }
 
-/// SERVFAIL response.
+/// SERVFAIL response (mirrors `make_response_base`, then overwrites rcode).
 pub(crate) fn build_servfail(msg: &Message) -> Message {
-    let mut response = Message::new(0, MessageType::Response, OpCode::Query);
-    // Copy the request's flags (opcode + RD/CD) and set RA, mirroring
-    // `make_response_base`; the response code is overwritten to SERVFAIL.
-    response.metadata = Metadata::response_from_request(&msg.metadata);
-    response.metadata.recursion_available = true;
+    let mut response = make_response_base(msg).expect("make_response_base cannot fail");
     response.metadata.response_code = ResponseCode::ServFail;
-    response.queries = msg.queries.clone();
     response
 }
 
 /// NoData response (empty answer, NOERROR).
 pub(crate) fn build_nodata(msg: &Message) -> io::Result<Message> {
     make_response_base(msg)
+}
+
+/// Watch events that can change file content (incl. atomic tmp→target renames).
+pub(crate) fn is_change_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) | EventKind::Any | EventKind::Other
+    )
 }
 
 #[cfg(test)]

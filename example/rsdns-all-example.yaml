@@ -79,12 +79,19 @@ cache:
   max_ttl: 3600                    # clamp TTL upper bound (seconds)
   keep_ttl: false                  # global default: clamp TTL
 
-# Hosts: suffix-matched static IP mapping (supports file: prefix and wildcard)
+# Hosts: suffix-matched static IP mapping (supports file: prefix and wildcard).
+# Two line formats:
+#   IP domain [domain...]                       → static IP mapping
+#   original_domain alias1 alias2 ...           → aliases: querying an alias
+#     answers under the queried name with the original domain's IP; when the
+#     original domain has no IP mapping, the query continues through the
+#     pipeline rewritten to the original domain (answered under the queried name).
 hosts:
   - "127.0.0.1 localhost"
   - "::1       localhost"
   - "192.168.1.1 router.lan"
   - "0.0.0.0 ad-domain.com"        # exact + all subdomains → 0.0.0.0
+  - "edge.example.com cdn1.example.com cdn2.example.com"   # alias line
   - "file:/etc/hosts"
 
 # Rules: matched in order, first hit stops.

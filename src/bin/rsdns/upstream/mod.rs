@@ -592,8 +592,8 @@ async fn bootstrap_resolve_all(
     bootstrap_clients: &[UpstreamClient],
     targets: &[(usize, UpstreamConfig)],
 ) -> Vec<(usize, Vec<SocketAddr>)> {
-    use hickory_proto::op::{Message as DnsMsg, MessageType, OpCode};
-    use hickory_proto::rr::{Name, RData, RecordType};
+    use crate::plugins::util::make_query_msg;
+    use hickory_proto::rr::{RData, RecordType};
 
     async fn resolve_host_all(
         bootstrap_clients: &[UpstreamClient],
@@ -609,17 +609,7 @@ async fn bootstrap_resolve_all(
                 PreferFamily::Ipv6 if qtype != RecordType::AAAA => continue,
                 _ => {}
             }
-            let mut msg = DnsMsg::new(0, MessageType::Query, OpCode::Query);
-            let mut q = hickory_proto::op::Query::new();
-            if let Ok(name) = Name::from_utf8(host) {
-                q.set_name(name);
-            } else {
-                continue;
-            }
-            q.set_query_type(qtype);
-            q.set_query_class(hickory_proto::rr::DNSClass::IN);
-            msg.queries.push(q);
-            msg.metadata.recursion_desired = true;
+            let Ok(msg) = make_query_msg(host, qtype) else { continue };
 
             for client in bootstrap_clients {
                 match client.query(&msg).await {
@@ -813,7 +803,7 @@ pub async fn init(config: &Config, registry: &MetricsRegistry) -> Result<Arc<Ups
 
     // Phase 3: assemble groups + attach pool metrics per group
     let metrics = UpstreamMetrics::new(registry);
-    let pool_metrics = Arc::new(pool::PoolMetrics::register(registry));
+    let pool_metrics = pool::PoolMetrics::register(registry);
 
     let groups: AHashMap<String, UpstreamGroup> = upstream_map
         .into_iter()
