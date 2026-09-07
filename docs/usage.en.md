@@ -49,6 +49,16 @@ Default config filename:
 config.yaml
 ```
 
+The `run` subcommand accepts a tokio runtime thread-mode option, default `single`:
+
+```bash
+xray-rs run -c config.yaml --thread single
+xray-rs run -c config.yaml --thread multi
+```
+
+- `single`: current-thread runtime (`new_current_thread`)
+- `multi`: multi-thread runtime (`new_multi_thread`)
+
 If the file extension is neither `.json` nor `.yaml/.yml`, the current implementation returns `unsupported config format`.
 
 ## 2. What happens at startup
@@ -82,16 +92,32 @@ The main config struct is defined in `src/command/run.rs`:
   "outbounds": [],
   "inbounds": [],
   "routing": {},
-  "dns": {}
+  "dns": {},
+  "log": {}
 }
 ```
 
-All four top-level fields are optional, but in practical terms:
+All five top-level fields are optional, but in practical terms:
 
 - without `inbounds`, the program usually will not receive proxy traffic
 - without `outbounds`, routing may not have any useful target
 - without `routing`, behavior falls back to using the first outbound as the default target
 - without `dns`, the program uses default `DnsSettings` and tends to rely on the system resolver
+- without `log`, logs go to stderr at info level
+
+The `log` field structure:
+
+```json
+{
+  "file": "/var/log/xray-rs.log",
+  "level": "info"
+}
+```
+
+- `file`: path of the log file (append mode); when omitted, logs go to stderr
+- `level`: filter level `off|error|warn|info|debug|trace`, default `info`
+
+The matching config struct `LogSettings` lives in `src/common/rslog.rs`; the main config struct is in `src/command/run.rs`.
 
 ## 4. inbounds
 
@@ -423,7 +449,13 @@ This means protocol logic can be combined with different transport layers such a
 
 ## 10. Logging and troubleshooting
 
-The main program currently initializes logging with `env_logger`, with a default filter level of `Info`. Common things to watch for:
+The main program currently initializes logging with slog (via `src/common/rslog.rs`). Logging behavior is configured through the top-level `log` field:
+
+- without `log.file`: logs go to stderr
+- with `log.file`: logs are appended to the given file
+- `log.level` controls the filter level, default `info`
+
+Common things to watch for:
 
 - `Starting xray-rs proxy`
 - DNS initialization logs

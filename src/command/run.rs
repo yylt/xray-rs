@@ -6,15 +6,26 @@ use tokio_stream::StreamExt;
 
 use crate::{
     app::{self, ConnectionSink},
-    common::{forward::StreamForwarder, stats},
+    build_info,
+    common::{forward::StreamForwarder, rslog, stats},
     proxy::{self},
     route::{DnsResolver, DnsSettings, Router, RoutingSettings},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ThreadMode {
+    Single,
+    Multi,
+}
 
 #[derive(Debug, clap::Args)]
 pub struct Run {
     #[arg(short, long, value_name = "config filepath", default_value = "config.yaml")]
     config: String,
+
+    /// 运行时线程模型，single 为单线程，multi 为多线程，默认 single
+    #[arg(long, value_name = "single|multi", default_value = "single")]
+    thread: ThreadMode,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -30,6 +41,9 @@ pub struct Config {
 
     #[serde(rename = "dns")]
     dns: Option<DnsSettings>,
+
+    #[serde(rename = "log")]
+    log: Option<rslog::LogSettings>,
 }
 
 impl Run {
@@ -43,7 +57,14 @@ impl Run {
             _ => return Err(io::Error::other("unsupported config format")),
         };
 
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let log_settings = config.log.clone().unwrap_or_default();
+        let _guard = rslog::init(&log_settings)?;
+        build_info::log_startup_info(env!("CARGO_PKG_NAME"));
+
+        let rt = match self.thread {
+            ThreadMode::Single => tokio::runtime::Builder::new_current_thread().enable_all().build()?,
+            ThreadMode::Multi => tokio::runtime::Builder::new_multi_thread().enable_all().build()?,
+        };
 
         rt.block_on(run_proxy(config))
     }
@@ -58,6 +79,7 @@ async fn run_proxy(config: Config) -> io::Result<()> {
         inbounds,
         routing,
         dns,
+        ..
     } = config;
 
     // Phase 1: 初始化 DNS resolver
