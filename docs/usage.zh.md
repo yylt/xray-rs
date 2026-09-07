@@ -49,6 +49,16 @@ xray-rs run -c config.json
 config.yaml
 ```
 
+`run` 子命令支持选择 tokio 运行时线程模型，默认 `single`：
+
+```bash
+xray-rs run -c config.yaml --thread single
+xray-rs run -c config.yaml --thread multi
+```
+
+- `single`：单线程运行时（`new_current_thread`）
+- `multi`：多线程运行时（`new_multi_thread`）
+
 如果后缀既不是 `.json` 也不是 `.yaml/.yml`，当前实现会直接报错 `unsupported config format`。
 
 ## 2. 主程序启动时会做什么
@@ -82,16 +92,32 @@ config.yaml
   "outbounds": [],
   "inbounds": [],
   "routing": {},
-  "dns": {}
+  "dns": {},
+  "log": {}
 }
 ```
 
-四个顶层字段都是可选的，但从实际使用角度看：
+五个顶层字段都是可选的，但从实际使用角度看：
 
 - 没有 `inbounds`，程序通常不会真正接收代理流量
 - 没有 `outbounds`，即使有路由也可能没有有效目标
 - 没有 `routing`，则会退化为“使用第一个 outbound 作为默认目标”
 - 没有 `dns`，则使用默认 `DnsSettings`，并倾向于系统解析器
+- 没有 `log`，则日志输出到 stderr，级别为 info
+
+`log` 字段结构：
+
+```json
+{
+  "file": "/var/log/xray-rs.log",
+  "level": "info"
+}
+```
+
+- `file`：日志文件路径（追加写）；缺省时日志输出到 stderr
+- `level`：过滤级别 `off|error|warn|info|debug|trace`，默认 `info`
+
+对应配置结构定义在 `src/common/rslog.rs` 的 `LogSettings`，主配置结构在 `src/command/run.rs`。
 
 ## 4. inbounds
 
@@ -423,7 +449,13 @@ config.yaml
 
 ## 10. 日志与排障建议
 
-当前主程序使用 `env_logger` 初始化日志，默认过滤级别是 `Info`。常见观察点：
+当前主程序使用 slog（经 `src/common/rslog.rs`）初始化日志。日志行为可通过顶层 `log` 字段配置：
+
+- 不配置 `log.file`：输出到 stderr
+- 配置 `log.file`：追加写入指定文件
+- `log.level` 控制过滤级别，默认 `info`
+
+常见观察点：
 
 - `Starting xray-rs proxy`
 - DNS 初始化日志

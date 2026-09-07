@@ -46,9 +46,20 @@ config.yaml
 - `.yml`
 - `.json`
 
+`run` 支持选择 tokio 运行时线程模型（默认 `single`）：
+
+```bash
+xray-rs run -c config.yaml --thread single
+xray-rs run -c config.yaml --thread multi
+```
+
 ## 最小配置示例
 
 ```yaml
+log:
+  file: /var/log/xray-rs.log   # 可选，缺省输出到 stderr
+  level: info                  # 可选，off|error|warn|info|debug|trace，默认 info
+
 inbounds:
   - listen: 127.0.0.1
     port: 1080
@@ -79,6 +90,11 @@ dns:
     - 1.1.1.1:53
     - tcp://8.8.8.8:53
 ```
+
+### log 配置
+
+- `file`：日志文件路径（追加写）。缺省时日志输出到 stderr。
+- `level`：过滤级别 `off|error|warn|info|debug|trace`，默认 `info`。
 
 ## example 目录说明
 

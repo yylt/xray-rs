@@ -46,9 +46,20 @@ Also supported:
 - `.yml`
 - `.json`
 
+`run` accepts a tokio runtime thread-mode option (default `single`):
+
+```bash
+xray-rs run -c config.yaml --thread single
+xray-rs run -c config.yaml --thread multi
+```
+
 ## Minimal config example
 
 ```yaml
+log:
+  file: /var/log/xray-rs.log   # optional, defaults to stderr
+  level: info                  # optional, off|error|warn|info|debug|trace, default info
+
 inbounds:
   - listen: 127.0.0.1
     port: 1080
@@ -79,6 +90,11 @@ dns:
     - 1.1.1.1:53
     - tcp://8.8.8.8:53
 ```
+
+### log config
+
+- `file`: path of the log file (append mode). When omitted, logs go to stderr.
+- `level`: filter level `off|error|warn|info|debug|trace`, default `info`.
 
 ## Supported Platforms
 
