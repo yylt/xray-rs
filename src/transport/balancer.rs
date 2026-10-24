@@ -59,13 +59,13 @@ impl TargetState {
     pub fn record_stream_closed(&self) {
         let _ = self
             .inflight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
     }
 
     pub fn record_open_success(&self) {
         let _ = self
             .failure_penalty
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
     }
 
     pub fn record_open_failure(&self) {

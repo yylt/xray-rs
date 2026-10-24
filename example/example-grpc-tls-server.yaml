@@ -9,7 +9,6 @@ inbounds:
       network: grpc
       security: tls
       tlsSettings:
-        certificates: []
         alpn:
           - h2
           - http/1.1

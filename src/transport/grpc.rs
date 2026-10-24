@@ -1,7 +1,7 @@
 use super::*;
 use crate::common::Address;
 use crate::generated::grpc_generated as pb;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use http::uri::PathAndQuery;
 use pb::*;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,6 @@ use std::{
     time::Duration,
 };
 
-use futures::ready;
 use log::{debug, error, warn};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -25,12 +24,24 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
 
-const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
+const DEFAULT_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE: bool = true;
 const DEFAULT_DNS_REFRESH_INTERVAL_SECS: u64 = 300;
-const DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD: usize = 64 * 1024;
 const DEFAULT_GRPC_MULTI_BATCH_LIMIT: usize = 32;
+/// HTTP/2 initial stream-level flow-control window. Larger windows let a single
+/// stream saturate high-bandwidth/high-RTT links without stalling on WINDOW_UPDATE.
+/// This is the client default; it is configurable via grpcSettings.http2InitialWindowSize.
+const DEFAULT_HTTP2_INITIAL_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+/// HTTP/2 initial connection-level flow-control window, expressed as a multiple
+/// of the stream-level window.
+const DEFAULT_HTTP2_CONNECTION_WINDOW_MULTIPLE: u32 = 2;
+/// Server-side HTTP/2 initial connection-level flow-control window.
+const DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW: u32 = 4 * 1024 * 1024;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
+/// Server-side HTTP/2 max concurrent streams per connection.
+const DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +70,9 @@ pub struct GrpcSettings {
 
     #[serde(rename = "http2KeepAliveWhileIdle")]
     http2_keep_alive_while_idle: Option<bool>,
+
+    #[serde(rename = "http2InitialWindowSize")]
+    http2_initial_window_size: Option<u32>,
 
     #[serde(rename = "loadBalancer")]
     load_balancer: Option<String>,
@@ -97,11 +111,39 @@ impl ConnectionTarget {
     }
 }
 
+/// Resolve the HTTP/2 `:authority` pseudo-header for an outbound connection.
+///
+/// Priority: explicit grpc `authority` > TLS `serverName` > target IP (or
+/// "localhost" for unix). Falling back to `serverName` keeps `:authority`
+/// consistent with the SNI the client sends, which matters for servers (e.g.
+/// xray-core) that route or validate on `:authority`.
+fn resolve_authority(
+    grpc_authority: &Option<String>,
+    tls_server_name: &Option<String>,
+    target: &ConnectionTarget,
+) -> String {
+    if let Some(authority) = grpc_authority {
+        return authority.clone();
+    }
+
+    if let Some(server_name) = tls_server_name {
+        return server_name.clone();
+    }
+
+    match target {
+        ConnectionTarget::Tcp(addr) => addr.ip().to_string(),
+        #[cfg(unix)]
+        ConnectionTarget::Unix(_) => "localhost".to_string(),
+    }
+}
+
 pub struct Grpc {
     route_config: RouteConfig,
     sockopt: super::sockopt::SocketOpt,
     tls_client: Option<crate::transport::tls::client::Tls>,
     tls_server: Option<crate::transport::tls::server::Tls>,
+    // TLS serverName, used as the fallback :authority when grpc authority is unset.
+    tls_server_name: Option<String>,
     balancer: Arc<super::balancer::GrpcBalancer>,
     dns: std::sync::Arc<crate::route::DnsResolver>,
     dns_refresh_task: Option<JoinHandle<()>>,
@@ -146,6 +188,10 @@ impl Grpc {
 
         let route_config = RouteConfig::from(grpc_settings);
 
+        let tls_server_name = tls_client
+            .as_ref()
+            .and_then(|tls| tls.server_name().map(|s| s.to_string()));
+
         let strategy_str = grpc_settings.load_balancer.as_deref().unwrap_or("least_connection");
         let strategy = super::balancer::Strategy::from_strategy_str(strategy_str);
 
@@ -158,6 +204,7 @@ impl Grpc {
             sockopt: sset.sockopt.clone(),
             tls_client,
             tls_server,
+            tls_server_name,
             balancer,
             dns,
             dns_refresh_task,
@@ -186,6 +233,10 @@ impl Grpc {
             Some(Address::Unix(_)) => None,
             Some(Address::Domain(domain, port)) => Some(tokio::spawn(async move {
                 let interval = Duration::from_secs(DEFAULT_DNS_REFRESH_INTERVAL_SECS);
+                // Track the last target set so we only touch the balancer when the
+                // resolved addresses actually change (avoids churning channels/TLS
+                // handshakes on every refresh tick).
+                let mut last_targets: Option<Vec<super::balancer::GrpcTargetKey>> = None;
                 loop {
                     match dns.resolve(&domain).await {
                         Ok(ips) => {
@@ -196,8 +247,11 @@ impl Grpc {
 
                             if targets.is_empty() {
                                 warn!("DNS resolved {} but got no addresses", domain);
-                            } else {
-                                balancer.sync_targets(targets).await;
+                                continue;
+                            }
+                            if last_targets.as_ref() != Some(&targets) {
+                                balancer.sync_targets(targets.clone()).await;
+                                last_targets = Some(targets);
                             }
                         }
                         Err(e) => {
@@ -240,11 +294,17 @@ impl Grpc {
                 .user_agent(user_agent)
                 .map_err(|err| Error::new(ErrorKind::InvalidInput, err.to_string()))?;
         }
+        let initial_stream_window = self.route_config.http2_initial_window_size;
+        let initial_connection_window = initial_stream_window.saturating_mul(DEFAULT_HTTP2_CONNECTION_WINDOW_MULTIPLE);
         ep = ep
             .http2_keep_alive_interval(self.route_config.http2_keep_alive_interval)
             .keep_alive_while_idle(self.route_config.http2_keep_alive_while_idle)
             .buffer_size(self.route_config.buf_byte_size)
-            .http2_adaptive_window(true);
+            .http2_adaptive_window(true)
+            .initial_stream_window_size(initial_stream_window)
+            .initial_connection_window_size(initial_connection_window)
+            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+            .tcp_keepalive(Some(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS)));
 
         let connector_target = target.clone();
         let sockopt = self.sockopt.clone();
@@ -262,7 +322,7 @@ impl Grpc {
         }))
         .await
         .map_err(|err| {
-            error!("gRPC channel connect failed to {:?}: {}", target, err);
+            error!("gRPC channel connect failed to {:?}: {:?}", target, err);
             Error::new(ErrorKind::ConnectionRefused, err.to_string())
         })
     }
@@ -423,15 +483,7 @@ impl Grpc {
     }
 
     fn authority_for_target(&self, target: &ConnectionTarget) -> String {
-        if let Some(authority) = &self.route_config.authority {
-            return authority.clone();
-        }
-
-        match target {
-            ConnectionTarget::Tcp(addr) => addr.ip().to_string(),
-            #[cfg(unix)]
-            ConnectionTarget::Unix(_) => "localhost".to_string(),
-        }
+        resolve_authority(&self.route_config.authority, &self.tls_server_name, target)
     }
 
     pub async fn listen(
@@ -825,7 +877,13 @@ where
             Ok(tls_stream) => {
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
 
-                let builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+                let mut builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+                builder
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .initial_stream_window_size(DEFAULT_HTTP2_INITIAL_STREAM_WINDOW)
+                    .initial_connection_window_size(DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW)
+                    .max_concurrent_streams(DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS)
+                    .keep_alive_interval(Some(Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS)));
                 let conn = builder.serve_connection(io, service);
 
                 if let Err(e) = conn.await {
@@ -841,7 +899,13 @@ where
     } else {
         let io = hyper_util::rt::TokioIo::new(stream);
 
-        let builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let mut builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .initial_stream_window_size(DEFAULT_HTTP2_INITIAL_STREAM_WINDOW)
+            .initial_connection_window_size(DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW)
+            .max_concurrent_streams(DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS)
+            .keep_alive_interval(Some(Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS)));
         let conn = builder.serve_connection(io, service);
 
         if let Err(e) = conn.await {
@@ -853,14 +917,15 @@ where
     Ok(())
 }
 
-fn make_service(buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
+fn make_service(_buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(DEFAULT_CHANNEL_CLIENT_CAPACITY);
-    let write_buf_capacity = buf_byte_size.clamp(8192, DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD);
 
+    // Writes bypass the intermediate buffer and go straight onto the outgoing
+    // channel (one Hunk per chunk), matching the Go HunkReaderWriter path and
+    // avoiding an extra copy per write.
     let stream_service = GrpcStream {
         read_buf: Bytes::new(),
-        write_buf: BytesMut::with_capacity(write_buf_capacity),
         incoming_rx: Some(incoming_rx),
         outgoing_tx: Some(PollSender::new(outgoing_tx)),
         task: None,
@@ -879,11 +944,12 @@ struct RouteConfig {
     buf_byte_size: usize,
     http2_keep_alive_interval: Duration,
     http2_keep_alive_while_idle: bool,
+    http2_initial_window_size: u32,
     tun_path: http::uri::PathAndQuery,
     multi_tun_path: http::uri::PathAndQuery,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServerRoute {
     Tun,
     TunMulti,
@@ -911,12 +977,10 @@ impl RouteConfig {
         let v = match &self.authority {
             None => true,
             Some(local) => {
-                match _req
-                    .headers()
-                    .get(http::header::HOST)
-                    .or_else(|| _req.headers().get(":authority"))
-                {
-                    Some(req_host) => req_host.to_str().unwrap_or("") == local,
+                // In HTTP/2 the :authority pseudo-header is parsed into the URI's
+                // authority component rather than the header map, so read it from there.
+                match _req.uri().authority() {
+                    Some(authority) => authority.as_str() == local,
                     None => false,
                 }
             }
@@ -959,6 +1023,9 @@ impl From<&GrpcSettings> for RouteConfig {
             http2_keep_alive_while_idle: settings
                 .http2_keep_alive_while_idle
                 .unwrap_or(DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE),
+            http2_initial_window_size: settings
+                .http2_initial_window_size
+                .unwrap_or(DEFAULT_HTTP2_INITIAL_STREAM_WINDOW),
             tun_path,
             multi_tun_path,
         }
@@ -967,7 +1034,6 @@ impl From<&GrpcSettings> for RouteConfig {
 
 pub struct GrpcStream {
     read_buf: Bytes,
-    write_buf: BytesMut,
     incoming_rx: Option<mpsc::Receiver<Bytes>>,
     outgoing_tx: Option<PollSender<Bytes>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -1017,43 +1083,169 @@ impl AsyncRead for GrpcStream {
 }
 
 impl AsyncWrite for GrpcStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
-        if self.write_buf.len() >= DEFAULT_GRPC_WRITE_FLUSH_THRESHOLD && self.as_mut().poll_flush(cx)?.is_pending() {
-            return Poll::Pending;
-        }
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        self.write_buf.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         let this = self.get_mut();
-
         let tx = match this.outgoing_tx.as_mut() {
             Some(tx) => tx,
             None => return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "closed"))),
         };
 
-        while !this.write_buf.is_empty() {
-            match Pin::new(&mut *tx).poll_reserve(cx) {
-                Poll::Ready(Ok(())) => {
-                    let data = this.write_buf.split().freeze();
-                    if tx.send_item(data).is_err() {
-                        return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "send failed")));
-                    }
+        // Reserve capacity for one Hunk worth of bytes, then send it directly
+        // onto the outgoing channel without an intermediate buffer copy.
+        match Pin::new(&mut *tx).poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                if tx.send_item(Bytes::copy_from_slice(buf)).is_err() {
+                    return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "send failed")));
                 }
-                Poll::Ready(Err(_)) => return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "sender closed"))),
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(buf.len()))
             }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "sender closed"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        // Writes are dispatched immediately, so there is nothing buffered to flush.
+        if self.outgoing_tx.is_none() {
+            return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "closed")));
         }
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        ready!(self.as_mut().poll_flush(cx))?;
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         self.outgoing_tx.take();
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route_config_with_authority(authority: Option<&str>) -> RouteConfig {
+        RouteConfig {
+            authority: authority.map(|s| s.to_string()),
+            path: PathAndQuery::from_static("/grpc/Tun"),
+            multi_mode: false,
+            user_agent: None,
+            buf_byte_size: DEFAULT_BUFFER_SIZE,
+            http2_keep_alive_interval: Duration::from_secs(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS),
+            http2_keep_alive_while_idle: DEFAULT_HTTP2_KEEP_ALIVE_WHILE_IDLE,
+            http2_initial_window_size: DEFAULT_HTTP2_INITIAL_STREAM_WINDOW,
+            tun_path: PathAndQuery::from_static("/grpc/Tun"),
+            multi_tun_path: PathAndQuery::from_static("/grpc/TunMulti"),
+        }
+    }
+
+    fn request_with_authority(authority: &str, path: &str) -> http::Request<()> {
+        http::Request::builder()
+            .uri(format!("https://{}/{}", authority, path.trim_start_matches('/')))
+            .body(())
+            .unwrap()
+    }
+
+    #[test]
+    fn match_request_matches_authority_from_uri() {
+        // Regression: in HTTP/2 the :authority pseudo-header lives in the URI
+        // authority, not the header map. A server configured with `authority`
+        // must still route requests sent with that authority, otherwise the
+        // tunnel is never wired up and the client hangs (http_code=000).
+        let rc = route_config_with_authority(Some("localhost"));
+        let req = request_with_authority("localhost", "/grpc/Tun");
+        assert_eq!(rc.match_request(&req), ServerRoute::Tun);
+    }
+
+    #[test]
+    fn match_request_rejects_wrong_authority() {
+        let rc = route_config_with_authority(Some("localhost"));
+        let req = request_with_authority("example.com", "/grpc/Tun");
+        assert_eq!(rc.match_request(&req), ServerRoute::None);
+    }
+
+    #[test]
+    fn match_request_matches_when_authority_unset() {
+        let rc = route_config_with_authority(None);
+        let req = request_with_authority("anything", "/grpc/Tun");
+        assert_eq!(rc.match_request(&req), ServerRoute::Tun);
+    }
+
+    #[test]
+    fn match_request_rejects_unknown_path() {
+        let rc = route_config_with_authority(Some("localhost"));
+        let req = request_with_authority("localhost", "/grpc/Other");
+        assert_eq!(rc.match_request(&req), ServerRoute::None);
+    }
+
+    fn tcp_target() -> ConnectionTarget {
+        ConnectionTarget::Tcp("127.0.0.1:1234".parse().unwrap())
+    }
+
+    #[test]
+    fn authority_prefers_grpc_authority_over_server_name() {
+        let target = tcp_target();
+        assert_eq!(
+            resolve_authority(&Some("grpc.example".to_string()), &Some("tls.example".to_string()), &target),
+            "grpc.example"
+        );
+    }
+
+    #[test]
+    fn authority_falls_back_to_tls_server_name() {
+        let target = tcp_target();
+        assert_eq!(
+            resolve_authority(&None, &Some("tls.example".to_string()), &target),
+            "tls.example"
+        );
+    }
+
+    #[test]
+    fn authority_falls_back_to_target_ip() {
+        let target = tcp_target();
+        assert_eq!(resolve_authority(&None, &None, &target), "127.0.0.1");
+    }
+
+    #[test]
+    fn default_http2_initial_window_is_one_mib() {
+        assert_eq!(DEFAULT_HTTP2_INITIAL_STREAM_WINDOW, 1024 * 1024);
+    }
+
+    #[test]
+    fn route_config_defaults_to_one_mib_stream_window() {
+        // grpcSettings without http2InitialWindowSize must default to 1 MiB,
+        // which keeps behavior consistent across client builds.
+        let grpc_settings = GrpcSettings {
+            service_name: "grpc".to_string(),
+            multi_mode: None,
+            authority: None,
+            user_agent: None,
+            buf_byte_size: None,
+            http2_keep_alive_interval: None,
+            http2_keep_alive_while_idle: None,
+            http2_initial_window_size: None,
+            load_balancer: None,
+        };
+        let rc = RouteConfig::from(&grpc_settings);
+        assert_eq!(rc.http2_initial_window_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn route_config_uses_configured_window() {
+        let grpc_settings = GrpcSettings {
+            service_name: "grpc".to_string(),
+            multi_mode: None,
+            authority: None,
+            user_agent: None,
+            buf_byte_size: None,
+            http2_keep_alive_interval: None,
+            http2_keep_alive_while_idle: None,
+            http2_initial_window_size: Some(512 * 1024),
+            load_balancer: None,
+        };
+        let rc = RouteConfig::from(&grpc_settings);
+        assert_eq!(rc.http2_initial_window_size, 512 * 1024);
     }
 }

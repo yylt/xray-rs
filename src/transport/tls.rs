@@ -92,12 +92,15 @@ fn create_crypto_provider(settings: &TlsSettings) -> Result<Option<Arc<CryptoPro
 
 fn create_server_config(settings: &TlsSettings) -> Result<ServerConfig> {
     let mut cert_resolver = common::tls::CertificateResolver::new();
-    if let Some(cert_configs) = &settings.certificates {
-        for cert_config in cert_configs.iter() {
-            cert_resolver.add_certificate(&cert_config.cert_file, &cert_config.key_file)?;
+    match settings.certificates.as_ref() {
+        Some(cert_configs) if !cert_configs.is_empty() => {
+            for cert_config in cert_configs.iter() {
+                cert_resolver.add_certificate(&cert_config.cert_file, &cert_config.key_file)?;
+            }
         }
-    } else {
-        cert_resolver.add_self_signed_certificate();
+        _ => {
+            cert_resolver.add_self_signed_certificate();
+        }
     }
 
     let builder = if let Some(provider) = create_crypto_provider(settings)? {
@@ -215,6 +218,11 @@ pub mod client {
         })
     }
     impl Tls {
+        /// The configured TLS serverName (SNI), if any.
+        pub fn server_name(&self) -> Option<&str> {
+            self.server_name.as_deref()
+        }
+
         pub async fn connect<IO>(&self, addr: &std::net::SocketAddr, stream: IO) -> Result<ClientTlsStream<IO>>
         where
             IO: AsyncRead + AsyncWrite + Unpin,
@@ -256,5 +264,43 @@ pub mod server {
             let tls_stream = self.acceptor.accept(stream).await?;
             Ok(tls_stream)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_builds_with_no_certificates() {
+        // The self-signed fallback needs a rustls crypto provider, as the runtime
+        // installs in main; ensure one is present for this unit test.
+        crate::common::tls::install_crypto_provider();
+        // Regression: `certificates` omitted must fall back to a self-signed
+        // certificate instead of resolving no certificate chain.
+        let settings = TlsSettings {
+            server_name: None,
+            alpn_protocols: None,
+            allow_insecure: None,
+            cipher_suites: None,
+            certificates: None,
+        };
+        assert!(create_server_config(&settings).is_ok());
+    }
+
+    #[test]
+    fn server_config_builds_with_empty_certificates() {
+        crate::common::tls::install_crypto_provider();
+        // Regression: `certificates: []` is equivalent to omitting it and must
+        // fall back to a self-signed certificate rather than sending an empty
+        // chain (which caused a TLS `AccessDenied` alert and a hung client).
+        let settings = TlsSettings {
+            server_name: None,
+            alpn_protocols: None,
+            allow_insecure: None,
+            cipher_suites: None,
+            certificates: Some(vec![]),
+        };
+        assert!(create_server_config(&settings).is_ok());
     }
 }

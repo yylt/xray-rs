@@ -13,11 +13,11 @@ categories = ["network-programming"]
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
 bytes = { version = "1.10.1", default-features = false, features = ["std"] }
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
-sha2 = { version = "0.11.0", default-features = false }
-serde = { version = "1.0.227", default-features = false, features = ["std", "derive"] }
-serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.1", default-features = false }
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 serde_yaml = { version = "0.9.34", default-features = false }
-uuid = { version = "1.22", default-features = false, features = ["std", "v4"] }
+uuid = { version = "1.29", default-features = false, features = ["std", "v4"] }
 mimalloc = { version = "0.1.48", default-features = false, optional = true }
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"], optional = true }
 tikv-jemallocator = { version = "0.7", default-features = false, optional = true }
@@ -25,17 +25,17 @@ parking_lot = { version = "0.12.5", default-features = false }
 base64 = { version = "0.23.0", default-features = false, features = ["std"] }
 fst = { version = "0.4.7", default-features = false }
 # runtime
-rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
-hickory-resolver = { version = "0.26.0", default-features = false, features = ["system-config"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config"] }
 aws-lc-rs = { version = "*", optional = true, default-features = false }
-tokio = { version = "1.49.0", default-features = false, features = ["io-std", "net", "signal", "sync", "time", "fs", "rt-multi-thread", "macros"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
+tokio = { version = "1.54.1", default-features = false, features = ["io-std", "net", "signal", "sync", "time", "fs", "rt-multi-thread", "macros"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "tls12"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["sync"] }
-tokio-util = { version = "0.7.18", default-features = false, features = ["io"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["io"] }
 async-stream = "0.3.6"
 ahash = { version = "0.8.12", default-features = false, features = ["std", "runtime-rng"] }
-rustls = { version = "0.23.37", default-features = false, features = ["std", "tls12"] }
-rustls-native-certs = { version = "0.8.3", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
+rustls-native-certs = { version = "0.8.5", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"] }
 x509-parser = { version = "0.18.1", default-features = false }
 tun = { version = "0.8.6", default-features = false, features = ["async"], optional = true }
@@ -44,8 +44,8 @@ socket2 = { version = "0.6", default-features = false }
 hyper-util = { version = "0.1", default-features = false, features = ["http1", "http2", "server-auto", "client-legacy", "tokio"] }
 http-body-util = { version = "0.1", default-features = false }
 http = { version = "1.4", default-features = false }
-hyper = { version = "1.8", default-features = false, features = ["server", "http1"] }
-tonic = { version = "0.14.2", default-features = false, features = ["gzip", "channel", "server", "codegen"] }
+hyper = { version = "1.12", default-features = false, features = ["server", "http1"] }
+tonic = { version = "0.14.6", default-features = false, features = ["gzip", "channel", "server", "codegen"] }
 tonic-prost = { version = "0.14", default-features = false }
 prost = { version = "0.14", default-features = false, features = ["std"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
@@ -73,6 +73,8 @@ lto = true
 strip = true
 debug-assertions = false
 codegen-units = 1
+panic = "abort"
+overflow-checks = false
 
 [profile.release-with-symbols]
 inherits = "release"

@@ -17,7 +17,9 @@ make build-xray  # debug build xray-rs binary
 make ci      # run fmt + clippy + check + test
 ```
 
-- `make ci` 是本地完整校验入口（fmt → clippy → workspace check → test），改动后必须通过。
+- `make ci` 是本地完整校验入口（fmt → clippy → workspace check → test）。**任何代码改动后都必须执行 `make ci`，并修复其中所有问题，直到完全健康**——即 exit 0、打印 `CI: all checks passed`、clippy 零警告、测试全绿。
+- `clippy` 以 `-D warnings` 运行（`cargo clippy --workspace --all-targets -- -D warnings`），任何 warning 都会升级为编译错误；出现弃用/告警必须修根因，不得用 `#[allow(...)]` 掩盖（见 Rules）。
+- `cargo fmt` 是 `make ci` 的一环，会自动格式化并应产生零 diff；提交前 `git diff` 中不应出现仅由 fmt 产生的格式改动。
 - 不主动做 smoke test / 手工起服务验证；只需通过 `make ci`。
 
 ## Code Generation

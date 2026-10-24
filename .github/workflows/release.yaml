@@ -20,13 +20,13 @@ jobs:
       matrix:
         platform:
           - name: Linux x86_64
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
             builder: cargo
             artifact-dir: release
             build-args: "--release"
 
           - name: Linux aarch64
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
             builder: cross
             artifact-dir: release
             build-args: "--release -vv"
@@ -42,27 +42,29 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install musl-tools
+      - name: Install build dependencies
         if: matrix.platform.builder == 'cargo'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
+          sudo apt-get install -y pkg-config
 
       - name: Install cross
         if: matrix.platform.builder == 'cross'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      # jemalloc page size is pinned to 4 KiB on every target; we no longer
+      # special-case per-arch PAGE_SIZE.
       - name: Build with cargo
         if: matrix.platform.builder == 'cargo'
         env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
+          JEMALLOC_SYS_WITH_LG_PAGE: "12"
         run: |
           cargo build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
 
       - name: Build with cross
         if: matrix.platform.builder == 'cross'
         env:
-          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
+          JEMALLOC_SYS_WITH_LG_PAGE: "12"
         run: |
           cross build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
 
