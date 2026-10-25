@@ -1209,13 +1209,13 @@ mod tests {
     }
 
     #[test]
-    fn default_http2_initial_window_is_one_mib() {
-        assert_eq!(DEFAULT_HTTP2_INITIAL_STREAM_WINDOW, 1024 * 1024);
+    fn default_http2_initial_window_is_two_mib() {
+        assert_eq!(DEFAULT_HTTP2_INITIAL_STREAM_WINDOW, 2 * 1024 * 1024);
     }
 
     #[test]
-    fn route_config_defaults_to_one_mib_stream_window() {
-        // grpcSettings without http2InitialWindowSize must default to 1 MiB,
+    fn route_config_defaults_to_two_mib_stream_window() {
+        // grpcSettings without http2InitialWindowSize must default to 2 MiB,
         // which keeps behavior consistent across client builds.
         let grpc_settings = GrpcSettings {
             service_name: "grpc".to_string(),
@@ -1229,7 +1229,7 @@ mod tests {
             load_balancer: None,
         };
         let rc = RouteConfig::from(&grpc_settings);
-        assert_eq!(rc.http2_initial_window_size, 1024 * 1024);
+        assert_eq!(rc.http2_initial_window_size, 2 * 1024 * 1024);
     }
 
     #[test]

@@ -10,68 +10,78 @@ concurrency:
 
 env:
   BIN_NAME: "xray-rs"
+  # Pin jemalloc to a 4 KiB page size (LG_PAGE=12) on every target so the
+  # allocator layout is identical across architectures.
+  JEMALLOC_SYS_WITH_LG_PAGE: "12"
+  CARGO_HOME: ${{ github.workspace }}/.cargo
+  RUSTUP_HOME: ${{ github.workspace }}/.rustup
 
 jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
     runs-on: ubuntu-latest
+    # Debian 12 (bookworm) build environment: every binary links glibc 2.36 and
+    # therefore stays runnable on Debian 12 and newer.
+    container:
+      image: debian:bookworm
     strategy:
       fail-fast: false
       matrix:
         platform:
           - name: Linux x86_64
             target: x86_64-unknown-linux-gnu
-            builder: cargo
-            artifact-dir: release
-            build-args: "--release"
-
+            arch: amd64
           - name: Linux aarch64
             target: aarch64-unknown-linux-gnu
-            builder: cross
-            artifact-dir: release
-            build-args: "--release -vv"
+            arch: arm64
 
     steps:
       - name: Checkout Git repo
         uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
         with:
-          targets: ${{ matrix.platform.target }}
+          path: |
+            ${{ github.workspace }}/.cargo
+            ${{ github.workspace }}/.rustup
+            ${{ github.workspace }}/target
+          key: ${{ runner.os }}-${{ matrix.platform.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.platform.target }}-cargo-
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install build dependencies
-        if: matrix.platform.builder == 'cargo'
+      - name: Install build toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            cmake perl
+          if [ "${{ matrix.platform.arch }}" = "arm64" ]; then
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          fi
 
-      - name: Install cross
-        if: matrix.platform.builder == 'cross'
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      # jemalloc page size is pinned to 4 KiB on every target; we no longer
-      # special-case per-arch PAGE_SIZE.
-      - name: Build with cargo
-        if: matrix.platform.builder == 'cargo'
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: "12"
+      - name: Install Rust toolchain
         run: |
-          cargo build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          . "$CARGO_HOME/env"
+          rustup target add ${{ matrix.platform.target }}
 
-      - name: Build with cross
-        if: matrix.platform.builder == 'cross'
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: "12"
+      - name: Configure aarch64 cross linker (gnu)
+        if: matrix.platform.arch == 'arm64'
         run: |
-          cross build ${{ matrix.platform.build-args }} --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_AARCH64_UNKNOWN_LINUX_GNU=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build release binary (gnu, 4K page)
+        run: |
+          . "$CARGO_HOME/env"
+          cargo build --release --bin ${{ env.BIN_NAME }} --target ${{ matrix.platform.target }}
 
       - name: Package release artifacts
         run: |
           mkdir -p dist
-          cp target/${{ matrix.platform.target }}/${{ matrix.platform.artifact-dir }}/${{ env.BIN_NAME }} dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}
+          cp target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }} dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}
           tar -C dist -czf dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.tar.gz ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
 
       - name: Store xray-rs artifact
