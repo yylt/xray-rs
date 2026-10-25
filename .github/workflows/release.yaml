@@ -57,7 +57,11 @@ jobs:
             ca-certificates curl git build-essential pkg-config \
             cmake perl
           if [ "${{ matrix.platform.arch }}" = "arm64" ]; then
-            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+            # gcc-aarch64-linux-gnu only Recommends the target sysroot, so
+            # libc6-dev-arm64-cross must be installed explicitly; without it the
+            # cross gcc cannot find <sys/types.h> (and other libc headers), which
+            # breaks building C deps like aws-lc-sys.
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           fi
 
       - name: Install Rust toolchain
