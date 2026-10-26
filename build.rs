@@ -31,8 +31,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-env-changed=TARGET");
 
-    let git_commit = command_output("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let git_branch = command_output("git", &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let git_commit = command_output("git", &["rev-parse", "--short", "HEAD"])
+        .or_else(|| env::var("GITHUB_SHA").ok().map(|s| s.chars().take(7).collect()))
+        .unwrap_or_else(|| "unknown".into());
+    let git_branch = command_output("git", &["rev-parse", "--abbrev-ref", "HEAD"])
+        .or_else(|| env::var("GITHUB_REF_NAME").ok())
+        .unwrap_or_else(|| "unknown".into());
     // Version tracks the closest git tag (e.g. `v0.2.0`), with distance+commit when
     // ahead of a tag (`v0.2.0-3-g4f4aeaf`) and `-dirty` for uncommitted changes.
     let version = command_output("git", &["describe", "--tags", "--always", "--dirty"])
