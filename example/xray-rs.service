@@ -1,0 +1,26 @@
+# Example systemd unit for xray-rs.
+#
+# Install:
+#   sudo cp example/xray-rs.service /etc/systemd/system/xray-rs.service
+#   sudo cp example/logrotate-xray-rs /etc/logrotate.d/xray-rs
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now xray-rs
+#
+# `systemctl reload` sends SIGHUP; xray-rs reopens its log file so that
+# logrotate (create + compress) can rotate it without losing writes.
+
+[Unit]
+Description=xray-rs proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray-rs run -c /etc/xray-rs/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target

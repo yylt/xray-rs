@@ -1,0 +1,13 @@
+/var/log/xray-rs.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    # reopen via `systemctl reload` (SIGHUP) instead of copytruncate
+    postrotate
+        systemctl reload xray-rs >/dev/null 2>&1 || true
+    endscript
+}

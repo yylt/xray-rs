@@ -96,6 +96,38 @@ dns:
 - `file`：日志文件路径（追加写）。缺省时日志输出到 stderr。
 - `level`：过滤级别 `off|error|warn|info|debug|trace`，默认 `info`。
 
+### 日志轮转（logrotate + systemctl reload）
+
+配置了 `log.file` 时进程会长期持有该文件的 fd。若 logrotate 不重开文件，
+压缩后的日志会继续被写入（`.gz` 被撑大、新文件为空）。xray-rs 收到 `SIGHUP`
+会重开日志文件，所以可以用 `postrotate` + `systemctl reload`：
+
+```ini
+# /etc/systemd/system/xray-rs.service
+[Service]
+ExecStart=/usr/local/bin/xray-rs run -c /etc/xray-rs/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+```
+
+```
+# /etc/logrotate.d/xray-rs
+/var/log/xray-rs.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    postrotate
+        systemctl reload xray-rs >/dev/null 2>&1 || true
+    endscript
+}
+```
+
+完整示例见 `example/xray-rs.service` 与 `example/logrotate-xray-rs`。
+注意：`SIGHUP` 只重开日志文件，不重载配置；改配置仍需重启服务。
+
 ## example 目录说明
 
 仓库中的 `example/` 目录提供了可直接参考的示例配置：

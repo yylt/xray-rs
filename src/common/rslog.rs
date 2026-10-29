@@ -60,6 +60,39 @@ impl LogLevel {
 pub struct AsyncGuard {
     _scope_guard: slog_scope::GlobalLoggerGuard,
     _async_guard: slog_async::AsyncGuard,
+    writer: Arc<dyn WriteLog>,
+}
+
+impl AsyncGuard {
+    /// 重开日志文件。logrotate 用 `create` 轮转后旧 fd 指向已压缩的
+    /// `.gz`，必须重开才会写进新文件。
+    pub fn reopen(&self) -> io::Result<()> {
+        self.writer.reopen()
+    }
+}
+
+/// 监听 SIGHUP 重开日志文件，永不返回（由调用方 spawn）。
+/// 与 systemd `ExecReload=/bin/kill -HUP $MAINPID` 配合支持 `systemctl reload`。
+#[cfg(unix)]
+pub async fn reload_on_sighup(guard: AsyncGuard) {
+    let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("failed to install SIGHUP handler: {}", e);
+            return;
+        }
+    };
+    while hup.recv().await.is_some() {
+        match guard.reopen() {
+            Ok(()) => log::info!("log file reopened"),
+            Err(e) => log::error!("failed to reopen log file: {}", e),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn reload_on_sighup(guard: AsyncGuard) {
+    let _ = guard;
 }
 
 /// 初始化日志：输出到 `settings.file`（配置了）或 stderr（默认），
@@ -72,7 +105,7 @@ pub fn init(settings: &LogSettings) -> io::Result<AsyncGuard> {
         None => Arc::new(StderrWriter),
     };
     let drain = FormatDrain {
-        writer,
+        writer: writer.clone(),
         max_level: slog_level,
     };
 
@@ -88,12 +121,18 @@ pub fn init(settings: &LogSettings) -> io::Result<AsyncGuard> {
     Ok(AsyncGuard {
         _scope_guard: scope_guard,
         _async_guard: async_guard,
+        writer,
     })
 }
 
 /// 日志写入后端：stderr 与文件共用同一种输出格式。
 trait WriteLog: Send + Sync {
     fn write(&self, line: &str);
+
+    /// 重开输出目标；stderr 无需操作。
+    fn reopen(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct StderrWriter;
@@ -107,23 +146,37 @@ impl WriteLog for StderrWriter {
 
 /// 追加写日志文件。所有记录在 slog-io 单线程上格式化，文件写经互斥保护。
 struct FileWriter {
+    path: PathBuf,
     file: Mutex<std::fs::File>,
 }
 
 impl FileWriter {
     fn new(path: &PathBuf) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: Mutex::new(file) })
+        Ok(Self {
+            path: path.clone(),
+            file: Mutex::new(open_append(path)?),
+        })
     }
+}
+
+fn open_append(path: &PathBuf) -> io::Result<std::fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 impl WriteLog for FileWriter {
     fn write(&self, line: &str) {
         use std::io::Write;
-        let file = &self.file;
-        if let Ok(mut file) = file.lock() {
+        if let Ok(mut file) = self.file.lock() {
             let _ = writeln!(file, "{}", line);
         }
+    }
+
+    fn reopen(&self) -> io::Result<()> {
+        let file = open_append(&self.path)?;
+        if let Ok(mut slot) = self.file.lock() {
+            *slot = file;
+        }
+        Ok(())
     }
 }
 
@@ -168,5 +221,31 @@ impl Drain for FormatDrain {
         self.writer
             .write(&format!("{level_char}{date} [{source}] {}", record.msg()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// logrotate 轮转后旧 fd 仍指向已压缩的旧文件，reopen 必须写进新文件。
+    #[test]
+    fn file_writer_reopen_redirects_to_new_file() {
+        let dir = std::env::temp_dir().join(format!("rslog-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.log");
+
+        let writer = FileWriter::new(&path).unwrap();
+        writer.write("before");
+        std::fs::rename(&path, dir.join("x.log.1")).unwrap();
+        writer.reopen().unwrap();
+        writer.write("after");
+
+        let rotated = std::fs::read_to_string(dir.join("x.log.1")).unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(rotated.contains("before") && !rotated.contains("after"), "{rotated}");
+        assert!(current.contains("after") && !current.contains("before"), "{current}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

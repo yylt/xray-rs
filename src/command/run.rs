@@ -58,13 +58,16 @@ impl Run {
         };
 
         let log_settings = config.log.clone().unwrap_or_default();
-        let _guard = rslog::init(&log_settings)?;
+        let guard = rslog::init(&log_settings)?;
         build_info::log_startup_info(env!("CARGO_PKG_NAME"));
 
         let rt = match self.thread {
             ThreadMode::Single => tokio::runtime::Builder::new_current_thread().enable_all().build()?,
             ThreadMode::Multi => tokio::runtime::Builder::new_multi_thread().enable_all().build()?,
         };
+
+        // `systemctl reload` → SIGHUP → 重开日志文件（logrotate 轮转后必需）
+        rt.spawn(rslog::reload_on_sighup(guard));
 
         rt.block_on(run_proxy(config))
     }
