@@ -329,7 +329,8 @@ impl Grpc {
             .http2_keep_alive_interval(self.route_config.http2_keep_alive_interval)
             .keep_alive_while_idle(self.route_config.http2_keep_alive_while_idle)
             .buffer_size(self.route_config.buf_byte_size)
-            .http2_adaptive_window(true)
+            // tonic applies adaptive mode last; enabling it resets explicit windows to 65,535.
+            .http2_adaptive_window(false)
             .initial_stream_window_size(initial_stream_window)
             .initial_connection_window_size(initial_connection_window)
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
@@ -1084,29 +1085,32 @@ impl Drop for GrpcStream {
 
 impl AsyncRead for GrpcStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<IoResult<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if !self.read_buf.is_empty() {
             let to_copy = std::cmp::min(self.read_buf.len(), buf.remaining());
             buf.put_slice(&self.read_buf[..to_copy]);
             self.read_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
-        if let Some(ref mut incoming_rx) = self.incoming_rx {
-            match Pin::new(incoming_rx).poll_recv(cx) {
+        loop {
+            let Some(incoming_rx) = self.incoming_rx.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+            match incoming_rx.poll_recv(cx) {
+                // A protobuf message can be empty without ending the byte stream.
+                Poll::Ready(Some(data)) if data.is_empty() => continue,
                 Poll::Ready(Some(mut data)) => {
                     let to_copy = std::cmp::min(data.len(), buf.remaining());
                     buf.put_slice(&data[..to_copy]);
-
-                    if to_copy < data.len() {
-                        data.advance(to_copy);
-                        self.read_buf = data;
-                    }
-                    Poll::Ready(Ok(()))
+                    data.advance(to_copy);
+                    self.read_buf = data;
+                    return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(None) => Poll::Ready(Ok(())),
-                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
             }
-        } else {
-            Poll::Ready(Ok(()))
         }
     }
 }
@@ -1201,6 +1205,156 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_hunks_do_not_end_download_or_lose_wakeup() {
+        use std::future::Future;
+        use tokio::io::AsyncReadExt;
+        let (mut stream, incoming, _outgoing) = make_service(DEFAULT_BUFFER_SIZE);
+        for _ in 0..3 {
+            incoming.send(Bytes::new()).await.unwrap();
+        }
+        // Poll after empties but before any payload, requiring a registered wakeup.
+        let mut byte = [0; 1];
+        let mut read = Box::pin(stream.read(&mut byte));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await);
+        incoming.send(Bytes::from_static(b"payload")).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), read)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(byte, [b'p']);
+        incoming.send(Bytes::new()).await.unwrap();
+        drop(incoming);
+        let mut tail = Vec::new();
+        stream.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"ayload");
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_read_does_not_consume_hunk() {
+        let (mut stream, incoming, _outgoing) = make_service(DEFAULT_BUFFER_SIZE);
+        incoming.send(Bytes::new()).await.unwrap();
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut ReadBuf::new(&mut [])))
+            .await
+            .unwrap();
+        assert_eq!(stream.incoming_rx.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_initial_window_is_advertised_on_wire() {
+        use tokio::io::AsyncReadExt;
+        let settings: super::super::StreamSettings = serde_json::from_value(serde_json::json!({
+            "network": "grpc",
+            "grpcSettings": {"serviceName": "grpc", "http2InitialWindowSize": 2_097_152}
+        }))
+        .unwrap();
+        let dns = Arc::new(crate::route::DnsResolver::new(crate::route::DnsSettings::default()).unwrap());
+        let client = Grpc::new(&settings, None, dns).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move { client.connect_channel_new(&ConnectionTarget::Tcp(addr)).await });
+        let advertised = tokio::time::timeout(Duration::from_secs(3), async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut preface = [0; 24];
+            socket.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            loop {
+                let mut header = [0; 9];
+                socket.read_exact(&mut header).await.unwrap();
+                let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let mut payload = vec![0; length];
+                socket.read_exact(&mut payload).await.unwrap();
+                if header[3] == 4 && header[4] & 1 == 0 {
+                    for setting in payload.as_chunks::<6>().0 {
+                        if setting[..2] == [0, 4] {
+                            return u32::from_be_bytes(setting[2..].try_into().unwrap());
+                        }
+                    }
+                    return 65_535; // Omitted SETTINGS_INITIAL_WINDOW_SIZE has the protocol default.
+                }
+            }
+        })
+        .await
+        .unwrap();
+        connect.abort();
+        let _ = connect.await;
+        assert_eq!(advertised, 2_097_152);
+    }
+
+    #[tokio::test]
+    async fn download_resumes_after_backpressure_and_window_updates() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Exercise the real tonic/h2 transport on the default single-thread runtime.
+        // Each transfer exceeds both HTTP/2 windows and the 128-message queue.
+        // Cover small and default windows with idle and half-closed uploads.
+        for window in [65_535, DEFAULT_HTTP2_INITIAL_STREAM_WINDOW] {
+            let settings: super::super::StreamSettings = serde_json::from_value(serde_json::json!({
+                "network": "grpc",
+                "grpcSettings": {"serviceName": "grpc", "http2InitialWindowSize": window}
+            }))
+            .unwrap();
+            let dns = Arc::new(crate::route::DnsResolver::new(crate::route::DnsSettings::default()).unwrap());
+            let server = Grpc::new(&settings, None, dns.clone()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let mut incoming = server.listen(&Address::Inet(addr)).await.unwrap();
+            let total = 32 * 1024 * 1024;
+            let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let progress = sent.clone();
+            let sender = tokio::spawn(async move {
+                let (mut stream, _) = incoming.next().await.unwrap().unwrap();
+                let mut request = [0; 1];
+                stream.read_exact(&mut request).await.unwrap();
+                let chunk = vec![0x5a; 16 * 1024];
+                for _ in 0..total / chunk.len() {
+                    stream.write_all(&chunk).await.unwrap();
+                    progress.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                stream.shutdown().await.unwrap();
+                let mut eof = [0; 1];
+                assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
+            });
+            let client = Grpc::new(&settings, Some(Address::Inet(addr)), dns).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = client
+                    .connect(&Address::Inet(addr), crate::common::Protocol::Tcp)
+                    .await
+                    .unwrap();
+                stream.write_all(b"x").await.unwrap();
+                // Check both idle upload and half-closed upload while download continues.
+                if window == DEFAULT_HTTP2_INITIAL_STREAM_WINDOW {
+                    stream.shutdown().await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let paused = sent.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    paused > 0 && paused < total,
+                    "download did not encounter backpressure: {paused}"
+                );
+                let mut received = 0;
+                let mut buf = [0; 4096];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    assert!(buf[..n].iter().all(|byte| *byte == 0x5a));
+                    received += n;
+                }
+                assert_eq!(received, total, "download stopped early (window={window})");
+                stream.shutdown().await.unwrap();
+                sender.await.unwrap();
+            })
+            .await
+            .expect("gRPC download stalled after backpressure");
         }
     }
 
