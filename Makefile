@@ -7,7 +7,9 @@ PROTOC_GEN_TONIC := $(CARGO_BIN_DIR)/protoc-gen-tonic
 
 XRAY_CORE_BIN ?= $(abspath ../Xray-Core/xray)
 
-.PHONY: tools generate build build-xray fmt test e2e e2e-compat check clippy ci clean-generated
+CONFIG ?= example/benchmark.json
+
+.PHONY: tools generate build build-xray fmt test benchmark benchmark-test e2e e2e-compat check clippy ci clean-generated
 
 tools:
 	cargo install protoc-gen-prost --locked
@@ -39,6 +41,12 @@ fmt:
 test:
 	cargo test
 
+benchmark:
+	python3 hack/benchmark.py --config "$(CONFIG)"
+
+benchmark-test:
+	python3 -B -m unittest discover -s hack -p 'test_benchmark.py'
+
 e2e: build-xray
 	./tests/e2e/run_xray_tests.sh
 
@@ -51,7 +59,7 @@ check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-ci: fmt clippy check test
+ci: fmt clippy check test benchmark-test
 	@echo "CI: all checks passed"
 
 clean-generated:
