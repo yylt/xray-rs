@@ -55,6 +55,24 @@ pub struct StreamSettings {
     xhttp_settings: Option<xhttp::XhttpSettings>,
 }
 
+impl StreamSettings {
+    pub fn network_name(&self) -> &'static str {
+        match self.network {
+            Network::Tcp => "tcp",
+            Network::Grpc => "grpc",
+            Network::Ws => "ws",
+            Network::Xhttp => "xhttp",
+        }
+    }
+
+    pub fn security_name(&self) -> &'static str {
+        match self.security {
+            Security::None => "none",
+            Security::Tls => "tls",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub enum Network {
     #[default]
