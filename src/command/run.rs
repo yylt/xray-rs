@@ -9,7 +9,7 @@ use crate::{
     build_info,
     common::{forward::StreamForwarder, rslog, stats},
     proxy::{self},
-    route::{DnsResolver, DnsSettings, Router, RoutingSettings},
+    route::{DnsResolver, Router, RoutingSettings},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -29,6 +29,7 @@ pub struct Run {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(rename = "outbounds")]
     outbounds: Option<Vec<app::OutboundSettings>>,
@@ -38,9 +39,6 @@ pub struct Config {
 
     #[serde(rename = "routing")]
     routing: Option<RoutingSettings>,
-
-    #[serde(rename = "dns")]
-    dns: Option<DnsSettings>,
 
     #[serde(rename = "log")]
     log: Option<rslog::LogSettings>,
@@ -81,12 +79,12 @@ async fn run_proxy(config: Config) -> io::Result<()> {
         outbounds,
         inbounds,
         routing,
-        dns,
         ..
     } = config;
 
     // Phase 1: 初始化 DNS resolver
-    let dns = init_dns_resolver(dns).await?;
+    log::info!("Using system DNS resolver");
+    let dns = Arc::new(DnsResolver);
 
     // Phase 2: 初始化 stats collector
     let stats = stats::create_shared_stats();
@@ -153,22 +151,6 @@ fn register_inbound_metadata(collector: &mut stats::StatsCollector, inbounds: &[
             supported,
         ));
     }
-}
-
-/// Phase 1: 初始化 DNS resolver
-async fn init_dns_resolver(dns: Option<DnsSettings>) -> io::Result<Arc<DnsResolver>> {
-    let (dns_settings, has_dns_config) = match dns {
-        Some(dns_settings) => (dns_settings, true),
-        None => (DnsSettings::default(), false),
-    };
-
-    if has_dns_config {
-        log::info!("Initializing DNS resolver with config");
-    } else {
-        log::info!("No DNS config, using system resolver");
-    }
-
-    Ok(Arc::new(DnsResolver::new(dns_settings)?))
 }
 
 /// Phase 3: 构建 outbound sinks
@@ -402,6 +384,19 @@ async fn wait_for_completion(handles: Vec<tokio::task::JoinHandle<()>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_dns_configuration_is_rejected() {
+        for value in [
+            serde_json::json!({"dns": {}}),
+            serde_json::json!({"dns": {"hosts": ["example.com:127.0.0.1"], "servers": ["1.1.1.1:53"]}}),
+        ] {
+            let error = serde_json::from_value::<super::Config>(value).unwrap_err();
+            assert!(error.to_string().contains("unknown field `dns`"));
+        }
+        assert!(serde_json::from_value::<super::Config>(serde_json::json!({})).is_ok());
+        assert!(serde_yaml::from_str::<super::Config>("dns: {}\n").is_err());
+    }
+
     use super::*;
 
     #[test]

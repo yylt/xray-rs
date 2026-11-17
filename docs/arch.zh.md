@@ -148,10 +148,12 @@ main
 ### 3.1 第一步：初始化 DNS
 
 ```text
-Config.dns
-  -> DnsSettings
-  -> DnsResolver::new(...)
+Arc::new(DnsResolver)
+  -> tokio::net::lookup_host(...)
+  -> system resolver
 ```
+
+解析器无状态，无应用内 DNS 缓存或自定义 DNS 配置。系统 hosts/DNS 服务及其缓存由操作系统管理。
 
 DNS 解析器在主程序中主要服务两处：
 

@@ -92,18 +92,18 @@ The main config struct is defined in `src/command/run.rs`:
   "outbounds": [],
   "inbounds": [],
   "routing": {},
-  "dns": {},
   "log": {}
 }
 ```
 
-All five top-level fields are optional, but in practical terms:
+All four top-level fields are optional, but in practical terms:
 
 - without `inbounds`, the program usually will not receive proxy traffic
 - without `outbounds`, routing may not have any useful target
 - without `routing`, behavior falls back to using the first outbound as the default target
-- without `dns`, the program uses default `DnsSettings` and tends to rely on the system resolver
 - without `log`, logs go to stderr at info level
+
+DNS always uses the system resolver without an application DNS cache. The top-level `dns` field (including hosts/servers/disableCache) is no longer supported and is rejected on config load; configure DNS through the OS. gRPC target snapshots and Channel reuse remain unchanged and are separate from the global DNS resolver.
 
 The `log` field structure:
 
@@ -436,11 +436,6 @@ This means protocol logic can be combined with different transport layers such a
     "fallback": {
       "tags": ["direct"]
     }
-  },
-  "dns": {
-    "disableCache": false,
-    "hosts": ["localhost:127.0.0.1"],
-    "servers": ["1.1.1.1:53", "tcp://8.8.8.8:53"]
   }
 }
 ```

@@ -2,7 +2,7 @@ pub mod resolver;
 pub mod router;
 
 use crate::common::{domain_trie, ip_trie};
-pub use resolver::{DnsResolver, DnsSettings};
+pub use resolver::DnsResolver;
 pub use router::{Router, SharedRouter};
 
 use ipnet::IpNet;

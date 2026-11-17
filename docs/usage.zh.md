@@ -92,18 +92,18 @@ xray-rs run -c config.yaml --thread multi
   "outbounds": [],
   "inbounds": [],
   "routing": {},
-  "dns": {},
   "log": {}
 }
 ```
 
-五个顶层字段都是可选的，但从实际使用角度看：
+四个顶层字段都是可选的，但从实际使用角度看：
 
 - 没有 `inbounds`，程序通常不会真正接收代理流量
 - 没有 `outbounds`，即使有路由也可能没有有效目标
 - 没有 `routing`，则会退化为“使用第一个 outbound 作为默认目标”
-- 没有 `dns`，则使用默认 `DnsSettings`，并倾向于系统解析器
 - 没有 `log`，则日志输出到 stderr，级别为 info
+
+DNS 统一使用系统解析器，无应用内 DNS 缓存。顶层 `dns`（含 hosts/servers/disableCache）不再支持，出现时配置加载会报错；请通过操作系统配置 DNS。gRPC 目标快照与 Channel 复用不属于全局 DNS 缓存，此次保持不变。
 
 `log` 字段结构：
 
@@ -436,11 +436,6 @@ xray-rs run -c config.yaml --thread multi
     "fallback": {
       "tags": ["direct"]
     }
-  },
-  "dns": {
-    "disableCache": false,
-    "hosts": ["localhost:127.0.0.1"],
-    "servers": ["1.1.1.1:53", "tcp://8.8.8.8:53"]
   }
 }
 ```

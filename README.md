@@ -81,15 +81,9 @@ routing:
   fallback:
     tags:
       - direct
-
-dns:
-  disableCache: false
-  hosts:
-    - localhost:127.0.0.1
-  servers:
-    - 1.1.1.1:53
-    - tcp://8.8.8.8:53
 ```
+
+DNS 仅使用系统解析器，不提供应用内 DNS 缓存或 `dns` 配置；旧配置须删除该字段。系统 DNS/hosts 及缓存由操作系统管理。
 
 ### log 配置
 
