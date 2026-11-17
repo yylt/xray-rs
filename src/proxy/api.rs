@@ -18,15 +18,32 @@ use crate::common::stats::SharedStats;
 use crate::common::{Address, BoxStream, Protocol};
 use crate::route::SharedRouter;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+mod metrics;
+#[cfg(test)]
+mod tests;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InSetting {
-    /// Optional authentication token for API access
-    pub token: Option<String>,
+    #[serde(default = "default_retention")]
+    pub retention: String,
+}
+
+fn default_retention() -> String {
+    "24h".into()
+}
+
+impl Default for InSetting {
+    fn default() -> Self {
+        Self {
+            retention: default_retention(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct ApiInbound {
-    settings: InSetting,
+    history: Arc<tokio::sync::RwLock<metrics::History>>,
     stats: SharedStats,
     router: SharedRouter,
     sinks: Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>, // outbound sinks for probing
@@ -40,7 +57,9 @@ impl ApiInbound {
         sinks: Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>,
     ) -> io::Result<Self> {
         Ok(Self {
-            settings: settings.clone(),
+            history: Arc::new(tokio::sync::RwLock::new(metrics::History::new(metrics::duration(
+                &settings.retention,
+            )?))),
             stats,
             router,
             sinks,
@@ -52,8 +71,17 @@ impl ApiInbound {
         let listener = crate::transport::bind_tcp_listener(addr)?;
         log::info!("API server listening on {}", addr);
 
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(metrics::SAMPLE_SECONDS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
+            let (stream, peer_addr) = tokio::select! {
+                _ = interval.tick() => {
+                    let snapshot = self.stats.read().await.snapshot();
+                    self.history.write().await.sample(snapshot, Instant::now(), metrics::timestamp_ms(), metrics::resident_memory());
+                    continue;
+                }
+                accepted = listener.accept() => accepted?,
+            };
             if let Err(e) = stream.set_nodelay(true) {
                 log::error!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
                 continue;
@@ -61,18 +89,18 @@ impl ApiInbound {
             let io = hyper_util::rt::TokioIo::new(stream);
 
             // Create service function for this connection
-            let settings = self.settings.clone();
+            let history = self.history.clone();
             let stats = self.stats.clone();
             let router = self.router.clone();
             let sinks = self.sinks.clone();
 
             tokio::spawn(async move {
                 let service_fn = service_fn(move |req| {
-                    let settings = settings.clone();
+                    let history = history.clone();
                     let stats = stats.clone();
                     let router = router.clone();
                     let sinks = sinks.clone();
-                    async move { handle_request(req, settings, stats, router, sinks).await }
+                    async move { handle_request(req, history, stats, router, sinks).await }
                 });
                 if let Err(err) = http1::Builder::new()
                     .keep_alive(true)
@@ -93,28 +121,47 @@ impl ApiInbound {
 
 async fn handle_request(
     req: Request<Incoming>,
-    settings: InSetting,
+    history: Arc<tokio::sync::RwLock<metrics::History>>,
     stats: SharedStats,
     router: SharedRouter,
     sinks: Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Check auth token if configured
-    if let Some(ref token) = settings.token {
-        let header_token = req
-            .headers()
-            .get("Authorization")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "));
-
-        if header_token != Some(token.as_str()) {
-            return Ok(json_response(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"})));
-        }
-    }
-
     let method = req.method().clone();
     let path = req.uri().path();
 
     match (method.as_str(), path) {
+        ("GET", "/") => Ok(text_response(
+            "text/html; charset=utf-8",
+            include_str!("metrics.html").to_string(),
+        )),
+        ("GET", "/metrics") => {
+            let snapshot = stats.read().await.snapshot();
+            Ok(text_response(
+                "text/plain; version=0.0.4; charset=utf-8",
+                history.read().await.prometheus(&snapshot),
+            ))
+        }
+        ("GET", "/metrics/history") => {
+            let history = history.read().await;
+            let range = url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
+                .find(|(key, _)| key == "range")
+                .map(|(_, value)| metrics::duration(&value))
+                .unwrap_or_else(|| Ok(history.retention()));
+            let range = match range {
+                Ok(range) if range <= history.retention() => range,
+                _ => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "invalid range or range exceeds retention"}),
+                    ))
+                }
+            };
+            let snapshot = stats.read().await.snapshot();
+            Ok(json_response(
+                StatusCode::OK,
+                history.response(range, &snapshot, Instant::now()),
+            ))
+        }
         ("GET", "/stats") => handle_get_stats(req, stats).await,
         ("POST", "/handler") => handle_post_handler(req, router, sinks).await,
         ("GET", "/check") => handle_get_check(req, sinks).await,
@@ -210,11 +257,22 @@ struct HandlerRequest {
     tag: String,
 }
 
+fn text_response(content_type: &str, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .header("Content-Type", content_type)
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Full<Bytes>> {
     let body_bytes = Bytes::from(body.to_string());
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(body_bytes))
         .unwrap()
 }

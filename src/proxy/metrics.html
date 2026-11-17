@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Xray metrics</title>
+<style>
+:root { color-scheme: light dark; --bg: #f3f6fa; --panel: #fff; --text: #17263c; --muted: #52637a; --border: #cbd5e1; --up: #1264bd; --down: #a63e00; --memory: #7540ad; }
+@media (prefers-color-scheme: dark) { :root { --bg: #101722; --panel: #192332; --text: #e5edf7; --muted: #a8b7cc; --border: #405168; --up: #74b9ff; --down: #ffb675; --memory: #c5a0ff; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+main { max-width: 1440px; margin: auto; padding: 24px; }
+header, .controls, .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+header { justify-content: space-between; }
+h1 { margin: 0; font-size: 1.8rem; } h2 { margin: 0 0 12px; font-size: 1.2rem; }
+p { margin: 8px 0; } .muted, .summary { color: var(--muted); }
+section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-top: 20px; min-width: 0; }
+label { display: inline-flex; align-items: center; gap: 8px; }
+select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 5px; padding: 8px 12px; min-height: 44px; }
+select { max-width: 100%; } button { cursor: pointer; } button:disabled { cursor: wait; opacity: .65; }
+:focus-visible { outline: 3px solid var(--up); outline-offset: 3px; }
+#error { border-left: 4px solid #c93636; padding: 12px; background: var(--panel); color: var(--text); }
+.table-scroll { overflow-x: auto; } table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+caption { text-align: left; color: var(--muted); padding-bottom: 10px; }
+th, td { text-align: left; border-bottom: 1px solid var(--border); padding: 10px 12px; }
+th:first-child, td:first-child { padding-left: 0; } td:nth-child(n+4), th:nth-child(n+4) { text-align: right; font-variant-numeric: tabular-nums; }
+.chart { width: 100%; height: 290px; display: block; margin-top: 12px; }
+.legend { gap: 20px; margin-top: 12px; color: var(--muted); }
+.key::before { content: ''; display: inline-block; width: 24px; border-top: 3px solid; vertical-align: middle; margin-right: 8px; }
+.up::before { border-color: var(--up); } .down::before { border-color: var(--down); } .memory::before { border-color: var(--memory); }
+.summary { font-variant-numeric: tabular-nums; }
+footer { margin-top: 24px; color: var(--muted); }
+@media (max-width: 600px) { main { padding: 14px; } section { padding: 14px; } .controls { gap: 10px; } .controls label { width: 100%; justify-content: space-between; } .controls select { max-width: 65%; } .chart { height: 250px; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+<div><h1>Xray metrics</h1><p class="muted">Live forwarding traffic and process memory</p></div>
+<div class="controls"><label for="range">Time range <select id="range" disabled><option value="">Configured retention</option></select></label><button id="refresh" type="button">Refresh</button></div>
+</header>
+<p id="status" role="status" aria-live="polite">Loading metrics…</p>
+<p id="error" role="alert" hidden></p>
+<section aria-labelledby="traffic-heading">
+<h2 id="traffic-heading">Network throughput</h2>
+<div class="controls">
+<label for="direction">Direction <select id="direction"><option value="inbound">Inbound</option><option value="outbound">Outbound</option></select></label>
+<label for="tag">Tag <select id="tag" disabled><option>No series yet</option></select></label>
+</div>
+<div class="legend" aria-label="Network chart legend"><span class="key up">Uplink · client → target</span><span class="key down">Downlink · target → client</span></div>
+<canvas id="traffic-chart" class="chart" role="img" aria-label="Network throughput over time" aria-describedby="traffic-summary">Network throughput is described below.</canvas>
+<p id="traffic-summary" class="summary">Waiting for samples.</p>
+</section>
+<section aria-labelledby="memory-heading">
+<h2 id="memory-heading">Process resident memory (RSS)</h2>
+<div class="legend"><span class="key memory">RSS · bucket average</span></div>
+<canvas id="memory-chart" class="chart" role="img" aria-label="Process RSS memory over time" aria-describedby="memory-summary">Process memory is described below.</canvas>
+<p id="memory-summary" class="summary">Waiting for samples.</p>
+</section>
+<section aria-labelledby="inbound-heading"><h2 id="inbound-heading">Inbound traffic</h2><div class="table-scroll" role="region" aria-label="Inbound counters, scroll horizontally for all columns" tabindex="0"><table><caption>Cumulative payload counters and latest sampled rates</caption><thead><tr><th scope="col">Tag</th><th scope="col">Proxy</th><th scope="col">Transport</th><th scope="col">Uplink total</th><th scope="col">Downlink total</th><th scope="col">Uplink /s</th><th scope="col">Downlink /s</th></tr></thead><tbody id="inbound-body"></tbody></table></div></section>
+<section aria-labelledby="outbound-heading"><h2 id="outbound-heading">Outbound traffic</h2><div class="table-scroll" role="region" aria-label="Outbound counters, scroll horizontally for all columns" tabindex="0"><table><caption>Cumulative payload counters and latest sampled rates</caption><thead><tr><th scope="col">Tag</th><th scope="col">Proxy</th><th scope="col">Transport</th><th scope="col">Uplink total</th><th scope="col">Downlink total</th><th scope="col">Uplink /s</th><th scope="col">Downlink /s</th></tr></thead><tbody id="outbound-body"></tbody></table></div></section>
+<footer>
+<p>Inbound and outbound are two views of the same traffic: do not add them together. Counters measure forwarded payload, not physical network traffic or protocol/TLS overhead. API traffic is excluded.</p>
+<p>Rates are sampling-interval averages; chart peaks preserve the highest sample in each time bucket. RSS may be unavailable. In-memory history is cleared on restart.</p>
+<p>No authentication is provided here. Keep this listener on loopback or behind a trusted, access-controlled reverse proxy.</p>
+</footer>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const range = $('range');
+const direction = $('direction');
+const tag = $('tag');
+let data = null;
+let timer;
+let inFlight = false;
+let pending = false;
+let lastSuccess = '';
+const valid = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+function bytes(value, rate = false) {
+  if (!valid(value)) return 'Unavailable';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return value.toLocaleString(undefined, { maximumFractionDigits: unit ? 2 : 0 }) + ' ' + units[unit] + (rate ? '/s' : '');
+}
+function option(value, label) {
+  const node = document.createElement('option');
+  node.value = value;
+  node.textContent = label;
+  return node;
+}
+function updateRanges(seconds) {
+  const previous = range.value;
+  const choices = [[3600, '1h', 'Last hour'], [86400, '24h', 'Last 24 hours'], [259200, '3d', 'Last 3 days']].filter(item => item[0] <= seconds);
+  if (!choices.some(item => item[0] === seconds)) choices.push([seconds, seconds + 's', 'Full retention (' + seconds.toLocaleString() + ' seconds)']);
+  range.replaceChildren(...choices.map(item => option(item[1], item[2])));
+  range.value = choices.some(item => item[1] === previous) ? previous : choices[choices.length - 1][1];
+  range.disabled = false;
+}
+function updateTags() {
+  const previous = tag.selectedOptions[0]?.textContent;
+  const choices = data.series.map((item, index) => ({ item, index })).filter(({ item }) => item.direction === direction.value);
+  tag.replaceChildren(...choices.map(({ item, index }) => option(String(index), item.tag)));
+  if (!choices.length) tag.append(option('', 'No registered series'));
+  const retained = choices.find(({ item }) => item.tag === previous);
+  if (retained) tag.value = String(retained.index);
+  tag.disabled = !choices.length;
+}
+function updateTables() {
+  for (const dir of ['inbound', 'outbound']) {
+    const body = $(dir + '-body');
+    body.replaceChildren();
+    for (const item of data.series.filter(item => item.direction === dir)) {
+      const row = document.createElement('tr');
+      const values = [item.tag, item.proxy, item.transport + (item.security === 'tls' ? '+tls' : ''), ...[item.uplink, item.downlink, item.uplink_bps, item.downlink_bps].map((value, index) => item.supported === false ? 'Unsupported' : bytes(value, index >= 2))];
+      for (const value of values) {
+        const cell = document.createElement('td');
+        cell.textContent = String(value ?? 'Unavailable');
+        row.append(cell);
+      }
+      body.append(row);
+    }
+    if (!body.children.length) {
+      const cell = document.createElement('td');
+      cell.colSpan = 7;
+      cell.textContent = 'No registered ' + dir + ' series.';
+      const row = document.createElement('tr');
+      row.append(cell);
+      body.append(row);
+    }
+  }
+}
+function timeLabel(timestamp, span) {
+  return new Date(timestamp).toLocaleString(undefined, span > 86400000 ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' } : { hour: '2-digit', minute: '2-digit', ...(span < 60000 ? { second: '2-digit' } : {}) });
+}
+function chart(canvas, lines, rate) {
+  const rect = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(rect.width * ratio);
+  canvas.height = Math.round(rect.height * ratio);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.scale(ratio, ratio);
+  const style = getComputedStyle(document.documentElement);
+  const width = rect.width, height = rect.height;
+  const left = Math.min(96, width * .28), right = 16, top = 18, bottom = 48;
+  const plotWidth = width - left - right, plotHeight = height - top - bottom;
+  const points = data ? data.points : [];
+  const timestamps = points.map(point => point.timestamp_ms).filter(valid);
+  const start = timestamps.length ? Math.min(...timestamps) : 0;
+  const end = timestamps.length ? Math.max(...timestamps) : 1;
+  const span = Math.max(end - start, 1000);
+  let max = 0, count = 0;
+  for (const line of lines) for (const value of line.values) if (valid(value)) { max = Math.max(max, value); count++; }
+  max = max > 0 ? max * 1.1 : 1;
+  ctx.font = '12px system-ui, sans-serif';
+  ctx.lineWidth = 1;
+  for (let tick = 0; tick <= 4; tick++) {
+    const y = top + plotHeight * tick / 4;
+    ctx.strokeStyle = style.getPropertyValue('--border').trim();
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
+    ctx.fillStyle = style.getPropertyValue('--muted').trim();
+    ctx.textAlign = 'right'; ctx.fillText(bytes(max * (1 - tick / 4), rate), left - 8, y + 4);
+  }
+  if (timestamps.length) {
+    const ticks = width < 600 ? 2 : 4;
+    for (let tick = 0; tick <= ticks; tick++) {
+      const x = left + plotWidth * tick / ticks;
+      ctx.textAlign = tick === 0 ? 'left' : tick === ticks ? 'right' : 'center';
+      ctx.fillText(timeLabel(start + (end - start) * tick / ticks, span), x, height - 18);
+    }
+  }
+  for (const line of lines) {
+    ctx.strokeStyle = style.getPropertyValue(line.color).trim();
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let connected = false;
+    line.values.forEach((value, index) => {
+      const timestamp = points[index]?.timestamp_ms;
+      if (!valid(value) || !valid(timestamp)) { connected = false; return; }
+      const x = left + (timestamp - start) / span * plotWidth;
+      const y = top + plotHeight * (1 - value / max);
+      if (connected) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      connected = true;
+    });
+    ctx.stroke();
+    // Mark isolated samples as well as continuous lines.
+    line.values.forEach((value, index) => {
+      if (!valid(value) || !valid(points[index]?.timestamp_ms)) return;
+      const x = left + (points[index].timestamp_ms - start) / span * plotWidth;
+      const y = top + plotHeight * (1 - value / max);
+      ctx.beginPath(); ctx.arc(x, y, 1.7, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+  if (!count) {
+    ctx.fillStyle = style.getPropertyValue('--muted').trim(); ctx.textAlign = 'center';
+    ctx.fillText('No samples available', left + plotWidth / 2, top + plotHeight / 2);
+  }
+}
+function renderCharts() {
+  const points = data?.points || [];
+  const selected = tag.value === '' ? null : data?.series[Number(tag.value)];
+  const index = Number(tag.value);
+  const supported = selected && selected.supported !== false;
+  const traffic = key => points.map(point => supported ? point.series?.[index]?.[key] : null);
+  const uplink = traffic('uplink_bps'), downlink = traffic('downlink_bps');
+  const peak = values => { const numbers = values.filter(valid); return numbers.length ? Math.max(...numbers) : null; };
+  chart($('traffic-chart'), [{ color: '--up', values: uplink }, { color: '--down', values: downlink }], true);
+  let summary = 'No registered series for this direction.';
+  if (selected && !supported) summary = selected.tag + ': traffic collection is unsupported.';
+  else if (supported) summary = direction.value + ' / ' + selected.tag + ' · Current uplink ' + bytes(selected.uplink_bps, true) + ', downlink ' + bytes(selected.downlink_bps, true) + ' · Range peaks: uplink ' + bytes(peak(traffic('uplink_peak_bps')), true) + ', downlink ' + bytes(peak(traffic('downlink_peak_bps')), true) + ' · ' + points.length + ' time buckets.';
+  $('traffic-summary').textContent = summary;
+  $('traffic-chart').setAttribute('aria-label', 'Network throughput. ' + summary);
+  const memory = points.map(point => point.memory_bytes);
+  chart($('memory-chart'), [{ color: '--memory', values: memory }], false);
+  const memorySummary = 'Current RSS: ' + bytes(data?.memory_bytes) + ' · Range peak: ' + bytes(peak(points.map(point => point.memory_peak_bytes))) + ' · ' + memory.filter(valid).length + ' available time buckets.';
+  $('memory-summary').textContent = memorySummary;
+  $('memory-chart').setAttribute('aria-label', 'Process resident memory. ' + memorySummary);
+}
+async function refresh() {
+  clearTimeout(timer);
+  if (inFlight) { pending = true; return; }
+  inFlight = true;
+  $('refresh').disabled = true;
+  $('status').textContent = lastSuccess ? 'Refreshing… Last updated ' + lastSuccess : 'Loading metrics…';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch('/metrics/history' + (range.value ? '?range=' + encodeURIComponent(range.value) : ''), { signal: controller.signal, headers: { Accept: 'application/json' }, cache: 'no-store' });
+    if (!response.ok) throw new Error('HTTP ' + response.status + ' ' + response.statusText);
+    const result = await response.json();
+    if (!Array.isArray(result.series) || !Array.isArray(result.points) || !valid(result.retention_seconds) || result.retention_seconds < 1) throw new Error('Invalid metrics history response');
+    // Ignore a stale range response; the queued request will fetch the new selection.
+    if (!pending) {
+      data = result;
+      updateRanges(result.retention_seconds);
+      updateTags(); updateTables(); renderCharts();
+      lastSuccess = new Date().toLocaleTimeString();
+      $('error').hidden = true;
+      $('status').textContent = 'Updated ' + lastSuccess + ' · Refreshes every 5 seconds · Retention ' + result.retention_seconds.toLocaleString() + ' seconds';
+    }
+  } catch (error) {
+    $('error').textContent = 'Unable to load metrics: ' + (error.name === 'AbortError' ? 'request timed out after 15 seconds' : error.message) + '. Retrying automatically; you can also use Refresh.';
+    $('error').hidden = false;
+    $('status').textContent = lastSuccess ? 'Showing stale data. Last updated ' + lastSuccess : 'No metrics loaded.';
+  } finally {
+    clearTimeout(timeout);
+    inFlight = false;
+    $('refresh').disabled = false;
+    if (pending) { pending = false; refresh(); }
+    else timer = setTimeout(refresh, 5000);
+  }
+}
+range.addEventListener('change', refresh);
+$('refresh').addEventListener('click', refresh);
+direction.addEventListener('change', () => { if (data) updateTags(); renderCharts(); });
+tag.addEventListener('change', renderCharts);
+new ResizeObserver(renderCharts).observe($('traffic-chart').parentElement);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', renderCharts);
+renderCharts();
+refresh();
+</script>
+</body>
+</html>

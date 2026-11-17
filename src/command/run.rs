@@ -91,6 +91,12 @@ async fn run_proxy(config: Config) -> io::Result<()> {
     // Phase 2: 初始化 stats collector
     let stats = stats::create_shared_stats();
 
+    // Register every business inbound before any API daemon can start.
+    if let Some(inbounds) = &inbounds {
+        let mut collector = stats.write().await;
+        register_inbound_metadata(&mut collector, inbounds);
+    }
+
     // Phase 3: 构建 outbound sinks
     let (sinks, _outbound_tags, mut handles, first_tag) =
         build_outbound_sinks(outbounds, dns.clone(), stats.clone()).await?;
@@ -106,6 +112,47 @@ async fn run_proxy(config: Config) -> io::Result<()> {
     // Phase 6: 等待所有任务完成
     wait_for_completion(handles).await;
     Ok(())
+}
+
+fn traffic_metadata(
+    direction: &str,
+    tag: &str,
+    proxy: &str,
+    stream: Option<&crate::transport::StreamSettings>,
+    supported: bool,
+) -> stats::TrafficSnapshot {
+    stats::TrafficSnapshot {
+        direction: direction.into(),
+        tag: tag.into(),
+        proxy: proxy.into(),
+        transport: stream.map_or("tcp", |s| s.network_name()).into(),
+        security: stream.map_or("none", |s| s.security_name()).into(),
+        supported,
+        uplink: 0,
+        downlink: 0,
+    }
+}
+
+fn register_inbound_metadata(collector: &mut stats::StatsCollector, inbounds: &[app::InboundSettings]) {
+    for inbound in inbounds {
+        let (protocol, supported) = match inbound.settings.as_ref() {
+            None | Some(proxy::InboundSettings::Api(_)) => continue,
+            Some(proxy::InboundSettings::Http(_)) => ("http", true),
+            Some(proxy::InboundSettings::Socks(_)) => ("socks", true),
+            Some(proxy::InboundSettings::Trojan(_)) => ("trojan", true),
+            Some(proxy::InboundSettings::Vless(_)) => ("vless", true),
+            Some(proxy::InboundSettings::Reverse(_)) => ("reverse", false),
+            #[cfg(feature = "tun")]
+            Some(proxy::InboundSettings::Tun(_)) => ("tun", true),
+        };
+        collector.register_metadata(traffic_metadata(
+            "inbound",
+            inbound.tag.as_deref().unwrap_or("in"),
+            protocol,
+            inbound.stream_settings.as_ref(),
+            supported,
+        ));
+    }
 }
 
 /// Phase 1: 初始化 DNS resolver
@@ -160,14 +207,22 @@ async fn build_outbound_sinks(
                 first_tag = Some(tag.clone());
             }
 
-            // Register outbound for stats tracking (skip blackhole and direct)
-            let needs_stats = !matches!(ob_set.settings.as_ref(), Some(proxy::OutboundSettings::Black));
-
-            if needs_stats {
-                outbound_tags.push(tag.clone());
-                let mut stats_guard = stats.write().await;
-                stats_guard.register_outbound(&tag);
-            }
+            let (protocol, supported) = match ob_set.settings.as_ref() {
+                None | Some(proxy::OutboundSettings::Freedom) => ("freedom", true),
+                Some(proxy::OutboundSettings::Black) => ("blackhole", true),
+                Some(proxy::OutboundSettings::Socks(_)) => ("socks", true),
+                Some(proxy::OutboundSettings::Trojan(_)) => ("trojan", true),
+                Some(proxy::OutboundSettings::Vless(_)) => ("vless", true),
+                Some(proxy::OutboundSettings::Reverse(_)) => ("reverse", false),
+            };
+            outbound_tags.push(tag.clone());
+            stats.write().await.register_metadata(traffic_metadata(
+                "outbound",
+                &tag,
+                protocol,
+                ob_set.stream_settings.as_ref(),
+                supported,
+            ));
 
             let sink = ob_set.build_sink(dns.clone())?;
 
@@ -312,16 +367,10 @@ async fn handle_proxy_stream(
                             .await
                         {
                             Ok(connected) => {
-                                // Perform forwarding with stats tracking
-                                let stats_for_tag = stats.read().await.get_outbound_stats(tag);
-
-                                let _ = if let Some(stats_ref) = stats_for_tag {
-                                    forwarder
-                                        .forward_with_stats(proxy_stream.inner, connected, stats_ref)
-                                        .await
-                                } else {
-                                    forwarder.forward(proxy_stream.inner, connected).await
-                                };
+                                let counters = stats.read().await.counters(&proxy_stream.metadata.inbound_tag, tag);
+                                let _ = forwarder
+                                    .forward_with_counters(proxy_stream.inner, connected, counters)
+                                    .await;
                                 return;
                             }
                             Err(_e) => {
@@ -330,7 +379,10 @@ async fn handle_proxy_stream(
                         }
                     }
                     _ => {
-                        let _ = sink.handle(proxy_stream, forwarder.as_ref()).await;
+                        let counters = stats.read().await.counters(&proxy_stream.metadata.inbound_tag, tag);
+                        let _ = sink
+                            .handle_with_counters(proxy_stream, forwarder.as_ref(), counters)
+                            .await;
                         return;
                     }
                 }
@@ -345,5 +397,33 @@ async fn handle_proxy_stream(
 async fn wait_for_completion(handles: Vec<tokio::task::JoinHandle<()>>) {
     for h in handles {
         let _ = h.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_registered_before_api_and_keeps_configured_transport() {
+        let inbounds: Vec<app::InboundSettings> = serde_json::from_value(serde_json::json!([
+            {"listen":"127.0.0.1", "protocol":"api", "tag":"api"},
+            {"listen":"127.0.0.1", "protocol":"socks", "tag":"socks", "streamSettings":{"network":"ws","security":"tls"}}
+        ])).unwrap();
+        let mut collector = stats::StatsCollector::new();
+        register_inbound_metadata(&mut collector, &inbounds);
+        collector.register_metadata(traffic_metadata("outbound", "reverse", "reverse", None, false));
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].direction, "inbound");
+        assert_eq!(snapshot[0].tag, "socks");
+        assert_eq!(snapshot[0].proxy, "socks");
+        assert_eq!(snapshot[0].transport, "ws");
+        assert_eq!(snapshot[0].security, "tls");
+        assert!(!snapshot[1].supported);
+        let counters = collector.counters("socks", "reverse");
+        counters.record_uplink(7);
+        assert_eq!(collector.calculate_total(), (7, 0));
+        assert_eq!(collector.snapshot()[0].uplink, 7);
     }
 }

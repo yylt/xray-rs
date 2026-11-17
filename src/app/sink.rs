@@ -1,5 +1,9 @@
 use crate::{
-    common::{forward::StreamForwarder, Address, Protocol},
+    common::{
+        forward::{CountingStream, StreamForwarder},
+        stats::TrafficCounters,
+        Address, Protocol,
+    },
     proxy::{Outbounder, ProxyStream},
     route::DnsResolver,
     transport::{self, TrStream},
@@ -30,9 +34,19 @@ impl std::fmt::Debug for ConnectionSink {
 impl ConnectionSink {
     /// 处理一条 ProxyStream
     pub async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
+        self.handle_with_counters(stream, forwarder, TrafficCounters::default())
+            .await
+    }
+
+    pub async fn handle_with_counters(
+        &self,
+        stream: ProxyStream,
+        forwarder: &StreamForwarder,
+        counters: TrafficCounters,
+    ) -> std::io::Result<()> {
         match self {
-            ConnectionSink::Direct(sink) => sink.handle(stream, forwarder).await,
-            ConnectionSink::Proxy(sink) => sink.handle(stream, forwarder).await,
+            ConnectionSink::Direct(sink) => sink.handle(stream, forwarder, counters).await,
+            ConnectionSink::Proxy(sink) => sink.handle(stream, forwarder, counters).await,
             ConnectionSink::Block => {
                 drop(stream);
                 Ok(())
@@ -59,20 +73,29 @@ pub struct DirectSink {
 }
 
 impl DirectSink {
-    async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
+    async fn handle(
+        &self,
+        stream: ProxyStream,
+        forwarder: &StreamForwarder,
+        counters: TrafficCounters,
+    ) -> std::io::Result<()> {
         let dst = self.resolve(&stream.metadata.dst).await?;
         match stream.metadata.protocol {
             Protocol::Tcp => {
                 let remote = self.transport.connect(&dst, Protocol::Tcp, None).await?;
-                forwarder.forward(stream.inner, remote).await?;
+                forwarder.forward_with_counters(stream.inner, remote, counters).await?;
                 Ok(())
             }
-            Protocol::Udp => self.handle_udp(stream, dst).await,
+            Protocol::Udp => self.handle_udp(stream, dst, counters).await,
         }
     }
 
-    async fn handle_udp(&self, stream: ProxyStream, dst: Address) -> std::io::Result<()> {
-        let mut inbound = stream.inner;
+    async fn handle_udp(&self, stream: ProxyStream, dst: Address, counters: TrafficCounters) -> std::io::Result<()> {
+        let mut inbound = CountingStream {
+            inner: stream.inner,
+            counters: counters.clone(),
+            uplink: false,
+        };
         let mut remote = self.transport.connect(&dst, Protocol::Udp, None).await?;
 
         let remote_socket = match &mut remote {
@@ -95,7 +118,8 @@ impl DirectSink {
                     if n == 0 {
                         break;
                     }
-                    remote_socket.send(&inbound_buf[..n]).await?;
+                    let sent = remote_socket.send(&inbound_buf[..n]).await?;
+                    counters.record_uplink(sent as u64);
                 }
                 remote_read = remote_socket.recv(&mut remote_buf) => {
                     let n = remote_read?;
@@ -131,11 +155,16 @@ pub struct ProxySink {
 }
 
 impl ProxySink {
-    async fn handle(&self, stream: ProxyStream, forwarder: &StreamForwarder) -> std::io::Result<()> {
+    async fn handle(
+        &self,
+        stream: ProxyStream,
+        forwarder: &StreamForwarder,
+        counters: TrafficCounters,
+    ) -> std::io::Result<()> {
         let remote = self
             .try_connect(&stream.metadata.dst, stream.metadata.protocol.clone())
             .await?;
-        forwarder.forward(stream.inner, remote).await?;
+        forwarder.forward_with_counters(stream.inner, remote, counters).await?;
         Ok(())
     }
 
@@ -164,5 +193,84 @@ impl DaemonSink {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{common::stats::TrafficStats, route::DnsSettings};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio::time::{timeout, Duration};
+
+    async fn direct_flow(protocol: Protocol) {
+        timeout(Duration::from_secs(5), async {
+            let dns = Arc::new(DnsResolver::new(DnsSettings::default()).unwrap());
+            let sink = DirectSink {
+                transport: transport::Transport::new(&transport::StreamSettings::default(), None, dns.clone()).unwrap(),
+                dns,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (inbound, _) = listener.accept().await.unwrap();
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let dst = match protocol {
+                Protocol::Tcp => tcp.local_addr().unwrap(),
+                Protocol::Udp => udp.local_addr().unwrap(),
+            };
+            let stream = ProxyStream::new(
+                protocol.clone(),
+                Address::Inet(client.local_addr().unwrap()),
+                Address::Inet(dst),
+                TrStream::Tcp(inbound),
+            );
+            let inbound_stats = Arc::new(TrafficStats::new());
+            let outbound_stats = Arc::new(TrafficStats::new());
+            let counters = TrafficCounters {
+                inbound: Some(inbound_stats.clone()),
+                outbound: Some(outbound_stats.clone()),
+            };
+            let task = tokio::spawn(async move { sink.handle(stream, &StreamForwarder::new(), counters).await });
+            client.write_all(b"ping").await.unwrap();
+            let mut buf = [0; 4];
+            match protocol {
+                Protocol::Tcp => {
+                    let (mut remote, _) = tcp.accept().await.unwrap();
+                    remote.read_exact(&mut buf).await.unwrap();
+                    remote.write_all(b"pong").await.unwrap();
+                    client.read_exact(&mut buf).await.unwrap();
+                    assert!(!task.is_finished());
+                    for stats in [&inbound_stats, &outbound_stats] {
+                        assert_eq!((stats.uplink(), stats.downlink()), (4, 4));
+                    }
+                    drop(remote);
+                }
+                Protocol::Udp => {
+                    let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                    assert_eq!(n, 4);
+                    udp.send_to(b"pong", peer).await.unwrap();
+                    client.read_exact(&mut buf).await.unwrap();
+                    assert!(!task.is_finished());
+                    for stats in [&inbound_stats, &outbound_stats] {
+                        assert_eq!((stats.uplink(), stats.downlink()), (4, 4));
+                    }
+                }
+            }
+            drop(client);
+            task.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_counts_while_open() {
+        direct_flow(Protocol::Tcp).await;
+    }
+
+    #[tokio::test]
+    async fn direct_udp_counts_while_open() {
+        direct_flow(Protocol::Udp).await;
     }
 }

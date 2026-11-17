@@ -36,11 +36,47 @@ impl TrafficStats {
     }
 }
 
+/// Non-sensitive configuration labels and current payload counters.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrafficSnapshot {
+    pub direction: String,
+    pub tag: String,
+    pub proxy: String,
+    pub transport: String,
+    pub security: String,
+    pub supported: bool,
+    pub uplink: u64,
+    pub downlink: u64,
+}
+
+/// Both views of one business flow; never sum inbound and outbound totals.
+#[derive(Clone, Default)]
+pub struct TrafficCounters {
+    pub inbound: Option<Arc<TrafficStats>>,
+    pub outbound: Option<Arc<TrafficStats>>,
+}
+
+impl TrafficCounters {
+    pub fn record_uplink(&self, bytes: u64) {
+        for stats in self.inbound.iter().chain(self.outbound.iter()) {
+            stats.record_uplink(bytes);
+        }
+    }
+
+    pub fn record_downlink(&self, bytes: u64) {
+        for stats in self.inbound.iter().chain(self.outbound.iter()) {
+            stats.record_downlink(bytes);
+        }
+    }
+}
+
 /// Global traffic statistics manager
 #[derive(Debug, Default)]
 pub struct StatsCollector {
     // Per-outbound stats indexed by tag
     per_outbound: HashMap<String, Arc<TrafficStats>, RandomState>,
+    per_inbound: HashMap<String, Arc<TrafficStats>, RandomState>,
+    metadata: Vec<TrafficSnapshot>,
     // Global totals
     global: Arc<TrafficStats>,
 }
@@ -49,6 +85,8 @@ impl StatsCollector {
     pub fn new() -> Self {
         Self {
             per_outbound: HashMap::with_hasher(RandomState::new()),
+            per_inbound: HashMap::with_hasher(RandomState::new()),
+            metadata: Vec::new(),
             global: Arc::new(TrafficStats::new()),
         }
     }
@@ -60,6 +98,41 @@ impl StatsCollector {
             .entry(tag.clone())
             .or_insert_with(|| Arc::new(TrafficStats::new()))
             .clone()
+    }
+
+    pub fn register_metadata(&mut self, metadata: TrafficSnapshot) {
+        if metadata.direction == "inbound" {
+            self.per_inbound.entry(metadata.tag.clone()).or_default();
+        } else {
+            self.register_outbound(&metadata.tag);
+        }
+        self.metadata
+            .retain(|item| item.direction != metadata.direction || item.tag != metadata.tag);
+        self.metadata.push(metadata);
+    }
+
+    pub fn counters(&self, inbound: &str, outbound: &str) -> TrafficCounters {
+        TrafficCounters {
+            inbound: self.per_inbound.get(inbound).cloned(),
+            outbound: self.get_outbound_stats(outbound),
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<TrafficSnapshot> {
+        let mut snapshots = self.metadata.clone();
+        for item in &mut snapshots {
+            let counters = if item.direction == "inbound" {
+                &self.per_inbound
+            } else {
+                &self.per_outbound
+            };
+            if let Some(stats) = counters.get(&item.tag) {
+                item.uplink = stats.uplink();
+                item.downlink = stats.downlink();
+            }
+        }
+        snapshots.sort_by(|a, b| (&a.direction, &a.tag).cmp(&(&b.direction, &b.tag)));
+        snapshots
     }
 
     /// Get stats for a specific outbound tag
