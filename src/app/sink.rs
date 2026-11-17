@@ -199,13 +199,13 @@ impl DaemonSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{common::stats::TrafficStats, route::DnsSettings};
+    use crate::common::stats::TrafficStats;
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use tokio::time::{timeout, Duration};
 
     async fn direct_flow(protocol: Protocol) {
         timeout(Duration::from_secs(5), async {
-            let dns = Arc::new(DnsResolver::new(DnsSettings::default()).unwrap());
+            let dns = Arc::new(DnsResolver);
             let sink = DirectSink {
                 transport: transport::Transport::new(&transport::StreamSettings::default(), None, dns.clone()).unwrap(),
                 dns,

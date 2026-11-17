@@ -148,10 +148,12 @@ main
 ### 3.1 Step 1: initialize DNS
 
 ```text
-Config.dns
-  -> DnsSettings
-  -> DnsResolver::new(...)
+Arc::new(DnsResolver)
+  -> tokio::net::lookup_host(...)
+  -> system resolver
 ```
+
+The resolver is stateless, with no application DNS cache or custom DNS configuration. The OS manages system hosts/DNS services and their caches.
 
 In the main program, the DNS resolver mainly serves two places:
 

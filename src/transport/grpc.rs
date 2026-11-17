@@ -18,8 +18,8 @@ use std::{
 use log::{debug, error, warn};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::mpsc,
-    task::JoinHandle,
+    sync::{mpsc, Mutex},
+    time::Instant,
 };
 use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
@@ -146,8 +146,16 @@ pub struct Grpc {
     tls_server_name: Option<String>,
     balancer: Arc<super::balancer::GrpcBalancer>,
     dns: std::sync::Arc<crate::route::DnsResolver>,
-    dns_refresh_task: Option<JoinHandle<()>>,
-    initial_targets: tokio::sync::watch::Receiver<Option<IoResult<()>>>,
+    server: Option<Address>,
+    discovery: Box<Mutex<DiscoveryState>>,
+}
+
+#[derive(Default)]
+struct DiscoveryState {
+    initialized: bool,
+    refresh_at: Option<Instant>,
+    retry_at: Option<Instant>,
+    generation: u64,
 }
 
 impl Grpc {
@@ -198,9 +206,6 @@ impl Grpc {
 
         let balancer = Arc::new(super::balancer::GrpcBalancer::new(strategy));
 
-        let (initial_tx, initial_targets) = tokio::sync::watch::channel(None);
-        let dns_refresh_task = Self::spawn_dns_refresh_task(server.clone(), dns.clone(), balancer.clone(), initial_tx);
-
         Ok(Self {
             route_config,
             sockopt: sset.sockopt.clone(),
@@ -209,74 +214,93 @@ impl Grpc {
             tls_server_name,
             balancer,
             dns,
-            dns_refresh_task,
-            initial_targets,
+            server,
+            discovery: Box::default(),
         })
     }
 
-    fn spawn_dns_refresh_task(
-        server: Option<Address>,
-        dns: Arc<crate::route::DnsResolver>,
-        balancer: Arc<super::balancer::GrpcBalancer>,
-        initial_tx: tokio::sync::watch::Sender<Option<IoResult<()>>>,
-    ) -> Option<JoinHandle<()>> {
-        match server.clone() {
-            None => None,
-            Some(Address::Inet(addr)) => Some(tokio::spawn(async move {
-                balancer
-                    .sync_targets(vec![ConnectionTarget::Tcp(addr).to_balancer_key()])
-                    .await;
-                initial_tx.send_replace(Some(Ok(())));
-            })),
-            #[cfg(unix)]
-            Some(Address::Unix(path)) => Some(tokio::spawn(async move {
-                balancer
-                    .sync_targets(vec![ConnectionTarget::Unix(path).to_balancer_key()])
-                    .await;
-                initial_tx.send_replace(Some(Ok(())));
-            })),
-            #[cfg(not(unix))]
-            Some(Address::Unix(_)) => None,
-            Some(Address::Domain(domain, port)) => Some(tokio::spawn(async move {
-                let interval = Duration::from_secs(DEFAULT_DNS_REFRESH_INTERVAL_SECS);
-                // Track the last target set so we only touch the balancer when the
-                // resolved addresses actually change (avoids churning channels/TLS
-                // handshakes on every refresh tick).
-                let mut last_targets: Option<Vec<super::balancer::GrpcTargetKey>> = None;
-                loop {
-                    match dns.resolve(&domain).await {
-                        Ok(ips) => {
-                            let targets: Vec<_> = ips
-                                .into_iter()
-                                .map(|ip| ConnectionTarget::Tcp(std::net::SocketAddr::new(ip, port)).to_balancer_key())
-                                .collect();
+    /// Serialize discovery, not TCP/TLS dialing. A cancelled lookup leaves no
+    /// initializer task or permanently cached error behind.
+    async fn ensure_targets(&self) -> IoResult<u64> {
+        self.ensure_targets_with(|domain| self.dns.resolve(domain)).await
+    }
 
-                            if targets.is_empty() {
-                                warn!("DNS resolved {} but got no addresses", domain);
-                                if last_targets.is_none() {
-                                    initial_tx.send_replace(Some(Err(Error::new(
-                                        ErrorKind::NotFound,
-                                        format!("DNS resolved {domain} but got no addresses"),
-                                    ))));
-                                }
-                            } else {
-                                if last_targets.as_ref() != Some(&targets) {
-                                    balancer.sync_targets(targets.clone()).await;
-                                    last_targets = Some(targets);
-                                }
-                                initial_tx.send_replace(Some(Ok(())));
-                            }
-                        }
-                        Err(e) => {
-                            error!("DNS resolution failed for {}: {}", domain, e);
-                            if last_targets.is_none() {
-                                initial_tx.send_replace(Some(Err(e)));
-                            }
-                        }
-                    }
-                    tokio::time::sleep(interval).await;
+    async fn ensure_targets_with<'a, F, Fut>(&'a self, resolve: F) -> IoResult<u64>
+    where
+        F: FnOnce(&'a str) -> Fut,
+        Fut: std::future::Future<Output = IoResult<Vec<std::net::IpAddr>>>,
+    {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "gRPC client requires a server address"))?;
+        let mut state = self.discovery.lock().await;
+        let now = Instant::now();
+        if state.retry_at.is_some_and(|at| now < at) {
+            return if state.initialized {
+                Ok(state.generation)
+            } else {
+                Err(Error::new(ErrorKind::NotConnected, "gRPC DNS discovery is backing off"))
+            };
+        }
+        if state.initialized && state.refresh_at.is_none_or(|at| now < at) {
+            return Ok(state.generation);
+        }
+
+        let targets = match server {
+            Address::Inet(addr) => Ok(vec![ConnectionTarget::Tcp(*addr).to_balancer_key()]),
+            #[cfg(unix)]
+            Address::Unix(path) => Ok(vec![ConnectionTarget::Unix(path.clone()).to_balancer_key()]),
+            #[cfg(not(unix))]
+            Address::Unix(_) => return Err(Error::new(ErrorKind::Unsupported, super::UNIX_SOCKET_UNSUPPORTED)),
+            Address::Domain(domain, port) => {
+                match tokio::time::timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS), resolve(domain)).await {
+                    Ok(Ok(ips)) if !ips.is_empty() => Ok(ips
+                        .into_iter()
+                        .map(|ip| ConnectionTarget::Tcp(std::net::SocketAddr::new(ip, *port)).to_balancer_key())
+                        .collect()),
+                    Ok(Ok(_)) => Err(Error::new(
+                        ErrorKind::NotFound,
+                        format!("DNS resolved {domain} but got no addresses"),
+                    )),
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => Err(Error::new(
+                        ErrorKind::TimedOut,
+                        format!("gRPC DNS resolution timed out for {domain}"),
+                    )),
                 }
-            })),
+            }
+        };
+        match targets {
+            Ok(targets) => {
+                self.balancer.sync_targets(targets).await;
+                // Also throttle refreshes triggered by failed opens.
+                state.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                state.initialized = true;
+                state.generation = state.generation.wrapping_add(1);
+                state.refresh_at = matches!(server, Address::Domain(..))
+                    .then(|| Instant::now() + Duration::from_secs(DEFAULT_DNS_REFRESH_INTERVAL_SECS));
+                Ok(state.generation)
+            }
+            Err(err) => {
+                state.retry_at = Some(Instant::now() + Duration::from_secs(1));
+                warn!("gRPC DNS discovery failed for {:?}: {}", server, err);
+                if state.initialized {
+                    Ok(state.generation)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    async fn invalidate_targets(&self, generation: u64) {
+        if matches!(self.server, Some(Address::Domain(..))) {
+            let mut state = self.discovery.lock().await;
+            // A failure from an older dial must not expire a newer snapshot.
+            if state.generation == generation {
+                state.refresh_at = Some(Instant::now());
+            }
         }
     }
 
@@ -286,25 +310,20 @@ impl Grpc {
 
     /// Connect using balancer-managed targets/channel cache.
     pub async fn connect(&self, _dest: &Address, _proto: crate::common::Protocol) -> IoResult<super::TrStream> {
-        // Listener readiness does not imply that the background resolver has
-        // installed targets. Share its result across all first connections.
-        let mut initial = self.initial_targets.clone();
-        loop {
-            if let Some(result) = initial.borrow_and_update().as_ref() {
-                result.as_ref().map_err(|e| Error::new(e.kind(), e.to_string()))?;
-                break;
-            }
-            initial
-                .changed()
-                .await
-                .map_err(|_| Error::new(ErrorKind::NotConnected, "gRPC target initialization stopped"))?;
-        }
-        let (selected, mut stream) = self
+        let generation = self.ensure_targets().await?;
+        let (lease, mut stream) = match self
             .balancer
             .open_with_retry(|key| async move { self.open_stream_via_target_key(&key).await })
-            .await?;
+            .await
+        {
+            Ok(opened) => opened,
+            Err(err) => {
+                self.invalidate_targets(generation).await;
+                return Err(err);
+            }
+        };
 
-        stream.target_state = Some(selected.state.clone());
+        stream.target_lease = Some(lease);
         Ok(super::TrStream::Grpc(stream))
     }
 
@@ -494,6 +513,14 @@ impl Grpc {
     }
 
     async fn open_stream_via_target_key(&self, key: &super::balancer::GrpcTargetKey) -> IoResult<GrpcStream> {
+        let channel_lock = self
+            .balancer
+            .channel_lock(key)
+            .await
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "gRPC target disappeared before channel open"))?;
+        // Recheck the cache after waiting: another open may have built or
+        // replaced this target's channel. Different targets never share this lock.
+        let _guard = channel_lock.lock().await;
         // 尝试从缓存获取通道
         if let Some(channel) = self.balancer.cached_channel(key).await {
             match self.open_stream_on_channel(channel).await {
@@ -669,14 +696,6 @@ impl Grpc {
         };
 
         Ok(Box::pin(stream))
-    }
-}
-
-impl Drop for Grpc {
-    fn drop(&mut self) {
-        if let Some(task) = self.dns_refresh_task.take() {
-            task.abort();
-        }
     }
 }
 
@@ -959,7 +978,7 @@ fn make_service(_buf_byte_size: usize) -> (GrpcStream, mpsc::Sender<Bytes>, mpsc
         incoming_rx: Some(incoming_rx),
         outgoing_tx: Some(PollSender::new(outgoing_tx)),
         task: None,
-        target_state: None,
+        target_lease: None,
     };
 
     (stream_service, incoming_tx, outgoing_rx)
@@ -1067,7 +1086,7 @@ pub struct GrpcStream {
     incoming_rx: Option<mpsc::Receiver<Bytes>>,
     outgoing_tx: Option<PollSender<Bytes>>,
     task: Option<tokio::task::JoinHandle<()>>,
-    target_state: Option<Arc<super::balancer::TargetState>>,
+    target_lease: Option<super::balancer::TargetLease>,
 }
 
 impl Drop for GrpcStream {
@@ -1077,9 +1096,7 @@ impl Drop for GrpcStream {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        if let Some(state) = self.target_state.take() {
-            state.record_stream_closed();
-        }
+        self.target_lease.take();
     }
 }
 
@@ -1160,21 +1177,308 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn first_connect_waits_for_initial_targets() {
-        // On a single-thread runtime the spawned initializer cannot run until
-        // connect yields. Exercise the same race for static and DNS targets.
+    async fn concurrent_opens_for_same_target_share_one_tcp_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::task::JoinSet;
+
+        let settings = serde_json::from_value(serde_json::json!({
+            "network": "grpc", "grpcSettings": {"serviceName": "grpc"}
+        }))
+        .unwrap();
+        let dns = Arc::new(crate::route::DnsResolver);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Grpc::new(&settings, Some(Address::Inet(addr)), dns).unwrap();
+        client.ensure_targets().await.unwrap();
+        let key = ConnectionTarget::Tcp(addr).to_balancer_key();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepted = accepts.clone();
+        let route = Arc::new(client.route_config.clone());
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                let (socket, peer) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::Relaxed);
+                connections.spawn(handle_connection(
+                    socket,
+                    Address::Inet(peer),
+                    route.clone(),
+                    stream_tx.clone(),
+                    route.buf_byte_size,
+                    None,
+                ));
+            }
+        });
+        // Poll every open before yielding to the listener: all see the cold cache.
+        let streams = tokio::time::timeout(
+            Duration::from_secs(3),
+            futures::future::join_all((0..8).map(|_| client.open_stream_via_target_key(&key))),
+        )
+        .await
+        .unwrap();
+        let streams: Vec<_> = streams.into_iter().map(Result::unwrap).collect();
+        let mut incoming = Vec::new();
+        for _ in &streams {
+            incoming.push(
+                tokio::time::timeout(Duration::from_secs(3), stream_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        tasks.shutdown().await;
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_failure_does_not_poison_later_connections() {
+        let settings = serde_json::from_value(serde_json::json!({
+            "network": "grpc", "grpcSettings": {"serviceName": "grpc"}
+        }))
+        .unwrap();
+        let dns = Arc::new(crate::route::DnsResolver);
+        let server = Grpc::new(&settings, None, dns.clone()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let mut incoming = server.listen(&Address::Inet(addr)).await.unwrap();
+        let accept = tokio::spawn(async move { incoming.next().await.unwrap().unwrap() });
+        let client = Grpc::new(&settings, Some(Address::Domain("recovery.test".into(), addr.port())), dns).unwrap();
+        let dest = Address::Inet(addr);
+        assert_eq!(
+            client
+                .ensure_targets_with(|_| async { Err(Error::new(ErrorKind::NotFound, "lookup failed")) })
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            client
+                .ensure_targets_with(|_| async { panic!("lookup during backoff") })
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotConnected
+        );
+        client.discovery.lock().await.retry_at = None;
+        assert_eq!(
+            client
+                .ensure_targets_with(|_| async { Ok(vec![addr.ip()]) })
+                .await
+                .unwrap(),
+            1
+        );
+        let result = tokio::time::timeout(Duration::from_secs(15), client.connect(&dest, crate::common::Protocol::Tcp))
+            .await
+            .unwrap();
+        if result.is_err() {
+            accept.abort();
+        }
+        assert!(result.is_ok(), "DNS recovery failed: {:?}", result.err());
+        let mut stream = result.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"recovered")
+            .await
+            .unwrap();
+        let (mut accepted, _) = tokio::time::timeout(Duration::from_secs(3), accept)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut payload = [0; 9];
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::io::AsyncReadExt::read_exact(&mut accepted, &mut payload),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&payload, b"recovered");
+    }
+
+    #[tokio::test]
+    async fn discovery_reuses_channels_and_guards_snapshot_invalidation() {
+        use super::super::balancer::GrpcTargetKey;
+        let settings = serde_json::from_value(serde_json::json!({
+            "network": "grpc", "grpcSettings": {"serviceName": "grpc", "loadBalancer": "round_robin"}
+        }))
+        .unwrap();
+        let client = Grpc::new(
+            &settings,
+            Some(Address::Domain("refresh.test".into(), 443)),
+            Arc::new(crate::route::DnsResolver),
+        )
+        .unwrap();
+        let resolve = |_| async {
+            tokio::task::yield_now().await;
+            Ok(vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()])
+        };
+        assert!(client.balancer.select_target(&[]).await.is_none());
+        let (a, b) = tokio::join!(
+            client.ensure_targets_with(resolve),
+            client.ensure_targets_with(|_| async { panic!("concurrent lookup was not coalesced") })
+        );
+        assert_eq!(a.unwrap(), 1);
+        assert_eq!(b.unwrap(), 1);
+        let first = client.balancer.select_target(&[]).await.unwrap();
+        let second = client.balancer.select_target(&[]).await.unwrap();
+        assert_ne!(first.key, second.key);
+        let retained = client
+            .balancer
+            .select_target(&[GrpcTargetKey::Tcp("127.0.0.1:443".parse().unwrap())])
+            .await
+            .unwrap();
+        let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.2:443");
+        client
+            .balancer
+            .cache_channel(&retained.key, endpoint.connect_lazy())
+            .await
+            .unwrap();
+        let refreshed = |_| async {
+            Ok(vec![
+                "127.0.0.2".parse().unwrap(),
+                "127.0.0.3".parse().unwrap(),
+                "127.0.0.3".parse().unwrap(),
+            ])
+        };
+        assert_eq!(client.ensure_targets().await.unwrap(), 1);
+        client.invalidate_targets(1).await;
+        assert_eq!(client.ensure_targets().await.unwrap(), 1); // Lookup backoff wins.
+        client.discovery.lock().await.retry_at = None;
+        assert_eq!(client.ensure_targets_with(refreshed).await.unwrap(), 2);
+        let added = GrpcTargetKey::Tcp("127.0.0.3:443".parse().unwrap());
+        let selected = client
+            .balancer
+            .select_target(std::slice::from_ref(&added))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected.state, &retained.state));
+        assert!(client.balancer.cached_channel(&retained.key).await.is_some());
+        assert!(client
+            .balancer
+            .select_target(&[retained.key.clone(), added])
+            .await
+            .is_none());
+        client.invalidate_targets(1).await; // Delayed failure from an older dial.
+        assert!(client.discovery.lock().await.refresh_at.unwrap() > Instant::now());
+        {
+            let mut state = client.discovery.lock().await;
+            state.refresh_at = Some(Instant::now() - Duration::from_secs(1));
+            state.retry_at = None;
+        }
+        assert_eq!(client.ensure_targets_with(refreshed).await.unwrap(), 3); // Expired successful snapshot.
+
+        // Failed refresh must preserve old targets.
+        {
+            let mut state = client.discovery.lock().await;
+            state.refresh_at = Some(Instant::now());
+            state.retry_at = None;
+        }
+        assert_eq!(
+            client
+                .ensure_targets_with(|_| async { Err(Error::new(ErrorKind::NotFound, "lookup failed")) })
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(client.balancer.cached_channel(&retained.key).await.is_some());
+        assert!(client.discovery.lock().await.retry_at.unwrap() > Instant::now());
+    }
+
+    #[tokio::test]
+    async fn failed_open_expires_domain_snapshot() {
+        let settings = serde_json::from_value(serde_json::json!({
+            "network": "grpc", "grpcSettings": {"serviceName": "grpc"}
+        }))
+        .unwrap();
+        let dns = Arc::new(crate::route::DnsResolver);
+        // Reserve a port without listening, guaranteeing connection refusal.
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into())
+            .unwrap();
+        let addr = socket.local_addr().unwrap().as_socket().unwrap();
+        let client = Grpc::new(&settings, Some(Address::Domain("refused.test".into(), addr.port())), dns).unwrap();
+        client
+            .ensure_targets_with(|_| async { Ok(vec![addr.ip()]) })
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(3),
+            client.connect(&Address::Inet(addr), crate::common::Protocol::Tcp)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(client.discovery.lock().await.refresh_at.unwrap() <= Instant::now());
+        assert_eq!(client.ensure_targets().await.unwrap(), 1); // Still throttled.
+        client.discovery.lock().await.retry_at = None;
+        assert_eq!(
+            client
+                .ensure_targets_with(|_| async { Ok(vec![addr.ip()]) })
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_discovery_can_be_retried_without_background_dns() {
+        use std::future::Future;
+        let settings = serde_json::from_value(serde_json::json!({
+            "network": "grpc", "grpcSettings": {"serviceName": "grpc"}
+        }))
+        .unwrap();
+        let client = Grpc::new(
+            &settings,
+            Some(Address::Domain("cancel.test".into(), 443)),
+            Arc::new(crate::route::DnsResolver),
+        )
+        .unwrap();
+        let started = std::cell::Cell::new(false);
+        let mut lookup = Box::pin(client.ensure_targets_with(|_| {
+            started.set(true);
+            std::future::pending()
+        }));
+        assert!(!started.get());
+        assert!(std::future::poll_fn(|cx| Poll::Ready(lookup.as_mut().poll(cx).is_pending())).await);
+        assert!(started.get());
+        drop(lookup);
+        assert!(!client.discovery.lock().await.initialized);
+        assert_eq!(
+            client
+                .ensure_targets_with(|_| async { Ok(vec!["127.0.0.1".parse().unwrap()]) })
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_only_client_fails_without_waiting_for_discovery() {
+        let settings = serde_json::from_value(serde_json::json!({
+            "network": "grpc", "grpcSettings": {"serviceName": "grpc"}
+        }))
+        .unwrap();
+        let dns = Arc::new(crate::route::DnsResolver);
+        let client = Grpc::new(&settings, None, dns).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), client.ensure_targets())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn first_connect_discovers_targets_on_demand() {
+        // Both static and DNS targets work without a background initializer.
         for domain in [false, true] {
             let settings: super::super::StreamSettings = serde_json::from_value(serde_json::json!({
                 "network": "grpc", "grpcSettings": {"serviceName": "grpc"}
             }))
             .unwrap();
-            let dns = Arc::new(
-                crate::route::DnsResolver::new(crate::route::DnsSettings {
-                    hosts: vec!["startup.test:127.0.0.1".into()],
-                    ..Default::default()
-                })
-                .unwrap(),
-            );
+            let dns = Arc::new(crate::route::DnsResolver);
             let server = Grpc::new(&settings, None, dns.clone()).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1185,7 +1489,7 @@ mod tests {
                 incoming.next().await.unwrap().unwrap()
             });
             let target = if domain {
-                Address::Domain("startup.test".into(), addr.port())
+                Address::Domain("localhost".into(), addr.port())
             } else {
                 Address::Inet(addr)
             };
@@ -1254,7 +1558,7 @@ mod tests {
             "grpcSettings": {"serviceName": "grpc", "http2InitialWindowSize": 2_097_152}
         }))
         .unwrap();
-        let dns = Arc::new(crate::route::DnsResolver::new(crate::route::DnsSettings::default()).unwrap());
+        let dns = Arc::new(crate::route::DnsResolver);
         let client = Grpc::new(&settings, None, dns).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1300,7 +1604,7 @@ mod tests {
                 "grpcSettings": {"serviceName": "grpc", "http2InitialWindowSize": window}
             }))
             .unwrap();
-            let dns = Arc::new(crate::route::DnsResolver::new(crate::route::DnsSettings::default()).unwrap());
+            let dns = Arc::new(crate::route::DnsResolver);
             let server = Grpc::new(&settings, None, dns.clone()).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

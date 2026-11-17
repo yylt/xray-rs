@@ -81,15 +81,9 @@ routing:
   fallback:
     tags:
       - direct
-
-dns:
-  disableCache: false
-  hosts:
-    - localhost:127.0.0.1
-  servers:
-    - 1.1.1.1:53
-    - tcp://8.8.8.8:53
 ```
+
+DNS uses only the system resolver, with no application DNS cache or `dns` configuration. Remove the legacy field. System DNS/hosts and caching are managed by the OS.
 
 ### log config
 
