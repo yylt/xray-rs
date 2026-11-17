@@ -43,8 +43,6 @@ func testGRPCTLSTrojan() error {
 	}
 	log.Println("[grpc-tls] Client ready on ports 13001, 13002")
 
-	time.Sleep(2 * time.Second)
-
 	log.Println("[grpc-tls] --- HTTP proxy (port 13001) ---")
 	if err := testHTTPProxy(13001); err != nil {
 		return fmt.Errorf("[grpc-tls] HTTP failed: %w", err)

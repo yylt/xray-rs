@@ -7,7 +7,6 @@ on:
       - "*.md"
       - "docs/**"
   pull_request:
-    branches: ["main"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -27,13 +26,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Checkout Xray-Core v26.10.21
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
+          path: .xray-core
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: "tests/e2e/go.mod"
+          go-version-file: ".xray-core/go.mod"
+          cache-dependency-path: ".xray-core/go.sum"
 
-      - name: Build xray-rs
-        run: cargo build
+      - name: Build Xray-Core
+        working-directory: .xray-core
+        run: go build -o xray ./main
 
-      - name: Run xray-rs E2E tests
-        run: ./tests/e2e/run_xray_tests.sh
+      - name: Run native and bidirectional compatibility E2E tests
+        run: make e2e-compat XRAY_CORE_BIN="$GITHUB_WORKSPACE/.xray-core/xray"

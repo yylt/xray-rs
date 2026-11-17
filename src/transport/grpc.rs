@@ -147,6 +147,7 @@ pub struct Grpc {
     balancer: Arc<super::balancer::GrpcBalancer>,
     dns: std::sync::Arc<crate::route::DnsResolver>,
     dns_refresh_task: Option<JoinHandle<()>>,
+    initial_targets: tokio::sync::watch::Receiver<Option<IoResult<()>>>,
 }
 
 impl Grpc {
@@ -197,7 +198,8 @@ impl Grpc {
 
         let balancer = Arc::new(super::balancer::GrpcBalancer::new(strategy));
 
-        let dns_refresh_task = Self::spawn_dns_refresh_task(server.clone(), dns.clone(), balancer.clone());
+        let (initial_tx, initial_targets) = tokio::sync::watch::channel(None);
+        let dns_refresh_task = Self::spawn_dns_refresh_task(server.clone(), dns.clone(), balancer.clone(), initial_tx);
 
         Ok(Self {
             route_config,
@@ -208,6 +210,7 @@ impl Grpc {
             balancer,
             dns,
             dns_refresh_task,
+            initial_targets,
         })
     }
 
@@ -215,6 +218,7 @@ impl Grpc {
         server: Option<Address>,
         dns: Arc<crate::route::DnsResolver>,
         balancer: Arc<super::balancer::GrpcBalancer>,
+        initial_tx: tokio::sync::watch::Sender<Option<IoResult<()>>>,
     ) -> Option<JoinHandle<()>> {
         match server.clone() {
             None => None,
@@ -222,12 +226,14 @@ impl Grpc {
                 balancer
                     .sync_targets(vec![ConnectionTarget::Tcp(addr).to_balancer_key()])
                     .await;
+                initial_tx.send_replace(Some(Ok(())));
             })),
             #[cfg(unix)]
             Some(Address::Unix(path)) => Some(tokio::spawn(async move {
                 balancer
                     .sync_targets(vec![ConnectionTarget::Unix(path).to_balancer_key()])
                     .await;
+                initial_tx.send_replace(Some(Ok(())));
             })),
             #[cfg(not(unix))]
             Some(Address::Unix(_)) => None,
@@ -247,15 +253,25 @@ impl Grpc {
 
                             if targets.is_empty() {
                                 warn!("DNS resolved {} but got no addresses", domain);
-                                continue;
-                            }
-                            if last_targets.as_ref() != Some(&targets) {
-                                balancer.sync_targets(targets.clone()).await;
-                                last_targets = Some(targets);
+                                if last_targets.is_none() {
+                                    initial_tx.send_replace(Some(Err(Error::new(
+                                        ErrorKind::NotFound,
+                                        format!("DNS resolved {domain} but got no addresses"),
+                                    ))));
+                                }
+                            } else {
+                                if last_targets.as_ref() != Some(&targets) {
+                                    balancer.sync_targets(targets.clone()).await;
+                                    last_targets = Some(targets);
+                                }
+                                initial_tx.send_replace(Some(Ok(())));
                             }
                         }
                         Err(e) => {
                             error!("DNS resolution failed for {}: {}", domain, e);
+                            if last_targets.is_none() {
+                                initial_tx.send_replace(Some(Err(e)));
+                            }
                         }
                     }
                     tokio::time::sleep(interval).await;
@@ -270,6 +286,19 @@ impl Grpc {
 
     /// Connect using balancer-managed targets/channel cache.
     pub async fn connect(&self, _dest: &Address, _proto: crate::common::Protocol) -> IoResult<super::TrStream> {
+        // Listener readiness does not imply that the background resolver has
+        // installed targets. Share its result across all first connections.
+        let mut initial = self.initial_targets.clone();
+        loop {
+            if let Some(result) = initial.borrow_and_update().as_ref() {
+                result.as_ref().map_err(|e| Error::new(e.kind(), e.to_string()))?;
+                break;
+            }
+            initial
+                .changed()
+                .await
+                .map_err(|_| Error::new(ErrorKind::NotConnected, "gRPC target initialization stopped"))?;
+        }
         let (selected, mut stream) = self
             .balancer
             .open_with_retry(|key| async move { self.open_stream_via_target_key(&key).await })
@@ -1125,6 +1154,55 @@ impl AsyncWrite for GrpcStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_connect_waits_for_initial_targets() {
+        // On a single-thread runtime the spawned initializer cannot run until
+        // connect yields. Exercise the same race for static and DNS targets.
+        for domain in [false, true] {
+            let settings: super::super::StreamSettings = serde_json::from_value(serde_json::json!({
+                "network": "grpc", "grpcSettings": {"serviceName": "grpc"}
+            }))
+            .unwrap();
+            let dns = Arc::new(
+                crate::route::DnsResolver::new(crate::route::DnsSettings {
+                    hosts: vec!["startup.test:127.0.0.1".into()],
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            let server = Grpc::new(&settings, None, dns.clone()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let mut incoming = server.listen(&Address::Inet(addr)).await.unwrap();
+            let accept = tokio::spawn(async move {
+                use tokio_stream::StreamExt;
+                incoming.next().await.unwrap().unwrap()
+            });
+            let target = if domain {
+                Address::Domain("startup.test".into(), addr.port())
+            } else {
+                Address::Inet(addr)
+            };
+            let client = Grpc::new(&settings, Some(target), dns).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.connect(&Address::Inet(addr), crate::common::Protocol::Tcp),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_ok(), "first connect failed (domain={domain}): {:?}", result.err());
+            let mut stream = result.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"startup")
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), accept)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     fn route_config_with_authority(authority: Option<&str>) -> RouteConfig {
         RouteConfig {
