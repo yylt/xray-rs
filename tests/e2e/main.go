@@ -20,12 +20,14 @@ var (
 	projectRoot string
 	binaryPath  string
 	verbose     bool
+	coreBinary  string
 )
 
 // errSkip is a sentinel error that signals a test was skipped.
 var errSkip = errors.New("SKIP")
 
 func init() {
+	flag.StringVar(&coreBinary, "core", "", "Xray-Core binary for bidirectional compatibility tests")
 	flag.BoolVar(&verbose, "v", false, "verbose output")
 	flag.Parse()
 
@@ -55,6 +57,27 @@ func main() {
 
 	runTest(results, "WebSocket+TLS+Trojan", testWSTLSTrojan)
 	runTest(results, "gRPC+TLS+Trojan", testGRPCTLSTrojan)
+	if coreBinary != "" {
+		resolved, err := exec.LookPath(coreBinary)
+		if err != nil {
+			log.Fatalf("[main] Xray-Core binary: %v", err)
+		}
+		coreBinary, err = filepath.Abs(resolved)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, network := range []string{"ws", "grpc"} {
+			for _, coreServer := range []bool{false, true} {
+				direction := "Core client -> Rust server"
+				if coreServer {
+					direction = "Rust client -> Core server"
+				}
+				runTest(results, network+"+TLS+Trojan: "+direction, func() error {
+					return testCoreCompatibility(network, coreServer)
+				})
+			}
+		}
+	}
 
 	results.PrintSummary()
 
@@ -108,10 +131,14 @@ type Process struct {
 }
 
 func startServer(ctx context.Context, configPath string) (*Process, error) {
+	return startBinary(ctx, binaryPath, configPath)
+}
+
+func startBinary(ctx context.Context, binary, configPath string) (*Process, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	log.Printf("[proc] Starting xray-rs with config: %s", configPath)
-	cmd := exec.CommandContext(ctx, binaryPath, "run", "--config", configPath)
+	log.Printf("[proc] Starting %s with config: %s", binary, configPath)
+	cmd := exec.CommandContext(ctx, binary, "run", "--config", configPath)
 	cmd.Dir = projectRoot
 	if verbose {
 		cmd.Stdout = os.Stdout
@@ -134,7 +161,8 @@ func (p *Process) Stop() error {
 	}
 	if p.cmd != nil && p.cmd.Process != nil {
 		log.Printf("[proc] Stopping PID=%d", p.cmd.Process.Pid)
-		return p.cmd.Process.Kill()
+		_ = p.cmd.Process.Kill()
+		return p.cmd.Wait()
 	}
 	return nil
 }
@@ -156,32 +184,65 @@ func waitForPort(port int, timeout time.Duration) error {
 }
 
 func testHTTPProxy(port int) error {
-	log.Printf("[http-proxy] Testing HTTP proxy on port %d...", port)
+	for _, tc := range []struct {
+		mode string
+		url  string
+	}{
+		{"GET", "http://baidu.com"},
+		{"CONNECT", "https://www.baidu.com"},
+	} {
+		if err := testHTTPProxyRequest(port, tc.mode, tc.url); err != nil {
+			return fmt.Errorf("[http-proxy %s] %w", tc.mode, err)
+		}
+	}
+	return nil
+}
+
+func testHTTPProxyRequest(port int, mode, targetURL string) error {
+	log.Printf("[http-proxy %s] Testing HTTP proxy on port %d...", mode, port)
 
 	proxyURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
 	if err != nil {
 		return fmt.Errorf("[http-proxy] invalid proxy URL: %w", err)
 	}
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
+	connectOK := false
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		OnProxyConnectResponse: func(_ context.Context, _ *url.URL, _ *http.Request, resp *http.Response) error {
+			log.Printf("[http-proxy CONNECT] Tunnel response: status=%d", resp.StatusCode)
+			connectOK = resp.StatusCode == http.StatusOK
+			return nil
 		},
-		Timeout: 15 * time.Second,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+		// Keep plain HTTP GET independent of HTTPS redirects (which use CONNECT).
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
-	log.Printf("[http-proxy] Requesting http://baidu.com via proxy %s", proxyURL)
+	log.Printf("[http-proxy %s] Requesting %s via proxy %s", mode, targetURL, proxyURL)
 	start := time.Now()
-	resp, err := client.Get("http://baidu.com")
+	resp, err := client.Get(targetURL)
 	elapsed := time.Since(start)
 	if err != nil {
 		return fmt.Errorf("[http-proxy] request failed after %.2fs: %w", elapsed.Seconds(), err)
 	}
 	defer resp.Body.Close()
 
-	log.Printf("[http-proxy] Response: status=%d (%.2fs)", resp.StatusCode, elapsed.Seconds())
+	log.Printf("[http-proxy %s] Response: status=%d (%.2fs)", mode, resp.StatusCode, elapsed.Seconds())
 
-	if resp.StatusCode != http.StatusOK {
+	if mode == "CONNECT" && !connectOK {
+		return fmt.Errorf("CONNECT tunnel was not established")
+	}
+	// baidu.com redirects plain HTTP to HTTPS; do not follow it in the GET case.
+	redirect := resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound ||
+		resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusPermanentRedirect
+	if resp.StatusCode != http.StatusOK && !(mode == "GET" && redirect && resp.Header.Get("Location") != "") {
 		return fmt.Errorf("[http-proxy] unexpected status code: %d", resp.StatusCode)
 	}
 
@@ -189,8 +250,11 @@ func testHTTPProxy(port int) error {
 	if err != nil {
 		return fmt.Errorf("[http-proxy] read body failed: %w", err)
 	}
-	log.Printf("[http-proxy] Body preview (%d bytes): %.100s", len(body), string(body))
-	log.Printf("[http-proxy] PASS")
+	if len(body) == 0 {
+		return fmt.Errorf("[http-proxy] empty response body")
+	}
+	log.Printf("[http-proxy %s] Body preview (%d bytes): %.100s", mode, len(body), string(body))
+	log.Printf("[http-proxy %s] PASS", mode)
 	return nil
 }
 

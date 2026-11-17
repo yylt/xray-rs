@@ -233,11 +233,7 @@ fn is_http_request(data: &[u8]) -> bool {
     }
 
     // Also check for HTTP/2 connection preface
-    if data.starts_with(b"PRI * HTTP/2") {
-        return true;
-    }
-
-    false
+    data.starts_with(b"PRI * HTTP/2")
 }
 
 /// Extract Host header from HTTP request

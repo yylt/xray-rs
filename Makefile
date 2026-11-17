@@ -5,7 +5,9 @@ CARGO_BIN_DIR := $(HOME)/.cargo/bin
 PROTOC_GEN_PROST := $(CARGO_BIN_DIR)/protoc-gen-prost
 PROTOC_GEN_TONIC := $(CARGO_BIN_DIR)/protoc-gen-tonic
 
-.PHONY: tools generate build build-xray fmt test check clippy ci clean-generated
+XRAY_CORE_BIN ?= $(abspath ../Xray-Core/xray)
+
+.PHONY: tools generate build build-xray fmt test e2e e2e-compat check clippy ci clean-generated
 
 tools:
 	cargo install protoc-gen-prost --locked
@@ -36,6 +38,12 @@ fmt:
 
 test:
 	cargo test
+
+e2e: build-xray
+	./tests/e2e/run_xray_tests.sh
+
+e2e-compat: build-xray
+	./tests/e2e/run_xray_tests.sh -core "$(XRAY_CORE_BIN)"
 
 check:
 	cargo build --workspace
