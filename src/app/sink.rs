@@ -70,6 +70,8 @@ impl ConnectionSink {
 pub struct DirectSink {
     pub dns: Arc<DnsResolver>,
     pub transport: transport::Transport,
+    #[cfg(target_os = "linux")]
+    pub bpf: Option<Arc<crate::common::bpf::BpfRelay>>,
 }
 
 impl DirectSink {
@@ -83,6 +85,48 @@ impl DirectSink {
         match stream.metadata.protocol {
             Protocol::Tcp => {
                 let remote = self.transport.connect(&dst, Protocol::Tcp, None).await?;
+                #[cfg(target_os = "linux")]
+                if let Some(bpf) = &self.bpf {
+                    if stream.metadata.bpf_eligible && stream.inner.is_plain_tcp() && remote.is_plain_tcp() {
+                        let (mut local, prefix) = stream
+                            .inner
+                            .into_tcp_with_prefix()
+                            .ok_or_else(|| std::io::Error::other("BPF inbound lost its TCP transport"))?;
+                        let (mut remote, remote_prefix) = remote
+                            .into_tcp_with_prefix()
+                            .ok_or_else(|| std::io::Error::other("BPF outbound lost its TCP transport"))?;
+                        // Complete preread writes before either receive hook can redirect new bytes.
+                        CountingStream {
+                            inner: &mut remote,
+                            counters: counters.clone(),
+                            uplink: true,
+                        }
+                        .write_all(&prefix)
+                        .await?;
+                        CountingStream {
+                            inner: &mut local,
+                            counters: counters.clone(),
+                            uplink: false,
+                        }
+                        .write_all(&remote_prefix)
+                        .await?;
+                        return match bpf
+                            .clone()
+                            .forward_with_counters(local, remote, counters.clone())
+                            .await?
+                        {
+                            crate::common::bpf::Outcome::Kernel => Ok(()),
+                            crate::common::bpf::Outcome::Userspace(local, remote) => {
+                                log::debug!("BPF fallback to userspace forwarding for TCP to {dst}");
+                                forwarder
+                                    .forward_with_counters(TrStream::Tcp(local), TrStream::Tcp(remote), counters)
+                                    .await?;
+                                Ok(())
+                            }
+                        };
+                    }
+                    log::debug!("BPF skipped: connection is not HTTP/SOCKS over plain TCP");
+                }
                 forwarder.forward_with_counters(stream.inner, remote, counters).await?;
                 Ok(())
             }
@@ -209,6 +253,8 @@ mod tests {
             let sink = DirectSink {
                 transport: transport::Transport::new(&transport::StreamSettings::default(), None, dns.clone()).unwrap(),
                 dns,
+                #[cfg(target_os = "linux")]
+                bpf: None,
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -272,5 +318,142 @@ mod tests {
     #[tokio::test]
     async fn direct_udp_counts_while_open() {
         direct_flow(Protocol::Udp).await;
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod bpf_tests {
+    use super::*;
+    use crate::common::bpf::BpfRelay;
+    use crate::{
+        common::Protocol,
+        proxy::{FreedomSettings, OutboundSettings as ProxyOutboundSettings},
+        transport::BufferedStream,
+    };
+    use aya::maps::SockHash;
+    use bytes::Bytes;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{sleep, timeout, Duration};
+
+    /// Preread prefix an HTTP inbound would have buffered before routing.
+    const PREFIX: &[u8] = b"GET / HTTP/1.1\r\nHost: target\r\n\r\n";
+
+    fn freedom(bpf: bool) -> crate::app::OutboundSettings {
+        crate::app::OutboundSettings {
+            tag: None,
+            settings: Some(ProxyOutboundSettings::Freedom(FreedomSettings { bpf })),
+            stream_settings: None,
+        }
+    }
+
+    fn dns() -> Arc<DnsResolver> {
+        Arc::new(DnsResolver)
+    }
+
+    fn inbound_stream(inbound: TcpStream, peer: std::net::SocketAddr, target: std::net::SocketAddr) -> ProxyStream {
+        let inner = TrStream::Buffered(Box::new(BufferedStream::new(
+            TrStream::Tcp(inbound),
+            Bytes::from_static(PREFIX),
+        )));
+        ProxyStream::new(Protocol::Tcp, Address::Inet(peer), Address::Inet(target), inner).with_bpf_eligibility(true)
+    }
+
+    /// Wait until both sockets are armed, otherwise the relay silently used
+    /// userspace forwarding and the test would prove nothing about the kernel path.
+    async fn wait_armed(relay: &BpfRelay) {
+        for _ in 0..500 {
+            let armed = {
+                let ebpf = relay.ebpf.lock().unwrap();
+                SockHash::<_, u64>::try_from(ebpf.map("sockets").unwrap())
+                    .unwrap()
+                    .keys()
+                    .count()
+            };
+            if armed == 2 {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("BPF relay never armed");
+    }
+
+    /// Run one buffered HTTP request through the sink and assert the prefix is
+    /// delivered exactly once, in order, before any later payload.
+    async fn relay_buffered_request(sink: ConnectionSink) {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(inbound_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (inbound, peer) = inbound_listener.accept().await.unwrap();
+        let bpf = match &sink {
+            ConnectionSink::Direct(direct) => direct.bpf.clone(),
+            _ => None,
+        };
+        let stream = inbound_stream(inbound, peer, target_addr);
+        let inbound_stats = Arc::new(crate::common::stats::TrafficStats::new());
+        let outbound_stats = Arc::new(crate::common::stats::TrafficStats::new());
+        let counters = TrafficCounters {
+            inbound: Some(inbound_stats.clone()),
+            outbound: Some(outbound_stats.clone()),
+        };
+        let relay = tokio::spawn(async move {
+            let forwarder = StreamForwarder::new();
+            sink.handle_with_counters(stream, &forwarder, counters).await
+        });
+        let (mut target, _) = target_listener.accept().await.unwrap();
+        if let Some(bpf) = &bpf {
+            wait_armed(bpf).await;
+        }
+
+        let mut head = vec![0; PREFIX.len()];
+        target.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, PREFIX);
+        client.write_all(b"body").await.unwrap();
+        let mut body = [0; 4];
+        target.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"body");
+
+        // Half-close must not truncate the reverse direction.
+        client.shutdown().await.unwrap();
+        let mut tail = Vec::new();
+        target.read_to_end(&mut tail).await.unwrap();
+        assert!(tail.is_empty());
+        target.write_all(b"reply").await.unwrap();
+        target.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        relay.await.unwrap().unwrap();
+        for stats in [&inbound_stats, &outbound_stats] {
+            assert_eq!(stats.uplink(), (PREFIX.len() + 4) as u64);
+            assert_eq!(stats.downlink(), 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn freedom_without_bpf_keeps_userspace_forwarding() {
+        let sink = freedom(false).build_sink(dns()).unwrap();
+        let ConnectionSink::Direct(direct) = &sink else {
+            panic!("freedom must build a direct sink");
+        };
+        assert!(direct.bpf.is_none(), "BPF must stay uninitialized by default");
+        timeout(Duration::from_secs(15), relay_buffered_request(sink))
+            .await
+            .expect("userspace relay timed out");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root/CAP_BPF, kernel SK_SKB support and clang"]
+    async fn freedom_bpf_relays_buffered_request_once() {
+        let sink = freedom(true).build_sink(dns()).unwrap();
+        let ConnectionSink::Direct(direct) = &sink else {
+            panic!("freedom must build a direct sink");
+        };
+        assert!(direct.bpf.is_some(), "bpf: true must load the relay at startup");
+        timeout(Duration::from_secs(15), relay_buffered_request(sink))
+            .await
+            .expect("BPF relay timed out");
     }
 }

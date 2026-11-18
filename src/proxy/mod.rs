@@ -45,7 +45,7 @@ pub enum InboundSettings {
 }
 
 #[derive(Deserialize)]
-struct RawInboundSettings {
+struct RawProxySettings {
     protocol: String,
     settings: Option<serde_json::Value>,
 }
@@ -64,7 +64,7 @@ impl<'de> Deserialize<'de> for InboundSettings {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = RawInboundSettings::deserialize(deserializer)?;
+        let raw = RawProxySettings::deserialize(deserializer)?;
 
         match raw.protocol.as_str() {
             "api" => match raw.settings {
@@ -98,14 +98,20 @@ impl<'de> Deserialize<'de> for InboundSettings {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct FreedomSettings {
+    #[serde(default)]
+    pub bpf: bool,
+}
+
+#[derive(Serialize, Debug)]
 #[serde(tag = "protocol", content = "settings")]
 pub enum OutboundSettings {
     #[serde(rename = "blackhole")]
     Black,
 
     #[serde(rename = "freedom")]
-    Freedom,
+    Freedom(FreedomSettings),
 
     #[serde(rename = "socks")]
     Socks(socks::OutSetting),
@@ -120,11 +126,44 @@ pub enum OutboundSettings {
     Reverse(reverse::OutSetting),
 }
 
+impl<'de> Deserialize<'de> for OutboundSettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawProxySettings::deserialize(deserializer)?;
+
+        match raw.protocol.as_str() {
+            "blackhole" => {
+                if let Some(value) = raw.settings {
+                    serde_json::from_value::<()>(value).map_err(D::Error::custom)?;
+                }
+                Ok(OutboundSettings::Black)
+            }
+            "freedom" => match raw.settings {
+                Some(value) => serde_json::from_value(value)
+                    .map(OutboundSettings::Freedom)
+                    .map_err(D::Error::custom),
+                None => Ok(OutboundSettings::Freedom(FreedomSettings::default())),
+            },
+            "socks" => deserialize_settings(raw.settings).map(OutboundSettings::Socks),
+            "trojan" => deserialize_settings(raw.settings).map(OutboundSettings::Trojan),
+            "vless" => deserialize_settings(raw.settings).map(OutboundSettings::Vless),
+            "reverse" => deserialize_settings(raw.settings).map(OutboundSettings::Reverse),
+            other => Err(D::Error::unknown_variant(
+                other,
+                &["blackhole", "freedom", "socks", "trojan", "vless", "reverse"],
+            )),
+        }
+    }
+}
+
 pub struct StreamMetadata {
     pub src: Address,
     pub dst: Address,
     pub protocol: Protocol,
     pub inbound_tag: String,
+    pub bpf_eligible: bool,
 }
 
 pub struct ProxyStream {
@@ -140,9 +179,15 @@ impl ProxyStream {
                 dst,
                 protocol: prot,
                 inbound_tag: String::new(),
+                bpf_eligible: false,
             },
             inner,
         }
+    }
+
+    pub fn with_bpf_eligibility(mut self, eligible: bool) -> Self {
+        self.metadata.bpf_eligible = eligible;
+        self
     }
 
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
@@ -271,7 +316,7 @@ impl Outbounder {
 
         let ob = match set {
             None => return Err(std::io::Error::other("no outbound settings")),
-            Some(OutboundSettings::Black) | Some(OutboundSettings::Freedom) => {
+            Some(OutboundSettings::Black) | Some(OutboundSettings::Freedom(_)) => {
                 return Err(std::io::Error::other("black|free protocol should be handled at app layer"))
             }
             Some(OutboundSettings::Socks(s)) => {
@@ -326,6 +371,81 @@ impl Outbounder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserialize_freedom_outbound_defaults_and_bpf() {
+        for (json, expected) in [
+            (r#"{"protocol":"freedom"}"#, false),
+            (r#"{"protocol":"freedom","settings":{}}"#, false),
+            (r#"{"protocol":"freedom","settings":{"bpf":false}}"#, false),
+            (r#"{"protocol":"freedom","settings":{"bpf":true}}"#, true),
+        ] {
+            let settings: OutboundSettings = serde_json::from_str(json).unwrap();
+            let OutboundSettings::Freedom(settings) = settings else {
+                panic!("expected freedom outbound settings");
+            };
+            assert_eq!(settings.bpf, expected);
+
+            let outbound: crate::app::OutboundSettings = serde_json::from_str(json).unwrap();
+            let Some(OutboundSettings::Freedom(settings)) = outbound.settings else {
+                panic!("expected flattened freedom outbound settings");
+            };
+            assert_eq!(settings.bpf, expected);
+        }
+        assert!(!FreedomSettings::default().bpf);
+    }
+
+    #[test]
+    fn freedom_outbound_yaml_round_trip() {
+        for bpf in [false, true] {
+            let yaml = format!("protocol: freedom\nsettings:\n  bpf: {bpf}\ntag: direct\n");
+            let outbound: crate::app::OutboundSettings = serde_yaml::from_str(&yaml).unwrap();
+            let serialized = serde_yaml::to_string(&outbound).unwrap();
+            let outbound: crate::app::OutboundSettings = serde_yaml::from_str(&serialized).unwrap();
+            let Some(OutboundSettings::Freedom(settings)) = outbound.settings else {
+                panic!("expected freedom outbound settings");
+            };
+            assert_eq!(settings.bpf, bpf);
+            assert_eq!(outbound.tag.as_deref(), Some("direct"));
+        }
+
+        let outbound: crate::app::OutboundSettings = serde_yaml::from_str("protocol: freedom\n").unwrap();
+        assert!(matches!(outbound.settings, Some(OutboundSettings::Freedom(settings)) if !settings.bpf));
+    }
+
+    #[test]
+    fn serialize_freedom_outbound_includes_bpf_setting() {
+        for bpf in [false, true] {
+            let settings = OutboundSettings::Freedom(FreedomSettings { bpf });
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(json, serde_json::json!({"protocol": "freedom", "settings": {"bpf": bpf}}));
+            let OutboundSettings::Freedom(settings) = serde_json::from_value(json).unwrap() else {
+                panic!("expected freedom outbound settings");
+            };
+            assert_eq!(settings.bpf, bpf);
+        }
+    }
+
+    #[test]
+    fn deserialize_freedom_outbound_rejects_invalid_bpf() {
+        for value in [serde_json::json!("true"), serde_json::json!(1), serde_json::Value::Null] {
+            let json = serde_json::json!({"protocol": "freedom", "settings": {"bpf": value}});
+            assert!(serde_json::from_value::<OutboundSettings>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn deserialize_other_outbound_protocols_keeps_requirements() {
+        assert!(matches!(
+            serde_json::from_str::<OutboundSettings>(r#"{"protocol":"blackhole"}"#).unwrap(),
+            OutboundSettings::Black
+        ));
+        for protocol in ["socks", "trojan", "vless", "reverse"] {
+            let json = serde_json::json!({"protocol": protocol});
+            let error = serde_json::from_value::<OutboundSettings>(json).unwrap_err();
+            assert!(error.to_string().contains("missing field `settings`"));
+        }
+    }
 
     #[test]
     fn deserialize_http_inbound_without_settings_uses_defaults() {

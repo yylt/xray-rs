@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+pub mod bpf;
 pub mod domain_trie;
 pub mod forward;
 pub mod ip_trie;

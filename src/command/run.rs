@@ -107,8 +107,15 @@ async fn run_proxy(config: Config) -> io::Result<()> {
         start_inbounds(inbounds, sinks, router, stats, dns, &mut handles).await?;
     }
 
-    // Phase 6: 等待所有任务完成
-    wait_for_completion(handles).await;
+    // Dropping Run's runtime cancels listener/connection tasks; their last relay
+    // references then release all unpinned BPF objects, including on SIGTERM.
+    tokio::select! {
+        _ = wait_for_completion(handles) => {}
+        signal = shutdown_signal() => {
+            signal?;
+            log::info!("Stopping proxy and unloading BPF relay");
+        }
+    }
     Ok(())
 }
 
@@ -175,7 +182,7 @@ async fn build_outbound_sinks(
         log::info!("Building {} outbound(s)", outbounds.len());
         for ob_set in outbounds {
             let tag = ob_set.tag.clone().unwrap_or_else(|| match &ob_set.settings {
-                Some(proxy::OutboundSettings::Freedom) | None => "freedom".to_string(),
+                Some(proxy::OutboundSettings::Freedom(_)) | None => "freedom".to_string(),
                 Some(proxy::OutboundSettings::Black) => "black".to_string(),
                 _ => {
                     let t = format!("proxy-{}", proxy_counter);
@@ -190,7 +197,7 @@ async fn build_outbound_sinks(
             }
 
             let (protocol, supported) = match ob_set.settings.as_ref() {
-                None | Some(proxy::OutboundSettings::Freedom) => ("freedom", true),
+                None | Some(proxy::OutboundSettings::Freedom(_)) => ("freedom", true),
                 Some(proxy::OutboundSettings::Black) => ("blackhole", true),
                 Some(proxy::OutboundSettings::Socks(_)) => ("socks", true),
                 Some(proxy::OutboundSettings::Trojan(_)) => ("trojan", true),
@@ -373,6 +380,19 @@ async fn handle_proxy_stream(
     } else {
         log::error!("[Routing] No route found");
     }
+}
+
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 /// Phase 6: 等待所有任务完成

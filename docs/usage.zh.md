@@ -61,6 +61,43 @@ xray-rs run -c config.yaml --thread multi
 
 如果后缀既不是 `.json` 也不是 `.yaml/.yml`，当前实现会直接报错 `unsupported config format`。
 
+### 1.3 freedom 的可选 BPF TCP 转发
+
+默认关闭，仅在 Linux 上显式配置：
+
+```yaml
+outbounds:
+  - tag: direct
+    protocol: freedom
+    settings:
+      bpf: true
+```
+
+启用后，进程启动时使用 PATH 中的 `clang`（需包含 BPF 后端）编译内嵌 C
+程序，通过 Aya 加载并挂接 sockhash；启动时不下载依赖，不调用 bpftool。
+编译/加载失败会拒绝启动并输出诊断。需要内核支持 SOCKHASH、SK_SKB stream
+parser/verdict、相关 helper，以及足够的 BPF 权限和 memlock 额度；最低内核
+版本为 4.18（sockmap 自 4.14，`bpf_sk_redirect_hash` 与 `SO_COOKIE` 自 4.18），
+低于该版本会在启动加载阶段失败并给出诊断。
+通常由具备相应权限的服务账户运行；普通用户的 unprivileged BPF 不够。
+省略 settings、bpf 或设置 false 时，不编译、不加载，也不要求安装 clang。
+
+加速仅用于 HTTP CONNECT、普通 HTTP 和 SOCKS5 CONNECT 经路由选中此
+freedom 出口后的原生 TCP 连接；代理自身 TLS、WS、gRPC、XHTTP、Unix 和
+UDP 不适用，继续使用原转发路径。隧道中的端到端 TLS 不影响资格。
+HTTP 的预读或改写数据会先按序发送，再允许 BPF 接管。
+入口/出口统计包含前缀、BPF 转发和用户态回退流量。BPF 部分按现有
+生命周期监视周期上报 redirect helper 接受的字节差量，结束/错误/取消时
+结算；用户态部分按目标 writer 接受的字节计数。两者均不代表远端 ACK
+或实际交付，不能用这些指标推断零丢失或加速收益。
+挂接前失败（如映射条目已存在或容量不足）会先撤销已建条目再退回用户态
+转发，前缀不会重发；已挂接后的数据面错误直接终止该连接，不做回退。
+
+对象不 pin 到系统文件路径。SIGINT/SIGTERM 停止及任务取消释放连接条目，
+最后一个运行期引用释放时卸载程序和映射；强制退出由内核回收进程 fd。
+需要真实内核权限的自动测试不会包含在默认 CI 的通过计数中，需在具备
+权限的 Linux 环境显式执行对应 ignored 测试，不应把回退成功当作加速验证。
+
 ## 2. 主程序启动时会做什么
 
 `run` 命令内部会按以下顺序工作：

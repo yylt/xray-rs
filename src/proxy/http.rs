@@ -252,7 +252,7 @@ async fn handle_connect(
     log::debug!("[HTTP] Sent 200 Connection Established");
 
     let stream = wrap_stream_with_prefix(stream, remainder);
-    Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, stream))
+    Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, stream).with_bpf_eligibility(true))
 }
 
 fn wrap_stream_with_prefix(stream: transport::TrStream, prefix: Option<Bytes>) -> transport::TrStream {
@@ -285,10 +285,10 @@ async fn handle_plain_http(
 
     if let Some(rewritten) = rewrite_request_line(&raw_request, path, header_len) {
         let wrapped = wrap_stream_with_prefix(stream, Some(Bytes::from(rewritten)));
-        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped))
+        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped).with_bpf_eligibility(true))
     } else {
         let wrapped = wrap_stream_with_prefix(stream, Some(raw_request));
-        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped))
+        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, wrapped).with_bpf_eligibility(true))
     }
 }
 
@@ -360,6 +360,7 @@ mod tests {
             other => panic!("unexpected destination: {:?}", other),
         }
 
+        assert!(proxy_stream.metadata.bpf_eligible);
         let mut inner = proxy_stream.inner;
         let mut buf = vec![0u8; tls_hello.len()];
         inner.read_exact(&mut buf).await.unwrap();
@@ -396,6 +397,7 @@ mod tests {
             other => panic!("unexpected destination: {:?}", other),
         }
 
+        assert!(proxy_stream.metadata.bpf_eligible);
         let mut inner = proxy_stream.inner;
         let mut buf = vec![0u8; expected.len()];
         inner.read_exact(&mut buf).await.unwrap();

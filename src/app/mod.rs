@@ -92,7 +92,7 @@ impl OutboundSettings {
     pub fn build_sink(self, dns: Arc<DnsResolver>) -> std::io::Result<ConnectionSink> {
         let sink = match &self.settings {
             Some(proxy::OutboundSettings::Black) => ConnectionSink::Block,
-            Some(proxy::OutboundSettings::Freedom) | None => {
+            Some(proxy::OutboundSettings::Freedom(_)) | None => {
                 let tr = transport::Transport::new(
                     self.stream_settings
                         .as_ref()
@@ -100,7 +100,27 @@ impl OutboundSettings {
                     None,
                     dns.clone(),
                 )?;
-                ConnectionSink::Direct(DirectSink { dns, transport: tr })
+                let bpf_enabled =
+                    matches!(&self.settings, Some(proxy::OutboundSettings::Freedom(settings)) if settings.bpf);
+                #[cfg(target_os = "linux")]
+                let bpf = if bpf_enabled {
+                    Some(crate::common::bpf::BpfRelay::shared()?)
+                } else {
+                    None
+                };
+                #[cfg(not(target_os = "linux"))]
+                if bpf_enabled {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "freedom BPF acceleration requires Linux",
+                    ));
+                }
+                ConnectionSink::Direct(DirectSink {
+                    dns,
+                    transport: tr,
+                    #[cfg(target_os = "linux")]
+                    bpf,
+                })
             }
             Some(proxy::OutboundSettings::Reverse(_)) => {
                 let outbounder = proxy::Outbounder::new(self.settings.as_ref(), self.stream_settings.as_ref(), dns)?;
