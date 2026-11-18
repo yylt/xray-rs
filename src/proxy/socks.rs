@@ -576,12 +576,13 @@ impl Proxy {
         account: Option<common::Account>,
     ) -> std::io::Result<ProxyStream> {
         let mut processor = Socks5Processor::new(account);
-        let (stream, _cmd, target_addr) = processor
+        let (stream, cmd, target_addr) = processor
             .process(stream)
             .await
             .map_err(|e| std::io::Error::other(format!("SOCKS5 handshake failed: {}", e)))?;
         log::debug!("SOCKS5 connection to {}", target_addr);
-        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, target_addr, stream))
+        Ok(ProxyStream::new(Protocol::Tcp, peer_addr, target_addr, stream)
+            .with_bpf_eligibility(matches!(cmd, common::socks::Command::Connect)))
     }
 
     /// Handle connection with UDP Associate support.
@@ -649,7 +650,10 @@ impl Proxy {
                     .await
                     .map_err(|e| std::io::Error::other(format!("SOCKS5 reply failed: {}", e)))?;
 
-                Ok(Some(ProxyStream::new(Protocol::Tcp, peer_addr, target_addr, stream)))
+                Ok(Some(
+                    ProxyStream::new(Protocol::Tcp, peer_addr, target_addr, stream)
+                        .with_bpf_eligibility(matches!(cmd, common::socks::Command::Connect)),
+                ))
             }
         }
     }
@@ -1079,6 +1083,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_is_bpf_eligible_and_preserves_pipelined_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let task = tokio::spawn(async move {
+            Proxy::handle_connection(transport::TrStream::Tcp(server), Address::Inet(peer), None)
+                .await
+                .unwrap()
+        });
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        assert_eq!(auth, [5, 0]);
+        let mut request = build_socks5_command_packet(1, &Address::Inet("127.0.0.1:8080".parse().unwrap())).unwrap();
+        request.extend_from_slice(b"payload");
+        client.write_all(&request).await.unwrap();
+        let mut stream = task.await.unwrap();
+        assert!(stream.metadata.bpf_eligible);
+        let mut payload = [0; 7];
+        stream.inner.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"payload");
+    }
+
+    #[tokio::test]
+    async fn only_connect_commands_are_bpf_eligible() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let task = tokio::spawn(async move {
+            Proxy::handle_connection(transport::TrStream::Tcp(server), Address::Inet(peer), None)
+                .await
+                .unwrap()
+        });
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        // BIND shares the TCP request path but must not bypass userspace forwarding.
+        let request = build_socks5_command_packet(0x02, &Address::Inet("127.0.0.1:8080".parse().unwrap())).unwrap();
+        client.write_all(&request).await.unwrap();
+        let stream = task.await.unwrap();
+        assert!(!stream.metadata.bpf_eligible);
+    }
 
     #[test]
     fn build_socks5_command_packet_ipv4_connect() {

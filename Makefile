@@ -9,7 +9,7 @@ XRAY_CORE_BIN ?= $(abspath ../Xray-Core/xray)
 
 CONFIG ?= example/benchmark.json
 
-.PHONY: tools generate build build-xray fmt test benchmark benchmark-test e2e e2e-compat check clippy ci clean-generated
+.PHONY: tools generate build build-xray build-ebpf-probe fmt test benchmark benchmark-test e2e e2e-compat check clippy ci clean-generated
 
 tools:
 	cargo install protoc-gen-prost --locked
@@ -20,6 +20,9 @@ build:
 
 build-xray:
 	cargo build --bin xray-rs
+
+build-ebpf-probe:
+	cargo build --bin ebpf-probe
 
 generate:
 	@mkdir -p $(GENERATED_DIR)

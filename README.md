@@ -53,6 +53,30 @@ xray-rs run -c config.yaml --thread single
 xray-rs run -c config.yaml --thread multi
 ```
 
+## 主机 eBPF 能力检测
+
+独立二进制 `ebpf-probe` 通过系统 `bpftool feature probe kernel` 检测当前
+Linux 主机的 eBPF 能力，包括内核配置、程序类型、map 类型、helper 等。
+需先安装 `bpftool` 并确保它在运行用户的 `PATH` 中，具体探测范围取决于
+bpftool 和内核版本，不包含网卡硬件 offload 检测。
+
+```bash
+make build-ebpf-probe
+sudo ./target/debug/ebpf-probe
+sudo ./target/debug/ebpf-probe --json
+# 仅检测非特权进程可用的能力，不代表主机完整支持情况
+./target/debug/ebpf-probe --unprivileged
+```
+
+默认输出可读报告，`--json` 输出 bpftool JSON 报告。完整探测通常需要 root
+或相应 capabilities；权限不足时返回非零，不自动降级为非特权探测。
+非 Linux、bpftool 缺失或探测执行失败同样返回非零并向 stderr 输出错误。
+报告中的单项“不支持”不影响命令成功退出。
+
+探测可能临时创建 BPF map 和加载测试程序，由 bpftool 清理；不会附加业务
+程序、修改 sysctl 或挂载文件系统。在容器中运行时，结果还受容器权限和
+可见内核配置限制；要了解主机完整能力，请在主机环境执行。
+
 ## 最小配置示例
 
 ```yaml

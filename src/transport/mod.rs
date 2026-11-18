@@ -282,6 +282,39 @@ where
     }
 }
 
+impl TrStream {
+    /// Only unwrap byte prefixes, never transports that need userspace framing or crypto.
+    pub fn is_plain_tcp(&self) -> bool {
+        match self {
+            Self::Tcp(_) => true,
+            Self::Buffered(buffered) => buffered.inner.is_plain_tcp(),
+            _ => false,
+        }
+    }
+
+    /// Preserve every unread prefix in outer-to-inner read order.
+    pub fn into_tcp_with_prefix(self) -> Option<(TcpStream, Bytes)> {
+        match self {
+            Self::Tcp(stream) => Some((stream, Bytes::new())),
+            Self::Buffered(buffered) => {
+                let BufferedStream {
+                    inner,
+                    buffer,
+                    buffer_pos,
+                } = *buffered;
+                let (stream, inner_prefix) = inner.into_tcp_with_prefix()?;
+                let mut prefix = BytesMut::new();
+                if let Some(buffer) = buffer {
+                    prefix.extend_from_slice(&buffer[buffer_pos..]);
+                }
+                prefix.extend_from_slice(&inner_prefix);
+                Some((stream, prefix.freeze()))
+            }
+            _ => None,
+        }
+    }
+}
+
 // Buffered stream wrapper for HTTP proxy
 pub struct BufferedStream {
     inner: Box<TrStream>,

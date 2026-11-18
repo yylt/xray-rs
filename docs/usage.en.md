@@ -61,6 +61,49 @@ xray-rs run -c config.yaml --thread multi
 
 If the file extension is neither `.json` nor `.yaml/.yml`, the current implementation returns `unsupported config format`.
 
+### 1.3 Optional BPF TCP relay for freedom
+
+Disabled by default; on Linux it can be enabled explicitly:
+
+```yaml
+outbounds:
+  - tag: direct
+    protocol: freedom
+    settings:
+      bpf: true
+```
+
+When enabled, startup compiles the embedded C program with `clang` from `PATH`
+(the BPF backend is required) and loads plus attaches it through Aya; nothing is
+downloaded and `bpftool` is not invoked. A compile or load failure aborts startup
+with diagnostics. Required: kernel SOCKHASH and SK_SKB stream parser/verdict
+support, the related helpers, BPF privileges and memlock headroom; the minimum
+kernel is 4.18 (sockmap since 4.14, `bpf_sk_redirect_hash` and `SO_COOKIE` since
+4.18). Older kernels fail during load with diagnostics. Ordinary accounts need
+more than unprivileged BPF. Omitting `settings`, omitting `bpf`, or setting it to
+false neither compiles nor loads anything and does not require `clang`.
+
+Acceleration only applies to HTTP CONNECT, plain HTTP and SOCKS5 CONNECT that
+route to this freedom outbound over native TCP. Proxy TLS, WS, gRPC, XHTTP, Unix
+and UDP keep the existing forwarding path; end-to-end TLS inside a tunnel does
+not affect eligibility. Buffered HTTP preread or rewritten headers are written in
+order before BPF takes over. A failure before arming (for example a duplicate map
+entry or exhausted capacity) undoes created entries and falls back to userspace
+forwarding without replaying the prefix; a data-plane error after arming closes
+that connection instead of falling back.
+
+Inbound/outbound statistics include prefixes, BPF traffic and userspace fallback.
+BPF bytes are reported as redirect-helper admission deltas during lifecycle
+monitoring and settled on completion, error or cancellation; userspace bytes are
+counted when accepted by the destination writer. Neither means remote ACK or
+actual delivery, and these counters do not establish losslessness or speedups.
+
+Objects are not pinned. SIGINT/SIGTERM and task cancellation release connection
+entries; the last runtime reference unloads programs and maps, while a forced
+exit relies on the kernel reclaiming process fds. Tests that need real BPF
+privileges are ignored by default and must be run explicitly on a capable Linux
+host; a fallback test passing is not proof that the BPF path was verified.
+
 ## 2. What happens at startup
 
 Internally, the `run` command works in this order:
