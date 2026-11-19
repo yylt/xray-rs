@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,7 @@ var (
 	binaryPath  string
 	verbose     bool
 	coreBinary  string
+	testFilter  string
 )
 
 // errSkip is a sentinel error that signals a test was skipped.
@@ -28,6 +30,7 @@ var errSkip = errors.New("SKIP")
 
 func init() {
 	flag.StringVar(&coreBinary, "core", "", "Xray-Core binary for bidirectional compatibility tests")
+	flag.StringVar(&testFilter, "test", "", "run only tests whose name contains this substring (case-insensitive)")
 	flag.BoolVar(&verbose, "v", false, "verbose output")
 	flag.Parse()
 
@@ -57,6 +60,11 @@ func main() {
 
 	runTest(results, "WebSocket+TLS+Trojan", testWSTLSTrojan)
 	runTest(results, "gRPC+TLS+Trojan", testGRPCTLSTrojan)
+	for _, upstream := range []string{"1.1", "h2c"} {
+		runTest(results, "XHTTP+TLS+Caddy: upstream="+upstream, func() error {
+			return testXHTTPCaddy(upstream)
+		})
+	}
 	if coreBinary != "" {
 		resolved, err := exec.LookPath(coreBinary)
 		if err != nil {
@@ -81,6 +89,9 @@ func main() {
 
 	results.PrintSummary()
 
+	if results.Passed+results.Failed+results.Skipped == 0 {
+		log.Fatal("[main] No tests matched -test filter")
+	}
 	if results.Failed > 0 {
 		os.Exit(1)
 	}
@@ -104,6 +115,9 @@ func (r *TestResults) PrintSummary() {
 }
 
 func runTest(results *TestResults, name string, testFunc func() error) {
+	if !strings.Contains(strings.ToLower(name), strings.ToLower(testFilter)) {
+		return
+	}
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("TEST: %s\n", name)
 	fmt.Printf("========================================\n")

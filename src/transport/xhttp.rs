@@ -1,3 +1,4 @@
+mod packet;
 use crate::common::{Address, BoxStream, Protocol};
 use crate::route::DnsResolver;
 use crate::transport::sockopt::SocketOpt;
@@ -5,10 +6,11 @@ use crate::transport::tls;
 
 use bytes::Bytes;
 use http::{header, Request, Response, StatusCode};
-use http_body_util::Empty;
+use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming};
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -22,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
 
@@ -30,10 +32,19 @@ use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use log::{error, trace, warn};
+use log::{debug, error, warn};
 use std::time::{Duration, Instant};
 
 use super::*;
+
+/// HTTP/2 stream-level flow-control window advertised by both roles. Downloads
+/// dominate XHTTP traffic and the client's window is what bounds them, but the
+/// server applies the same value to its upload streams for symmetry.
+const DEFAULT_HTTP2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+/// HTTP/2 connection-level window as a multiple of the stream-level window.
+const HTTP2_INITIAL_CONNECTION_WINDOW_MULTIPLE: u32 = 2;
+/// HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE is a 31-bit quantity.
+const MAX_HTTP2_INITIAL_STREAM_WINDOW: u32 = (1 << 31) - 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XhttpSettings {
@@ -41,22 +52,37 @@ pub struct XhttpSettings {
     pub path: String,
 
     #[serde(rename = "mode")]
-    pub mode: Option<String>, // "stream-one" for single POST channel, None for dual-channel
+    pub mode: Option<String>, // Only packet-up is supported; omitted defaults to it.
 
     #[serde(rename = "upload")]
     pub upload: Option<ServerConfig>,
 
     #[serde(rename = "download")]
     pub download: Option<ServerConfig>,
+
+    #[serde(rename = "http2InitialWindowSize")]
+    pub http2_initial_window_size: Option<u32>,
+
+    #[serde(rename = "loadBalancer")]
+    pub load_balancer: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
-    #[serde(rename = "address")]
+    // An omitted address is resolved once in Xhttp::new.
+    #[serde(default, deserialize_with = "deserialize_endpoint_address")]
     pub address: String,
 
     #[serde(rename = "port")]
     pub port: u16,
+}
+
+fn deserialize_endpoint_address<'de, D: serde::Deserializer<'de>>(deserializer: D) -> StdResult<String, D::Error> {
+    let address = String::deserialize(deserializer)?;
+    if address.trim().is_empty() {
+        return Err(serde::de::Error::custom("XHTTP endpoint address must not be empty"));
+    }
+    Ok(address)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,26 +106,6 @@ impl Body for ChannelBody {
 }
 
 // ---------------------------------------------------------------------------
-// Server pairing state
-// ---------------------------------------------------------------------------
-
-pub enum PendingStream {
-    // POST arrived first, waiting for GET to complete the pair
-    UploadPending {
-        incoming: Incoming, // read client upload data from POST body
-        post_response_tx: mpsc::Sender<StdResult<Frame<Bytes>, Infallible>>, // write to POST response
-        timestamp: Instant,
-    },
-    // GET arrived first, waiting for POST to complete the pair
-    DownloadPending {
-        get_response_tx: mpsc::Sender<StdResult<Frame<Bytes>, Infallible>>, // write to GET response
-        timestamp: Instant,
-    },
-}
-
-const PENDING_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
-
-// ---------------------------------------------------------------------------
 // Xhttp Transport
 // ---------------------------------------------------------------------------
 
@@ -109,13 +115,98 @@ pub struct Xhttp {
     tls_client: Option<tls::client::Tls>,
     tls_server: Option<tls::server::Tls>,
     dns: std::sync::Arc<DnsResolver>,
+    h2_window: u32,
 
-    // Client connection cache using RwLock for fast read access
-    upload_client: Arc<RwLock<Option<SendRequest<ChannelBody>>>>,
-    download_client: Arc<RwLock<Option<SendRequest<Empty<Bytes>>>>>,
+    upload_pool: ClientPool,
+    download_pool: ClientPool,
+    packet_sessions: packet::PacketSessions,
+}
 
-    // Server stream matching
-    pending_streams: Arc<Mutex<HashMap<String, PendingStream>>>,
+type DownloadResponse = Pin<Box<dyn Future<Output = IoResult<Incoming>> + Send + Sync>>;
+
+type ClientBalancer = super::balancer::Balancer<SendRequest<ChannelBody>>;
+
+struct ClientPool {
+    balancer: ClientBalancer,
+    discovery: Mutex<DiscoveryState>,
+}
+
+#[derive(Default)]
+struct DiscoveryState {
+    initialized: bool,
+    refresh_at: Option<Instant>,
+    retry_at: Option<Instant>,
+    generation: u64,
+}
+
+impl ClientPool {
+    fn new(strategy: super::balancer::Strategy) -> Self {
+        Self {
+            balancer: ClientBalancer::new(strategy),
+            discovery: Mutex::new(DiscoveryState::default()),
+        }
+    }
+
+    async fn discover<F, Fut>(&self, config: &ServerConfig, resolve: F) -> IoResult<u64>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = IoResult<Vec<std::net::IpAddr>>>,
+    {
+        let mut state = self.discovery.lock().await;
+        let now = Instant::now();
+        if state.retry_at.is_some_and(|at| now < at) {
+            return if state.initialized {
+                Ok(state.generation)
+            } else {
+                Err(Error::new(ErrorKind::NotConnected, "XHTTP DNS discovery backing off"))
+            };
+        }
+        if state.initialized && state.refresh_at.is_none_or(|at| now < at) {
+            return Ok(state.generation);
+        }
+        let ips = match config.address.parse::<std::net::IpAddr>() {
+            Ok(ip) => Ok(vec![ip]),
+            Err(_) => match tokio::time::timeout(Duration::from_secs(10), resolve()).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::new(ErrorKind::TimedOut, "XHTTP DNS resolution timed out")),
+            },
+        };
+        state.retry_at = Some(Instant::now() + Duration::from_secs(1));
+        match ips {
+            Ok(ips) if !ips.is_empty() => {
+                self.balancer
+                    .sync_targets(
+                        ips.into_iter()
+                            .map(|ip| super::balancer::GrpcTargetKey::Tcp(std::net::SocketAddr::new(ip, config.port)))
+                            .collect(),
+                    )
+                    .await;
+                state.initialized = true;
+                state.generation = state.generation.wrapping_add(1);
+                state.refresh_at = config
+                    .address
+                    .parse::<std::net::IpAddr>()
+                    .is_err()
+                    .then(|| Instant::now() + Duration::from_secs(300));
+                Ok(state.generation)
+            }
+            result => {
+                if state.initialized {
+                    return Ok(state.generation);
+                }
+                Err(result
+                    .err()
+                    .unwrap_or_else(|| Error::new(ErrorKind::NotFound, "XHTTP DNS returned no IPs")))
+            }
+        }
+    }
+
+    async fn invalidate(&self, generation: u64) {
+        let mut state = self.discovery.lock().await;
+        if state.generation == generation {
+            state.refresh_at = Some(Instant::now());
+        }
+    }
 }
 
 impl Xhttp {
@@ -127,7 +218,7 @@ impl Xhttp {
         Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CACHE_CONTROL, "no-store")
+            .header(header::CACHE_CONTROL, "no-cache, no-store")
             .header("X-Accel-Buffering", "no")
             // Disable buffering for nginx/other proxies
             .header("X-Cache-Status", "BYPASS")
@@ -135,48 +226,88 @@ impl Xhttp {
             .unwrap()
     }
 
-    fn cleanup_expired_pending_streams(map: &mut HashMap<String, PendingStream>) {
-        let now = Instant::now();
-        map.retain(|id, pending| {
-            let timestamp = match pending {
-                PendingStream::UploadPending { timestamp, .. } => *timestamp,
-                PendingStream::DownloadPending { timestamp, .. } => *timestamp,
-            };
-            let expired = now.duration_since(timestamp) > PENDING_STREAM_TIMEOUT;
-            if expired {
-                warn!("[xhttp][server] dropping expired pending stream id={}", id);
-            }
-            !expired
-        });
-    }
-
-    pub fn new(sset: &StreamSettings, _server: Option<Address>, dns: std::sync::Arc<DnsResolver>) -> IoResult<Self> {
-        let xhttp_settings = sset
+    pub fn new(sset: &StreamSettings, server: Option<Address>, dns: Arc<DnsResolver>) -> IoResult<Self> {
+        let mut settings = sset
             .xhttp_settings
-            .as_ref()
+            .clone()
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "xhttpSettings is required"))?;
-
-        let tls_client = if sset.security == Security::Tls {
-            sset.tls_settings.as_ref().and_then(|ts| tls::client::new(ts).ok())
-        } else {
-            None
+        if settings.mode.as_deref().is_some_and(|mode| mode != "packet-up") {
+            return Err(Error::new(ErrorKind::InvalidInput, "unsupported XHTTP mode"));
+        }
+        settings.path = format!("/{}", settings.path.trim_matches('/'));
+        if settings.path == "/" {
+            settings.path.clear();
+        }
+        let fallback = match server {
+            Some(Address::Inet(addr)) => Some(ServerConfig {
+                address: addr.ip().to_string(),
+                port: addr.port(),
+            }),
+            Some(Address::Domain(address, port)) => Some(ServerConfig { address, port }),
+            _ => None,
         };
-
-        let tls_server = if sset.security == Security::Tls {
-            sset.tls_settings.as_ref().and_then(|ts| tls::server::new(ts).ok())
+        let (tls_client, tls_server) = if sset.security == Security::Tls {
+            let ts = sset
+                .tls_settings
+                .as_ref()
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "XHTTP TLS requires tlsSettings"))?;
+            (Some(tls::client::new_http2(ts)?), Some(tls::server::new(ts)?))
         } else {
-            None
+            (None, None)
         };
-
+        let tls_name = tls_client.as_ref().and_then(|tls| tls.server_name());
+        if tls_name.is_some_and(|name| name.trim().is_empty()) {
+            return Err(Error::new(ErrorKind::InvalidInput, "XHTTP TLS serverName must not be empty"));
+        }
+        let resolve = |endpoint: &mut ServerConfig, inherited: Option<&ServerConfig>| -> IoResult<()> {
+            if endpoint.address.is_empty() {
+                endpoint.address = tls_name
+                    .or_else(|| fallback.as_ref().map(|config| config.address.as_str()))
+                    .or_else(|| inherited.map(|config| config.address.as_str()))
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "XHTTP endpoint address missing"))?
+                    .to_owned();
+            } else if endpoint.address.trim().is_empty() {
+                return Err(Error::new(ErrorKind::InvalidInput, "XHTTP endpoint address must not be empty"));
+            }
+            Ok(())
+        };
+        settings.upload = settings.upload.or_else(|| {
+            fallback.as_ref().map(|config| ServerConfig {
+                address: String::new(),
+                port: config.port,
+            })
+        });
+        if let Some(upload) = &mut settings.upload {
+            resolve(upload, None)?;
+        }
+        if let Some(download) = &mut settings.download {
+            resolve(download, settings.upload.as_ref())?;
+        } else {
+            settings.download = settings.upload.clone();
+        }
+        let strategy = super::balancer::Strategy::from_strategy_str(
+            settings.load_balancer.as_deref().unwrap_or("least_connection"),
+        );
+        let h2_window = settings
+            .http2_initial_window_size
+            .unwrap_or(DEFAULT_HTTP2_INITIAL_STREAM_WINDOW);
+        // Zero would stall every stream; the protocol maximum is 2^31-1.
+        if h2_window == 0 || h2_window > MAX_HTTP2_INITIAL_STREAM_WINDOW {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "XHTTP http2InitialWindowSize must be between 1 and 2147483647",
+            ));
+        }
         Ok(Self {
-            settings: xhttp_settings.clone(),
+            settings,
             opt: sset.sockopt.clone(),
             tls_client,
             tls_server,
             dns,
-            upload_client: Arc::new(RwLock::new(None)),
-            download_client: Arc::new(RwLock::new(None)),
-            pending_streams: Arc::new(Mutex::new(HashMap::new())),
+            h2_window,
+            upload_pool: ClientPool::new(strategy),
+            download_pool: ClientPool::new(strategy),
+            packet_sessions: Arc::default(),
         })
     }
 
@@ -184,45 +315,17 @@ impl Xhttp {
         &self.dns
     }
 
-    // Resolve server config and establish TCP connection (shared helper)
-    async fn resolve_and_connect(
-        &self,
-        config: Option<&ServerConfig>,
-        name: &str,
-    ) -> IoResult<(TcpStream, std::net::SocketAddr)> {
-        let cfg = config.ok_or_else(|| {
-            Error::new(ErrorKind::InvalidInput, format!("{} config is not set in XhttpSettings", name))
-        })?;
-
-        let ips = self.dns.resolve(&cfg.address).await.map_err(|e| {
-            Error::new(ErrorKind::NotFound, format!("DNS resolution failed for {}: {}", cfg.address, e))
-        })?;
-
-        if ips.is_empty() {
-            return Err(Error::new(ErrorKind::NotFound, format!("No IP found for {}", cfg.address)));
-        }
-
-        let socket_addr = std::net::SocketAddr::new(ips[0], cfg.port);
-        let stream = TcpStream::connect(&socket_addr).await?;
-        let stream = self.opt.apply_tcpstream(stream)?;
-        Ok((stream, socket_addr))
-    }
-
     // Perform HTTP/2 handshake and spawn connection task (shared helper)
-    async fn http2_handshake<B>(
-        &self,
-        stream: TcpStream,
-        socket_addr: std::net::SocketAddr,
-        name: &str,
-    ) -> IoResult<SendRequest<B>>
+    async fn http2_handshake<B>(&self, stream: TcpStream, name: &str) -> IoResult<SendRequest<B>>
     where
         B: Body + Unpin + Send + 'static,
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let request_sender = if let Some(tls) = &self.tls_client {
-            let tls_stream = tls.connect(&socket_addr, stream).await?;
-            let (request_sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            let tls_stream = tls.connect_http2(name, stream).await?;
+            let (request_sender, connection) = self
+                .h2_client_builder()
                 .handshake(TokioIo::new(tls_stream))
                 .await
                 .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e.to_string()))?;
@@ -235,7 +338,8 @@ impl Xhttp {
             });
             request_sender
         } else {
-            let (request_sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            let (request_sender, connection) = self
+                .h2_client_builder()
                 .handshake(TokioIo::new(stream))
                 .await
                 .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e.to_string()))?;
@@ -251,114 +355,142 @@ impl Xhttp {
         Ok(request_sender)
     }
 
-    /// Get upload client (POST channel with streaming body)
-    async fn get_upload_client(&self) -> IoResult<SendRequest<ChannelBody>> {
-        // Check cache first
-        let client_opt = self.upload_client.read().await;
-        if let Some(client) = client_opt.as_ref() {
-            if client.is_ready() {
-                return Ok(client.clone());
-            }
-        }
-        drop(client_opt);
-
-        let mut write_lock = self.upload_client.write().await;
-        if let Some(client) = write_lock.as_ref() {
-            if client.is_ready() {
-                return Ok(client.clone());
-            }
-        }
-
-        let (stream, socket_addr) = self
-            .resolve_and_connect(self.settings.upload.as_ref(), "upload")
-            .await?;
-        let request_sender: SendRequest<ChannelBody> = self.http2_handshake(stream, socket_addr, "upload").await?;
-        *write_lock = Some(request_sender.clone());
-        Ok(request_sender)
+    fn h2_client_builder(&self) -> hyper::client::conn::http2::Builder<TokioExecutor> {
+        let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+        builder
+            .initial_stream_window_size(self.h2_window)
+            .initial_connection_window_size(self.h2_window.saturating_mul(HTTP2_INITIAL_CONNECTION_WINDOW_MULTIPLE));
+        builder
     }
 
-    /// Get download client (GET channel with empty body)
-    async fn get_download_client(&self) -> IoResult<SendRequest<Empty<Bytes>>> {
-        // Check cache first
-        let client_opt = self.download_client.read().await;
-        if let Some(client) = client_opt.as_ref() {
-            if client.is_ready() {
-                return Ok(client.clone());
+    async fn get_client(
+        &self,
+        pool: &ClientPool,
+        key: &super::balancer::GrpcTargetKey,
+        config: &ServerConfig,
+    ) -> IoResult<SendRequest<ChannelBody>> {
+        if let Some(sender) = pool.balancer.cached_channel(key).await {
+            if !sender.is_closed() {
+                return Ok(sender);
             }
         }
-        drop(client_opt);
-
-        let mut write_lock = self.download_client.write().await;
-        if let Some(client) = write_lock.as_ref() {
-            if client.is_ready() {
-                return Ok(client.clone());
+        let lock = pool
+            .balancer
+            .channel_lock(key)
+            .await
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "XHTTP target removed"))?;
+        let _guard = lock.lock().await;
+        if let Some(sender) = pool.balancer.cached_channel(key).await {
+            if !sender.is_closed() {
+                return Ok(sender);
             }
         }
-
-        let (stream, socket_addr) = self
-            .resolve_and_connect(self.settings.download.as_ref(), "download")
-            .await?;
-        let request_sender: SendRequest<Empty<Bytes>> = self.http2_handshake(stream, socket_addr, "download").await?;
-        *write_lock = Some(request_sender.clone());
-        Ok(request_sender)
+        pool.balancer.remove_cached_channel(key).await;
+        let addr = match key {
+            super::balancer::GrpcTargetKey::Tcp(addr) => addr,
+            #[cfg(unix)]
+            super::balancer::GrpcTargetKey::Unix(_) => {
+                return Err(Error::new(ErrorKind::Unsupported, "XHTTP client requires TCP"))
+            }
+        };
+        let stream = self.opt.apply_tcpstream(TcpStream::connect(addr).await?)?;
+        let sender = self.http2_handshake(stream, &config.address).await?;
+        pool.balancer
+            .cache_channel(key, sender)
+            .await
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "XHTTP target removed"))
     }
 
     pub async fn connect(&self, _dest: &Address, _proto: Protocol) -> IoResult<super::TrStream> {
-        let stream = self.connect_inner().await?;
-        Ok(super::TrStream::Xhttp(Box::new(stream)))
+        let config = self
+            .settings
+            .upload
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "XHTTP upload endpoint missing"))?;
+        let pool = &self.upload_pool;
+        let generation = pool.discover(config, || self.dns.resolve(&config.address)).await?;
+        let opened = pool
+            .balancer
+            .open_with_retry(|key| async move {
+                tokio::time::timeout(Duration::from_secs(10), self.connect_inner(&key))
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::TimedOut, "XHTTP stream establishment timed out"))?
+            })
+            .await;
+        match opened {
+            Ok((lease, mut stream)) => {
+                stream.target_leases.push(lease);
+                Ok(super::TrStream::Xhttp(Box::new(stream)))
+            }
+            Err(err) => {
+                pool.invalidate(generation).await;
+                Err(err)
+            }
+        }
     }
 
-    async fn connect_inner(&self) -> IoResult<crate::transport::xhttp::XhttpStream> {
-        // Generate a random UUID
+    fn request_uri(&self, config: Option<&ServerConfig>, path: &str) -> IoResult<http::Uri> {
+        let config = config.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing XHTTP endpoint"))?;
+        // Use the same resolved endpoint name for DNS, TLS and virtual-host routing.
+        let host = &config.address;
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{}]", host)
+        } else {
+            host.to_string()
+        };
+        http::Uri::builder()
+            .scheme(if self.tls_client.is_some() { "https" } else { "http" })
+            .authority(format!("{}:{}", host, config.port))
+            .path_and_query(path)
+            .build()
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e))
+    }
+
+    async fn connect_inner(&self, key: &super::balancer::GrpcTargetKey) -> IoResult<XhttpStream> {
         let uuid = uuid::Uuid::new_v4().to_string();
         let path = format!("{}/{}", self.settings.path, uuid);
-        let mode: XhttpMode = self.settings.mode.clone().into();
-
-        // --- Execute Upload (POST) - establish first and keep it alive ---
-        let (post_tx, post_rx) = mpsc::channel(DEFAULT_CHANNEL_CLIENT_CAPACITY);
-        let body = ChannelBody { rx: post_rx };
-
-        let upload_address = self.settings.upload.as_ref().map(|u| u.address.as_str()).unwrap_or("");
-        let mut post_client = self.get_upload_client().await?;
-        warn!("[xhttp][client] issuing POST path={} host={}", path, upload_address);
-        let post_req = Request::builder()
-            .method("POST")
-            .uri(&path)
-            .header("Host", upload_address)
-            .header("User-Agent", "xray-rs/v0.1.0")
-            .header("Content-Type", "application/octet-stream")
-            .body(body)
-            .unwrap();
-
-        let post_response = post_client
-            .send_request(post_req)
-            .await
-            .map_err(|e| Error::other(format!("POST request failed: {}", e)))?;
-
-        warn!(
-            "[xhttp][client] POST established path={} status={}",
-            path,
-            post_response.status()
-        );
-
-        if post_response.status() != StatusCode::OK {
-            return Err(Error::new(
-                ErrorKind::ConnectionRefused,
-                format!("Upload failed with status: {}", post_response.status()),
-            ));
-        }
-
-        let incoming = match mode {
-            XhttpMode::StreamUp => self.establish_get(&path).await?,
-            XhttpMode::StreamOne => post_response.into_body(),
+        let config = self.settings.upload.as_ref().unwrap();
+        let sender = self.get_client(&self.upload_pool, key, config).await?;
+        let mut leases = Vec::new();
+        let incoming = if self.settings.upload == self.settings.download {
+            self.establish_get(&path, &self.upload_pool, key).await?
+        } else {
+            let config = self.settings.download.as_ref().unwrap();
+            let pool = &self.download_pool;
+            let generation = pool.discover(config, || self.dns.resolve(&config.address)).await?;
+            match pool
+                .balancer
+                .open_with_retry(|key| {
+                    let path = &path;
+                    async move { self.establish_get(path, pool, &key).await }
+                })
+                .await
+            {
+                Ok((lease, body)) => {
+                    leases.push(lease);
+                    body
+                }
+                Err(error) => {
+                    pool.invalidate(generation).await;
+                    return Err(error);
+                }
+            }
         };
-
-        // Assemble stream based on mode: incoming response body for read, POST request (post_tx) for write
-        Ok(XhttpStream::new_with_mode(incoming, PollSender::new(post_tx), None, mode))
+        let mut stream =
+            packet::connect(sender, incoming, self.request_uri(self.settings.upload.as_ref(), &path)?).await?;
+        stream.target_leases = leases;
+        Ok(stream)
     }
 
-    async fn establish_get(&self, path: &str) -> IoResult<Incoming> {
-        let mut get_client = self.get_download_client().await?;
+    async fn establish_get(
+        &self,
+        path: &str,
+        pool: &ClientPool,
+        key: &super::balancer::GrpcTargetKey,
+    ) -> IoResult<DownloadResponse> {
+        let config = self.settings.download.as_ref().unwrap();
+        let mut get_client = self.get_client(pool, key, config).await?;
+        get_client.ready().await.map_err(Error::other)?;
         let download_address = self
             .settings
             .download
@@ -366,30 +498,28 @@ impl Xhttp {
             .map(|d| d.address.as_str())
             .unwrap_or("");
 
-        warn!("[xhttp][client] issuing GET path={} host={}", path, download_address);
+        debug!("[xhttp][client] issuing GET path={} host={}", path, download_address);
         let get_req = Request::builder()
             .method("GET")
-            .uri(path)
-            .header("Host", download_address)
+            .uri(self.request_uri(self.settings.download.as_ref(), path)?)
             .header("User-Agent", "xray-rs/v0.1.0")
-            .body(Empty::<Bytes>::new())
+            .body(Self::empty_body())
             .unwrap();
 
-        let get_response = get_client
-            .send_request(get_req)
-            .await
-            .map_err(|e| Error::other(format!("GET request failed: {}", e)))?;
-
-        warn!("[xhttp][client] GET established path={} status={}", path, get_response.status());
-
-        if get_response.status() != StatusCode::OK {
-            return Err(Error::new(
-                ErrorKind::ConnectionRefused,
-                format!("Download failed with status: {}", get_response.status()),
-            ));
-        }
-
-        Ok(get_response.into_body())
+        let response = get_client.send_request(get_req);
+        Ok(Box::pin(async move {
+            let response = tokio::time::timeout(Duration::from_secs(10), response)
+                .await
+                .map_err(|_| Error::new(ErrorKind::TimedOut, "XHTTP GET response headers timed out"))?
+                .map_err(Error::other)?;
+            if response.status() != StatusCode::OK {
+                return Err(Error::new(
+                    ErrorKind::ConnectionRefused,
+                    format!("Download failed with status: {}", response.status()),
+                ));
+            }
+            Ok(response.into_body())
+        }))
     }
 
     fn listener_stream(
@@ -427,10 +557,10 @@ impl Xhttp {
     ) -> IoResult<BoxStream<(super::TrStream, Address), std::io::Error>> {
         let (stream_tx, stream_rx) = mpsc::channel(DEFAULT_CHANNEL_SERVER_CAPACITY);
         let listener = super::bind_tcp_listener(*addr)?;
-        let pending = self.pending_streams.clone();
+        let packet_sessions = self.packet_sessions.clone();
         let stx = stream_tx.clone();
         let base_path = self.settings.path.clone();
-        let mode: XhttpMode = self.settings.mode.clone().into();
+        let h2_window = self.h2_window;
         let sockopt = self.opt.clone();
         let tls_server = self.tls_server.clone();
 
@@ -445,7 +575,7 @@ impl Xhttp {
                         }
                     };
 
-                    let pending_clone = pending.clone();
+                    let packet_sessions = packet_sessions.clone();
                     let stx_clone = stx.clone();
                     let base_path_clone = base_path.clone();
                     let tls_server = tls_server.clone();
@@ -457,10 +587,10 @@ impl Xhttp {
                                     let io = TokioIo::new(tls_stream);
                                     Self::serve_connection(
                                         io,
-                                        pending_clone,
+                                        packet_sessions,
                                         stx_clone,
                                         base_path_clone,
-                                        mode,
+                                        h2_window,
                                         Address::Inet(peer_addr),
                                     )
                                     .await;
@@ -473,10 +603,10 @@ impl Xhttp {
                             let io = TokioIo::new(stream);
                             Self::serve_connection(
                                 io,
-                                pending_clone,
+                                packet_sessions,
                                 stx_clone,
                                 base_path_clone,
-                                mode,
+                                h2_window,
                                 Address::Inet(peer_addr),
                             )
                             .await;
@@ -502,10 +632,10 @@ impl Xhttp {
         }
         let listener = UnixListener::bind(path)?;
         let (stream_tx, stream_rx) = mpsc::channel(DEFAULT_CHANNEL_SERVER_CAPACITY);
-        let pending = self.pending_streams.clone();
+        let packet_sessions = self.packet_sessions.clone();
         let stx = stream_tx.clone();
         let base_path = self.settings.path.clone();
-        let mode: XhttpMode = self.settings.mode.clone().into();
+        let h2_window = self.h2_window;
         let sockopt = self.opt.clone();
         let listener_path = path.clone();
 
@@ -520,14 +650,15 @@ impl Xhttp {
                         }
                     };
 
-                    let pending_clone = pending.clone();
+                    let packet_sessions = packet_sessions.clone();
                     let stx_clone = stx.clone();
                     let base_path_clone = base_path.clone();
                     let peer_addr = Address::Unix(listener_path.clone());
 
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
-                        Self::serve_connection(io, pending_clone, stx_clone, base_path_clone, mode, peer_addr).await;
+                        Self::serve_connection(io, packet_sessions, stx_clone, base_path_clone, h2_window, peer_addr)
+                            .await;
                     });
                 }
             }
@@ -538,234 +669,142 @@ impl Xhttp {
 
     async fn serve_connection<I>(
         conn_io: TokioIo<I>,
-        pending: Arc<Mutex<HashMap<String, PendingStream>>>,
+        packet_sessions: packet::PacketSessions,
         stx: mpsc::Sender<(super::TrStream, Address)>,
         base_path: String,
-        mode: XhttpMode,
+        h2_window: u32,
         peer_addr: Address,
     ) where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let connection_peer = peer_addr.clone();
         let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-            let pending = pending.clone();
+            let packet_sessions = packet_sessions.clone();
             let stx = stx.clone();
             let base_path = base_path.clone();
             let peer_addr = peer_addr.clone();
 
             async move {
+                if !matches!(req.version(), http::Version::HTTP_11 | http::Version::HTTP_2) {
+                    return Ok::<_, Infallible>(Self::stream_response(
+                        StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+                        Self::empty_body(),
+                    ));
+                }
                 let path = req.uri().path().to_string();
 
                 // Validate base path
-                if !path.starts_with(&base_path) || path.len() <= base_path.len() + 1 {
+                if !path.starts_with(&format!("{}/", base_path)) || path.len() <= base_path.len() + 1 {
                     return Ok::<_, Infallible>(Self::stream_response(StatusCode::NOT_FOUND, Self::empty_body()));
                 }
                 let id = path[base_path.len() + 1..].to_string();
-
-                if req.method() == http::Method::POST {
-                    warn!("[xhttp][server] recv POST peer={:?} path={} id={}", peer_addr, path, id);
-                    warn!(
-                        "[xhttp][server] POST version={:?} host={:?} content-type={:?}",
-                        req.version(),
-                        req.headers().get(header::HOST),
-                        req.headers().get(header::CONTENT_TYPE)
-                    );
-                    let content_type = req
-                        .headers()
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or("");
-                    if !content_type.starts_with("application/octet-stream") {
-                        error!(
-                            "[xhttp][server] invalid POST content-type peer={:?} path={} id={} content_type={}",
-                            peer_addr, path, id, content_type
-                        );
-                        return Ok::<_, Infallible>(Self::stream_response(StatusCode::BAD_REQUEST, Self::empty_body()));
-                    }
-
-                    // Extract POST body (for reading client upload data)
-                    let incoming = req.into_body();
-
-                    // Create POST response channel - for sending data back to client via POST response
-                    let (post_resp_tx, post_resp_rx) =
-                        mpsc::channel::<StdResult<Frame<Bytes>, Infallible>>(DEFAULT_CHANNEL_SERVER_CAPACITY);
-                    let post_body = ChannelBody { rx: post_resp_rx };
-
-                    if mode == XhttpMode::StreamOne {
-                        let xstream = XhttpStream::new_stream_one(incoming, PollSender::new(post_resp_tx));
-                        match stx
-                            .send((super::TrStream::Xhttp(Box::new(xstream)), peer_addr.clone()))
-                            .await
-                        {
-                            Ok(()) => {
-                                warn!(
-                                    "[xhttp][server] forwarded stream-one stream from POST peer={:?} id={}",
-                                    peer_addr, id
-                                )
-                            }
-                            Err(e) => error!(
-                                "[xhttp][server] failed to forward stream-one stream from POST peer={:?} id={} err={}",
-                                peer_addr, id, e
-                            ),
-                        }
-                        return Ok::<_, Infallible>(Self::stream_response(StatusCode::OK, post_body));
-                    }
-
-                    // Lock scope: minimize critical section - only HashMap operations, no await inside
-                    let matched_get_tx = {
-                        let mut map = pending.lock().await;
-                        Self::cleanup_expired_pending_streams(&mut map);
-                        if let Some(PendingStream::DownloadPending { get_response_tx, .. }) = map.remove(&id) {
-                            warn!("[xhttp][server] matched POST with pending GET peer={:?} id={}", peer_addr, id);
-                            Some(get_response_tx)
-                        } else {
-                            warn!("[xhttp][server] store POST as upload pending peer={:?} id={}", peer_addr, id);
-                            None
-                        }
-                    }; // Lock released here
-
-                    if let Some(get_tx) = matched_get_tx {
-                        // Pairing complete: GET arrived before POST
-                        // Create dual-channel XhttpStream
-                        warn!("[xhttp][server] POST creating dual-channel XhttpStream with incoming (POST body) and both tx channels peer={:?} id={}", peer_addr, id);
-                        let xstream = XhttpStream::new_stream_up(
-                            incoming,
-                            PollSender::new(post_resp_tx),
-                            PollSender::new(get_tx),
-                        );
-                        // Send to upstream outside of lock
-                        match stx
-                            .send((super::TrStream::Xhttp(Box::new(xstream)), peer_addr.clone()))
-                            .await
-                        {
-                            Ok(()) => {
-                                warn!("[xhttp][server] forwarded dual-channel stream from POST peer={:?} id={}", peer_addr, id)
-                            }
-                            Err(e) => error!(
-                                "[xhttp][server] failed to forward dual-channel stream from POST peer={:?} id={} err={}",
-                                peer_addr, id, e
-                            ),
-                        }
-                        // Return POST response - upstream will write to it
-                        warn!(
-                            "[xhttp][server] POST returning response body channel to client peer={:?} id={}",
-                            peer_addr, id
-                        );
-                        return Ok::<_, Infallible>(Self::stream_response(StatusCode::OK, post_body));
-                    }
-
-                    // No pending GET: store POST as pending
-                    // Note: post_resp_tx and incoming are moved into pending, they can't be used here
-                    warn!("[xhttp][server] POST no pending GET, storing as pending and returning empty response peer={:?} id={}", peer_addr, id);
-                    {
-                        let mut map = pending.lock().await;
-                        map.insert(
-                            id.clone(),
-                            PendingStream::UploadPending {
-                                incoming,
-                                post_response_tx: post_resp_tx,
-                                timestamp: Instant::now(),
-                            },
-                        );
-                    }
-
-                    // Return POST response for stream-one mode
-                    // In stream-up mode, this will be auxiliary when GET arrives
-                    Ok::<_, Infallible>(Self::stream_response(StatusCode::OK, post_body))
-                } else if req.method() == http::Method::GET {
-                    if mode == XhttpMode::StreamOne {
-                        return Ok::<_, Infallible>(Self::stream_response(
-                            StatusCode::METHOD_NOT_ALLOWED,
-                            Self::empty_body(),
-                        ));
-                    }
-
-                    warn!(
-                        "[xhttp][server] recv GET peer={:?} path={} id={} version={:?} host={:?}",
-                        peer_addr,
-                        path,
-                        id,
-                        req.version(),
-                        req.headers().get(header::HOST)
-                    );
-                    // Create GET response channel - for sending data to client via GET response
-                    let (get_resp_tx, get_resp_rx) =
-                        mpsc::channel::<StdResult<Frame<Bytes>, Infallible>>(DEFAULT_CHANNEL_SERVER_CAPACITY);
-                    let get_body = ChannelBody { rx: get_resp_rx };
-
-                    // Lock scope: minimize critical section - only HashMap operations
-                    let matched_post = {
-                        let mut map = pending.lock().await;
-                        Self::cleanup_expired_pending_streams(&mut map);
-                        if let Some(PendingStream::UploadPending {
-                            incoming,
-                            post_response_tx,
-                            ..
-                        }) = map.remove(&id)
-                        {
-                            warn!("[xhttp][server] matched GET with pending POST peer={:?} id={}", peer_addr, id);
-                            Some((incoming, post_response_tx))
-                        } else {
-                            warn!("[xhttp][server] store GET as download pending peer={:?} id={}", peer_addr, id);
-                            None
-                        }
-                    }; // Lock released here
-
-                    if let Some((incoming, post_resp_tx)) = matched_post {
-                        // Pairing complete: POST arrived before GET
-                        // Create dual-channel XhttpStream
-                        let xstream = XhttpStream::new_stream_up(
-                            incoming,
-                            PollSender::new(post_resp_tx),
-                            PollSender::new(get_resp_tx),
-                        );
-                        warn!("[xhttp][server] GET pairing complete - XhttpStream created with both channels, about to forward to upstream peer={:?} id={}", peer_addr, id);
-                        // Send to upstream outside of lock
-                        match stx
-                            .send((super::TrStream::Xhttp(Box::new(xstream)), peer_addr.clone()))
-                            .await
-                        {
-                            Ok(()) => {
-                                warn!(
-                                    "[xhttp][server] forwarded dual-channel stream from GET peer={:?} id={}",
-                                    peer_addr, id
-                                )
-                            }
-                            Err(e) => error!(
-                                "[xhttp][server] failed to forward dual-channel stream from GET peer={:?} id={} err={}",
-                                peer_addr, id, e
-                            ),
-                        }
-                    } else {
-                        // No pending POST: store GET as pending
-                        let mut map = pending.lock().await;
-                        map.insert(
-                            id.clone(),
-                            PendingStream::DownloadPending {
-                                get_response_tx: get_resp_tx,
-                                timestamp: Instant::now(),
-                            },
-                        );
-                    }
-
-                    // Always return GET response - in stream-up mode this is the primary download channel
-                    warn!(
-                        "[xhttp][server] returning GET response body to client peer={:?} id={}",
-                        peer_addr, id
-                    );
-                    Ok::<_, Infallible>(Self::stream_response(StatusCode::OK, get_body))
-                } else {
-                    Ok::<_, Infallible>(Self::stream_response(StatusCode::METHOD_NOT_ALLOWED, Self::empty_body()))
-                }
+                Ok::<_, Infallible>(packet::handle(req, packet_sessions, stx, peer_addr, &id).await)
             }
         });
 
         // Support both HTTP/1.1 (behind nginx) and HTTP/2
         // Note: HTTP/1.1 processes requests sequentially per connection
-        if let Err(err) = AutoBuilder::new(TokioExecutor::new())
-            .serve_connection(conn_io, service)
-            .await
-        {
-            error!("[xhttp][server] connection error: {:?}", err);
+        let mut builder = AutoBuilder::new(TokioExecutor::new());
+        builder
+            .http2()
+            .initial_stream_window_size(h2_window)
+            .initial_connection_window_size(h2_window.saturating_mul(HTTP2_INITIAL_CONNECTION_WINDOW_MULTIPLE));
+        if let Err(err) = builder.serve_connection(conn_io, service).await {
+            error!("[xhttp][server] connection error peer={:?}: {:?}", connection_peer, err);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "xhttp/tests.rs"]
+mod regression_tests;
+
+#[cfg(test)]
+#[path = "xhttp/packet_tests.rs"]
+mod packet_tests;
+
+#[cfg(test)]
+#[path = "xhttp/endpoint_tests.rs"]
+mod endpoint_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http2_window_defaults_to_four_mib_and_rejects_out_of_range() {
+        let build = |window: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "network": "xhttp", "xhttpSettings": {"path": "/test"}
+            });
+            if !window.is_null() {
+                value["xhttpSettings"]["http2InitialWindowSize"] = window;
+            }
+            let settings: StreamSettings = serde_json::from_value(value).unwrap();
+            Xhttp::new(&settings, None, Arc::new(DnsResolver))
+        };
+        assert_eq!(build(serde_json::Value::Null).unwrap().h2_window, 4 * 1024 * 1024);
+        assert_eq!(build(serde_json::json!(1_048_576)).unwrap().h2_window, 1_048_576);
+        for invalid in [serde_json::json!(0), serde_json::json!(2_147_483_648u64)] {
+            let error = build(invalid).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+        }
+    }
+
+    #[test]
+    fn outbound_defaults_and_tls_errors() {
+        let mut value = serde_json::json!({
+            "network": "xhttp", "xhttpSettings": {"path": "/test", "mode": "packet-up"}
+        });
+        let server = Address::Domain("example.com".to_string(), 443);
+        let settings: StreamSettings = serde_json::from_value(value.clone()).unwrap();
+        let transport = Xhttp::new(&settings, Some(server.clone()), Arc::new(DnsResolver)).unwrap();
+        assert_eq!(transport.settings.upload.as_ref().unwrap().address, "example.com");
+        assert_eq!(transport.settings.upload, transport.settings.download);
+        value["security"] = serde_json::json!("tls");
+        for tls in [
+            serde_json::Value::Null,
+            serde_json::json!({"alpn": ["http/1.1"]}),
+            serde_json::json!({"cipherSuites": ["invalid"]}),
+        ] {
+            value["tlsSettings"] = tls;
+            let settings = serde_json::from_value(value.clone()).unwrap();
+            assert!(Xhttp::new(&settings, Some(server.clone()), Arc::new(DnsResolver)).is_err());
+        }
+    }
+
+    #[test]
+    fn request_uri_preserves_scheme_virtual_host_port_and_ipv6() {
+        for (security, tls_settings, address, expected) in [
+            ("none", serde_json::Value::Null, "127.0.0.1", "http://127.0.0.1:8443/test/id"),
+            ("none", serde_json::Value::Null, "::1", "http://[::1]:8443/test/id"),
+            (
+                "tls",
+                serde_json::json!({"serverName": "example.com", "alpn": ["h2"]}),
+                "127.0.0.1",
+                "https://127.0.0.1:8443/test/id",
+            ),
+        ] {
+            let settings: StreamSettings = serde_json::from_value(serde_json::json!({
+                "network": "xhttp", "security": security, "tlsSettings": tls_settings,
+                "xhttpSettings": {"path": "/test", "upload": {"address": address, "port": 8443}}
+            }))
+            .unwrap();
+            let transport = Xhttp::new(&settings, None, Arc::new(DnsResolver)).unwrap();
+            if security == "tls" {
+                assert!(transport.tls_client.is_some());
+            }
+            assert_eq!(
+                transport
+                    .request_uri(transport.settings.upload.as_ref(), "/test/id")
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+            assert!(transport.request_uri(None, "/test/id").is_err());
+            assert!(transport
+                .request_uri(transport.settings.upload.as_ref(), "bad path")
+                .is_err());
         }
     }
 }
@@ -776,56 +815,10 @@ impl Xhttp {
 
 use futures::stream::Stream;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum XhttpMode {
-    /// Stream-up mode: POST for upload, GET for download (default, matches spec)
-    StreamUp,
-    /// Stream-one mode: single POST channel for bidirectional stream
-    StreamOne,
-}
-
-impl From<Option<String>> for XhttpMode {
-    fn from(mode: Option<String>) -> Self {
-        match mode.as_deref() {
-            Some("stream-one") => XhttpMode::StreamOne,
-            Some("stream-up") | None => XhttpMode::StreamUp,
-            _ => {
-                warn!(
-                    "[xhttp] unknown mode '{}', defaulting to stream-up",
-                    mode.as_deref().unwrap_or("null")
-                );
-                XhttpMode::StreamUp
-            }
-        }
-    }
-}
-
-// Shared state for tracking stream lifecycle
-struct StreamState {
-    read_closed: AtomicBool,
-    write_closed: AtomicBool,
-}
-
-impl StreamState {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            read_closed: AtomicBool::new(false),
-            write_closed: AtomicBool::new(false),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// XhttpStream: AsyncRead + AsyncWrite
-// ---------------------------------------------------------------------------
-
-// Wrap `Incoming` with an AsyncRead implementation
+// Adapts a hyper response body to the byte stream expected by StreamReader.
 pin_project! {
     struct IncomingStream {
-        #[pin]
         incoming: Incoming,
-        // Track stream state for EOF handling
-        state: Arc<StreamState>,
     }
 }
 
@@ -833,207 +826,62 @@ impl Stream for IncomingStream {
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
+        let this = self.project();
         loop {
-            match this.incoming.as_mut().poll_frame(cx) {
+            match Pin::new(&mut *this.incoming).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if frame.is_data() {
                         let data = frame.into_data().unwrap_or_default();
                         if data.is_empty() {
-                            // HTTP/1.1 chunked encoding may send empty data frames as keepalive
-                            // Continue reading instead of returning empty data
-                            trace!("[xhttp][stream] incoming body received empty data frame, continuing");
+                            // HTTP/1.1 chunked encoding may send empty data frames as keepalive.
                             continue;
                         }
-                        warn!("[xhttp][stream] incoming body received data frame len={}", data.len());
                         return Poll::Ready(Some(Ok(data)));
                     }
-
-                    if frame.is_trailers() {
-                        warn!("[xhttp][stream] incoming body received trailers - stream ending");
-                    } else {
+                    if !frame.is_trailers() {
                         warn!("[xhttp][stream] ignoring unknown frame type from incoming body");
                     }
-                    continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    error!("[xhttp][stream] incoming body frame error: {}", e);
                     return Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))));
                 }
-                Poll::Ready(None) => {
-                    warn!("[xhttp][stream] incoming body EOF - hyper Incoming closed");
-                    this.state.read_closed.store(true, Ordering::Relaxed);
-                    return Poll::Ready(None);
-                }
+                Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
     }
 }
 
-// A full duplex stream that handles both read and write
 pub struct XhttpStream {
-    reader: Pin<Box<StreamReader<IncomingStream, Bytes>>>,
-    /// POST response channel - for stream-one mode or stream-up mode fallback
-    post_tx: Option<PollSender<StdResult<Frame<Bytes>, Infallible>>>,
-    /// GET response channel - for stream-up mode (preferred for download)
-    get_tx: Option<PollSender<StdResult<Frame<Bytes>, Infallible>>>,
-    mode: XhttpMode,
-    /// Shared state for tracking which halves are closed
-    state: Arc<StreamState>,
+    packet: packet::PacketStream,
+    target_leases: Vec<super::balancer::TargetLease>,
 }
 
 impl XhttpStream {
-    /// Create for stream-up mode (POST + GET channels, default mode)
-    pub fn new_stream_up(
-        incoming: Incoming,
-        post_tx: PollSender<StdResult<Frame<Bytes>, Infallible>>,
-        get_tx: PollSender<StdResult<Frame<Bytes>, Infallible>>,
-    ) -> Self {
-        Self::new_with_mode(incoming, post_tx, Some(get_tx), XhttpMode::StreamUp)
-    }
-
-    /// Create for stream-one mode (single POST channel)
-    pub fn new_stream_one(incoming: Incoming, post_tx: PollSender<StdResult<Frame<Bytes>, Infallible>>) -> Self {
-        Self::new_with_mode(incoming, post_tx, None, XhttpMode::StreamOne)
-    }
-
-    /// Create with specified mode
-    pub fn new_with_mode(
-        incoming: Incoming,
-        post_tx: PollSender<StdResult<Frame<Bytes>, Infallible>>,
-        get_tx: Option<PollSender<StdResult<Frame<Bytes>, Infallible>>>,
-        mode: XhttpMode,
-    ) -> Self {
-        let state = StreamState::new();
-
-        let stream_reader = StreamReader::new(IncomingStream {
-            incoming,
-            state: state.clone(),
-        });
+    fn new_packet(packet: packet::PacketStream) -> Self {
         Self {
-            reader: Box::pin(stream_reader),
-            post_tx: Some(post_tx),
-            get_tx,
-            mode,
-            state,
+            packet,
+            target_leases: Vec::new(),
         }
-    }
-}
-
-impl Drop for XhttpStream {
-    fn drop(&mut self) {
-        let write_closed = self.state.write_closed.load(Ordering::Relaxed);
-        let read_closed = self.state.read_closed.load(Ordering::Relaxed);
-
-        warn!(
-            "[xhttp][stream] XhttpStream dropping mode={:?} read_closed={} write_closed={} post_tx_closed={} get_tx_closed={}",
-            self.mode,
-            read_closed,
-            write_closed,
-            self.post_tx.as_ref().map(|t| t.is_closed()).unwrap_or(true),
-            self.get_tx.as_ref().map(|t| t.is_closed()).unwrap_or(true)
-        );
-
-        // Only close all channels when write is explicitly closed (shutdown called)
-        // In Stream-up mode, read EOF (GET body end) should NOT close write channel
-        let should_close_write = write_closed || self.mode == XhttpMode::StreamOne;
-
-        if should_close_write {
-            if let Some(ref mut tx) = self.post_tx {
-                tx.close();
-            }
-            if let Some(ref mut tx) = self.get_tx {
-                tx.close();
-            }
-        }
-        // If only read closed (GET EOF in Stream-up mode), channels remain open until stream drop completes
     }
 }
 
 impl AsyncRead for XhttpStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<IoResult<()>> {
-        self.reader.as_mut().poll_read(cx, buf)
+        Pin::new(&mut self.packet).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for XhttpStream {
-    /// Write strategy:
-    /// - Stream-up mode: prefer GET response channel (its purpose is download)
-    /// - Stream-one mode: use POST response channel
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
-        // Select target channel based on mode and availability
-        let this = self.get_mut();
-        let target_tx: Option<&mut PollSender<StdResult<Frame<Bytes>, Infallible>>> = match this.mode {
-            XhttpMode::StreamUp => {
-                // Stream-up mode: prefer GET response channel (download), fallback to POST
-                if let Some(ref mut tx) = this.get_tx {
-                    Some(tx)
-                } else {
-                    this.post_tx.as_mut()
-                }
-            }
-            XhttpMode::StreamOne => this.post_tx.as_mut(),
-        };
-
-        if let Some(tx) = target_tx {
-            match tx.poll_reserve(cx) {
-                Poll::Ready(Ok(())) => {
-                    let size = buf.len();
-                    let frame = Frame::data(Bytes::copy_from_slice(buf));
-                    if let Err(e) = tx.send_item(Ok(frame)) {
-                        warn!(
-                            "[xhttp][stream] write failed - send_item error: {:?}, mode={:?} has_post={} has_get={}",
-                            e,
-                            this.mode,
-                            this.post_tx.is_some(),
-                            this.get_tx.is_some()
-                        );
-                        return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, format!("Send failed: {:?}", e))));
-                    }
-                    Poll::Ready(Ok(size))
-                }
-                Poll::Ready(Err(e)) => {
-                    warn!(
-                        "[xhttp][stream] write failed - poll_reserve error: {:?}, mode={:?} has_post={} has_get={}",
-                        e,
-                        this.mode,
-                        this.post_tx.is_some(),
-                        this.get_tx.is_some()
-                    );
-                    Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, format!("Reserve failed: {:?}", e))))
-                }
-                Poll::Pending => {
-                    // Channel is full, backpressure applied - no log at trace level to avoid spam
-                    Poll::Pending
-                }
-            }
-        } else {
-            error!(
-                "[xhttp][stream] write failed - no available write channel, mode={:?}",
-                this.mode
-            );
-            Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "No write channel initialized")))
-        }
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
+        Pin::new(&mut self.packet).poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Pin::new(&mut self.packet).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        let this = self.get_mut();
-        // Mark write as closed - this is the signal to close all channels in Drop
-        this.state.write_closed.store(true, Ordering::Relaxed);
-        this.state.read_closed.store(true, Ordering::Relaxed);
-
-        // Close both channels
-        if let Some(ref mut tx) = this.post_tx {
-            tx.close();
-        }
-        if let Some(ref mut tx) = this.get_tx {
-            tx.close();
-        }
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Pin::new(&mut self.packet).poll_shutdown(cx)
     }
 }

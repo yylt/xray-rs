@@ -23,15 +23,13 @@ echo ""
 cd "$(dirname "$0")"
 
 echo "编译测试程序..."
-go build -o test_runner . || exit 1
+RUNNER=$(mktemp /tmp/xray-e2e-runner.XXXXXX)
+[[ "$RUNNER" == /tmp/xray-e2e-runner.* && -f "$RUNNER" ]]
+trap 'rm -f -- "${RUNNER:?}"' EXIT
+go build -o "$RUNNER" . || exit 1
 echo "✓ 测试程序编译成功"
 echo ""
 
 echo "开始运行测试..."
 echo "=========================================="
-./test_runner -v "$@"
-
-EXIT_CODE=$?
-
-rm -f test_runner
-exit $EXIT_CODE
+"$RUNNER" -v "$@"

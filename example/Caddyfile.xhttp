@@ -1,0 +1,8 @@
+# Replace proxy.example.net with a domain pointing to this Caddy server.
+# Caddy terminates TLS; the XHTTP server listens without TLS on 20080.
+proxy.example.net {
+	@xhttp path /test/*
+	reverse_proxy @xhttp h2c://127.0.0.1:20080 {
+		flush_interval -1
+	}
+}
