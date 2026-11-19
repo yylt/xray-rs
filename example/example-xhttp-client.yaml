@@ -8,7 +8,7 @@ inbounds:
 
 outbounds:
   - tag: proxy
-    protocol: xhttp-out
+    protocol: trojan
     settings:
       address: 127.0.0.1
       port: 10443
@@ -18,9 +18,11 @@ outbounds:
       security: none
       xhttpSettings:
         path: /test
+        # mode defaults to packet-up, the only supported mode.
+        # http2InitialWindowSize: 4194304  # HTTP/2 stream window, 4 MiB by default.
         upload:
           address: 127.0.0.1
-          port: 28888
+          port: 20080
         download:
           address: 127.0.0.1
-          port: 28888
+          port: 20080

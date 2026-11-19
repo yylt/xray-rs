@@ -12,6 +12,67 @@
 - 传输：支持 `tcp`、`ws`、`grpc`，并支持 `tls`
 - DNS：内置 `DnsResolver`（独立 DNS 程序 `rsdns` 已迁移至独立仓库）
 
+## XHTTP 直连与 Caddy 反代
+
+直连配置：[server](example/example-xhttp-server.yaml) / [client](example/example-xhttp-client.yaml)。
+客户端在 `127.0.0.1:2080` 提供 HTTP 代理，服务端监听 `127.0.0.1:20080`。
+
+Caddy TLS 入口配置：[Caddyfile](example/Caddyfile.xhttp) / [client](example/example-xhttp-caddy-client.yaml)。
+将两份配置中的 `proxy.example.net` 替换为自己的域名；服务端继续使用上述无 TLS 配置。
+Caddy 终止 TLS 并通过 h2c 转发，保留 `/test/*` 路径（不要使用会剥离前缀的 `handle_path`）。
+客户端上传/下载的显式 `address` 同时用于 DNS、TLS SNI/证书校验与 HTTP 虚拟主机路由，`alpn` 设置为 `[h2]`。
+端点块中省略 `address` 时，先回落到 TLS 的 `serverName`，再回落到 outbound 地址；`port` 仍必填。
+显式 IP 不再被全局 `serverName` 覆盖：使用 IP 证书校验，且不发送域名 SNI。
+仅支持 `packet-up`（默认）；`stream-one` 与 `stream-up` 已移除，旧配置须删除 `mode` 或改为 `packet-up`。
+`packet-up` 使用定长 POST 上传与 GET 下载，适合存在请求缓冲的链路。
+
+XHTTP 出站支持 `xhttpSettings.loadBalancer: least_connection`（默认），
+也可设置 `round_robin` 或 `least_loaded`。域名全部 IPv4/IPv6 参与选址，每个 IP 复用 HTTP/2 连接，
+并发首次连接合并建连；DNS 在新请求时按需刷新，快照间隔 300 秒，无后台轮询。
+整个 upload 省略时，地址先取 TLS `serverName`，否则取 outbound 地址；端口沿用 outbound，不自动猜测 443。
+整个 download 省略时继承已解析的 upload。
+同一入口的 POST/GET 固定同一 IP 并共享连接。
+`xhttpSettings.http2InitialWindowSize` 配置 HTTP/2 单流初始流控窗口（字节，默认 4 MiB，
+有效范围 1..2147483647），客户端与服务端各自生效：客户端该值决定下载方向允许的在途数据量，
+服务端该值约束上传方向；连接级窗口固定取该值的 2 倍。低于或高于请按链路 BDP 调整，
+调大只增内存、不增加延迟。
+如果 Caddy 内部再均衡到多个独立 XHTTP server，必须按会话 UUID 保持 POST/GET 路由一致；
+客户端选中同一 Caddy IP 并不能保证 Caddy 选中同一后端。
+显式分离 upload/download 入口也必须由部署保证二者到达共享会话状态的服务端。
+
+```bash
+make build-xray
+# 分别启动 server、Caddy（使用反代时）和对应 client 后：
+curl --proxy http://127.0.0.1:2080 http://example.com
+curl --proxy http://127.0.0.1:2080 https://example.com
+# E2E 仅验证本地 Caddy TLS 反代：HTTP/1.1/h2c 后端，共 2 项。
+# 需要 Go、caddy；使用本地 HTTP/HTTPS 源站和临时证书，不访问公网。
+./tests/e2e/run_xray_tests.sh -test XHTTP
+```
+
+### 反代与协议
+
+当前 XHTTP 服务端仅接受 HTTP/1.1 与 HTTP/2；HTTP/1.0 请求返回 505，HTTP/3 尚未实现。
+GET 响应头在首次读取时等待，最多 10 秒；因此 connect 成功不代表远端已接受 GET/POST，
+远端 HTTP 拒绝会在后续 IO 暴露，不会自动重放已经发送的业务数据。
+XHTTP E2E 仅保留本地 Caddy 矩阵，不包含 Nginx 或公网访问验证。
+
+### HTTP 层优化约定
+
+`packet-up` 的收益来自“短请求 + 明确长度”，HTTP 层因此不再叠加额外改造：
+
+- 不加 base64：载荷全程走二进制 body，base64 会让体积增加约 1/3。
+- 不启用 gzip/br：隧道内通常是 TLS 等已加密载荷，压不动，只增加 CPU 和流式 flush 延迟；
+  客户端不发送 `Accept-Encoding`，反代侧也不要对 XHTTP 路径开启压缩。
+- 不手动设置 `Transfer-Encoding`/chunked：HTTP/2 用 DATA 帧加 END_STREAM 表达消息体，禁止传输层 chunked；
+  上传 POST 必须带准确的 `Content-Length`（缺失返回 411，长度不符返回 400，超限返回 413）；
+  下载 GET 的响应框架交给 hyper 决定，HTTP/1.1 下由它自行使用 chunked，不要手写。
+- 不加类型/编码头或缩小包长：上传是串行等 ACK 的，吞吐上限约为 `单包大小 ÷ RTT`
+  （64 KiB 单包：RTT 50 ms ≈ 10 Mbps，RTT 200 ms ≈ 2.6 Mbps），每 64 KiB 的头部开销不到 1%，
+  消除该瓶颈只能靠加大在途窗口，而不是调整 HTTP 头。
+- 下载方向没有逐包 ACK，单个长 GET 的吞吐由 HTTP/2 流控窗口与 TCP 决定，是真正承载大流量的通道；
+  窗口由 `http2InitialWindowSize`（默认 4 MiB）控制，高 BDP 链路可继续加大。
+
 ## 快速开始
 
 ### 构建

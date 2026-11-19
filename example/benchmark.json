@@ -1,0 +1,9 @@
+{
+  "xray_rs_bin": "../target/debug/xray-rs",
+  "xray_core_bin": "../../Xray-Core/xray",
+  "target_url": "https://github.com/mmtrt/WINE_AppImage/releases/download/continuous-staging/wine-staging_11.21-x86_64.AppImage",
+  "server": "trojan://...",
+  "rounds": 3,
+  "duration_seconds": 30,
+  "startup_timeout_seconds": 10
+}

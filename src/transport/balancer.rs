@@ -107,13 +107,13 @@ impl Drop for TargetLease {
     }
 }
 
-struct BalancerEntry {
+struct BalancerEntry<C> {
     state: Arc<TargetState>,
-    channel: Option<tonic::transport::Channel>,
+    channel: Option<C>,
     channel_lock: Arc<Mutex<()>>,
 }
 
-impl BalancerEntry {
+impl<C> BalancerEntry<C> {
     fn new() -> Self {
         Self {
             state: Arc::new(TargetState::new()),
@@ -123,12 +123,12 @@ impl BalancerEntry {
     }
 }
 
-struct BalancerPool {
-    targets: HashMap<GrpcTargetKey, BalancerEntry, RandomState>,
+struct BalancerPool<C> {
+    targets: HashMap<GrpcTargetKey, BalancerEntry<C>, RandomState>,
     order: Vec<GrpcTargetKey>,
 }
 
-impl BalancerPool {
+impl<C> BalancerPool<C> {
     fn new() -> Self {
         Self {
             targets: HashMap::with_hasher(RandomState::new()),
@@ -137,13 +137,15 @@ impl BalancerPool {
     }
 }
 
-pub struct GrpcBalancer {
+pub struct Balancer<C> {
     strategy: Strategy,
     counter: AtomicUsize,
-    pool: Arc<RwLock<BalancerPool>>,
+    pool: Arc<RwLock<BalancerPool<C>>>,
 }
 
-impl GrpcBalancer {
+pub type GrpcBalancer = Balancer<tonic::transport::Channel>;
+
+impl<C> Balancer<C> {
     pub fn new(strategy: Strategy) -> Self {
         Self {
             strategy,
@@ -190,7 +192,10 @@ impl GrpcBalancer {
             .map(|entry| entry.channel_lock.clone())
     }
 
-    pub async fn cached_channel(&self, key: &GrpcTargetKey) -> Option<tonic::transport::Channel> {
+    pub async fn cached_channel(&self, key: &GrpcTargetKey) -> Option<C>
+    where
+        C: Clone,
+    {
         self.pool
             .read()
             .await
@@ -199,11 +204,10 @@ impl GrpcBalancer {
             .and_then(|entry| entry.channel.clone())
     }
 
-    pub async fn cache_channel(
-        &self,
-        key: &GrpcTargetKey,
-        channel: tonic::transport::Channel,
-    ) -> Option<tonic::transport::Channel> {
+    pub async fn cache_channel(&self, key: &GrpcTargetKey, channel: C) -> Option<C>
+    where
+        C: Clone,
+    {
         let mut pool = self.pool.write().await;
         let entry = pool.targets.get_mut(key)?;
         entry.channel = Some(channel.clone());
@@ -223,7 +227,7 @@ impl GrpcBalancer {
         self.select_from_pool(&pool, &excluded)
     }
 
-    fn select_from_pool(&self, pool: &BalancerPool, excluded: &HashSet<GrpcTargetKey>) -> Option<SelectedTarget> {
+    fn select_from_pool(&self, pool: &BalancerPool<C>, excluded: &HashSet<GrpcTargetKey>) -> Option<SelectedTarget> {
         match self.strategy {
             Strategy::RoundRobin => self.select_round_robin(pool, excluded),
             Strategy::LeastLoadedP2c => self.select_least_loaded_p2c(pool, excluded),
@@ -244,7 +248,7 @@ impl GrpcBalancer {
         Some((selected, lease))
     }
 
-    fn select_round_robin(&self, pool: &BalancerPool, excluded: &HashSet<GrpcTargetKey>) -> Option<SelectedTarget> {
+    fn select_round_robin(&self, pool: &BalancerPool<C>, excluded: &HashSet<GrpcTargetKey>) -> Option<SelectedTarget> {
         let len = pool.order.len();
         if len == 0 {
             return None;
@@ -268,7 +272,7 @@ impl GrpcBalancer {
 
     fn select_least_loaded_p2c(
         &self,
-        pool: &BalancerPool,
+        pool: &BalancerPool<C>,
         excluded: &HashSet<GrpcTargetKey>,
     ) -> Option<SelectedTarget> {
         let candidates: Vec<_> = pool
@@ -310,7 +314,7 @@ impl GrpcBalancer {
 
     fn select_least_connections(
         &self,
-        pool: &BalancerPool,
+        pool: &BalancerPool<C>,
         excluded: &HashSet<GrpcTargetKey>,
     ) -> Option<SelectedTarget> {
         let candidates = pool.order.iter().filter_map(|key| {
@@ -377,6 +381,23 @@ impl GrpcBalancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn generic_channel_cache_preserves_retained_targets_and_removes_stale_values() {
+        let balancer = Balancer::<String>::new(Strategy::LeastConnections);
+        let key = GrpcTargetKey::Tcp("127.0.0.1:443".parse().unwrap());
+        assert!(balancer.cache_channel(&key, "missing".into()).await.is_none());
+        balancer.sync_targets(vec![key.clone()]).await;
+        assert!(balancer.cached_channel(&key).await.is_none());
+        assert_eq!(balancer.cache_channel(&key, "cached".into()).await.as_deref(), Some("cached"));
+        balancer.sync_targets(vec![key.clone()]).await;
+        assert_eq!(balancer.cached_channel(&key).await.as_deref(), Some("cached"));
+        balancer.remove_cached_channel(&key).await;
+        assert!(balancer.cached_channel(&key).await.is_none());
+        balancer.cache_channel(&key, "replaced".into()).await;
+        balancer.sync_targets(Vec::new()).await;
+        assert!(balancer.cached_channel(&key).await.is_none());
+    }
 
     #[tokio::test]
     async fn channel_locks_are_per_target_and_cancellation_releases_them() {

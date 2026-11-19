@@ -39,6 +39,22 @@ jobs:
           go-version-file: ".xray-core/go.mod"
           cache-dependency-path: ".xray-core/go.sum"
 
+      - name: Install Caddy v2.11.9 for XHTTP reverse proxy tests
+        env:
+          CADDY_VERSION: 2.11.9
+        run: |
+          archive="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          checksums="caddy_${CADDY_VERSION}_checksums.txt"
+          base="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --retry 3 -O "$base/$archive"
+          curl --fail --silent --show-error --location --retry 3 -O "$base/$checksums"
+          awk -v archive="$archive" '$2 == archive { print; found=1 } END { if (!found) exit 1 }' "$checksums" > caddy.sha512
+          sha512sum --check caddy.sha512
+          tar -xzf "$archive" caddy
+          sudo install -m 0755 caddy /usr/local/bin/caddy
+          caddy version
+
       - name: Build Xray-Core
         working-directory: .xray-core
         run: go build -o xray ./main

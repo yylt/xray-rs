@@ -1,0 +1,28 @@
+# Use with example-xhttp-server.yaml and Caddyfile.xhttp.
+# Replace proxy.example.net with your Caddy domain (valid certificate required).
+inbounds:
+  - listen: 127.0.0.1
+    port: 2080
+    protocol: http
+    tag: http-in
+
+outbounds:
+  - tag: proxy
+    protocol: trojan
+    settings:
+      address: proxy.example.net
+      port: 443
+      password: test-password-123
+    streamSettings:
+      network: xhttp
+      security: tls
+      tlsSettings:
+        serverName: proxy.example.net
+        alpn: [h2]
+      xhttpSettings:
+        path: /test
+        # packet-up is the only supported mode and the default.
+        loadBalancer: least_connection
+        # http2InitialWindowSize: 4194304  # HTTP/2 stream window, 4 MiB by default.
+        # upload address defaults to TLS serverName, port to outbound port.
+        # download inherits upload; explicit endpoint address overrides serverName.

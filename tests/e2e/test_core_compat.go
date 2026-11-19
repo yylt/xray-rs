@@ -24,25 +24,8 @@ func testCoreCompatibility(network string, coreServer bool) error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	certFile, keyFile, der, err := writeLocalhostCertificate(dir)
 	if err != nil {
-		return err
-	}
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
-		DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Hour),
-		NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		return err
-	}
-	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
-		return err
-	}
-	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0600); err != nil {
 		return err
 	}
 	fingerprint := sha256.Sum256(der)
@@ -105,12 +88,8 @@ func testCoreCompatibility(network string, coreServer bool) error {
 		{"server", serverBinary, serverConfig, []int{serverPort}},
 		{"client", clientBinary, clientConfig, []int{httpPort, socksPort}},
 	} {
-		data, err := json.MarshalIndent(endpoint.config, "", "  ")
+		path, err := writeJSONConfig(dir, endpoint.name, endpoint.config)
 		if err != nil {
-			return err
-		}
-		path := filepath.Join(dir, endpoint.name+".json")
-		if err := os.WriteFile(path, data, 0600); err != nil {
 			return err
 		}
 		process, err := startBinary(context.Background(), endpoint.binary, path)
@@ -128,4 +107,41 @@ func testCoreCompatibility(network string, coreServer bool) error {
 		return err
 	}
 	return testSOCKS5Proxy(socksPort)
+}
+
+func writeLocalhostCertificate(dir string) (certFile, keyFile string, der []byte, err error) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", "", nil, err
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
+		DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Hour),
+		NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err = x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return "", "", nil, err
+	}
+	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
+		return "", "", nil, err
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0600); err != nil {
+		return "", "", nil, err
+	}
+	return certFile, keyFile, der, nil
+}
+
+func writeJSONConfig(dir, name string, config map[string]any) (string, error) {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, name+".json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return "", err
+	}
+	return path, nil
 }

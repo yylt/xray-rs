@@ -217,7 +217,36 @@ pub mod client {
             connector: tlsconnect,
         })
     }
+    pub fn new_http2(value: &TlsSettings) -> Result<Tls> {
+        if value
+            .alpn_protocols
+            .as_ref()
+            .is_some_and(|protocols| !protocols.iter().any(|p| p == "h2"))
+        {
+            return Err(Error::new(ErrorKind::InvalidInput, "HTTP/2 transport requires h2 ALPN"));
+        }
+        let mut config = create_client_config(value)?;
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        Ok(Tls {
+            connector: TlsConnector::from(Arc::new(config)),
+            server_name: value.server_name.clone(),
+        })
+    }
+
     impl Tls {
+        pub async fn connect_http2<IO>(&self, endpoint_name: &str, stream: IO) -> Result<ClientTlsStream<IO>>
+        where
+            IO: AsyncRead + AsyncWrite + Unpin,
+        {
+            let name = endpoint_name.to_string();
+            let name = pki_types::ServerName::try_from(name).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+            let stream = self.connector.connect(name, stream).await?;
+            if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
+                return Err(Error::new(ErrorKind::InvalidData, "server did not negotiate h2"));
+            }
+            Ok(stream)
+        }
+
         /// The configured TLS serverName (SNI), if any.
         pub fn server_name(&self) -> Option<&str> {
             self.server_name.as_deref()
@@ -270,6 +299,44 @@ pub mod server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http2_client_uses_endpoint_sni_and_requires_h2() {
+        crate::common::tls::install_crypto_provider();
+        let settings = TlsSettings {
+            server_name: Some("global.invalid".into()),
+            alpn_protocols: None,
+            allow_insecure: Some(true),
+            cipher_suites: None,
+            certificates: None,
+        };
+        let client = client::new_http2(&settings).unwrap();
+        for endpoint_name in ["sf.example.com", "sf.foo.com"] {
+            for protocol in ["h2", "http/1.1"] {
+                let server = server::new(&TlsSettings {
+                    alpn_protocols: Some(vec![protocol.into()]),
+                    ..settings.clone()
+                })
+                .unwrap();
+                let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+                let (connected, accepted) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(client.connect_http2(endpoint_name, client_io), server.accept(server_io))
+                })
+                .await
+                .expect("TLS handshake timed out");
+                if protocol == "h2" {
+                    let connected = connected.unwrap();
+                    let accepted = accepted.unwrap();
+                    assert_eq!(connected.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+                    assert_eq!(accepted.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+                    assert_eq!(accepted.get_ref().1.server_name(), Some(endpoint_name));
+                } else {
+                    assert!(connected.is_err(), "HTTP/1.1-only server must not be accepted");
+                    assert!(accepted.is_err());
+                }
+            }
+        }
+    }
 
     #[test]
     fn server_config_builds_with_no_certificates() {

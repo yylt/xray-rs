@@ -1,0 +1,21 @@
+# No authentication: keep this listener private or use an access-controlled proxy.
+inbounds:
+  - tag: metrics
+    listen: 127.0.0.1
+    port: 8080
+    protocol: api
+    settings:
+      retention: 24h # Positive integer + s/m/h/d, maximum 3d; default 24h.
+  - tag: socks-in
+    listen: 127.0.0.1
+    port: 1080
+    protocol: socks
+outbounds:
+  - tag: direct
+    protocol: freedom
+
+# GET http://127.0.0.1:8080/                HTML traffic and RSS charts
+# GET http://127.0.0.1:8080/metrics         Prometheus metrics
+# GET http://127.0.0.1:8080/metrics/history?range=1h
+# History is sampled every 5s in memory; restarting clears it.
+# Inbound/outbound counters are separate views of the same forwarded payload.
