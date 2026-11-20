@@ -1,5 +1,6 @@
 use super::super::balancer::{GrpcTargetKey, TargetState};
 use super::*;
+use http_body_util::BodyExt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

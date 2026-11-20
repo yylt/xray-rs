@@ -1,4 +1,9 @@
 use super::*;
+use futures::Stream;
+use http_body_util::BodyExt;
+use hyper::client::conn::http2::SendRequest;
+use log::warn;
+use pin_project_lite::pin_project;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Server {
@@ -470,5 +475,42 @@ async fn packet_http1_finite_upload_long_download_and_interactive_messages() {
         })
         .await
         .unwrap_or_else(|_| panic!("{version:?} packet exchange hung"));
+    }
+}
+
+// Adapts a hyper response body to the byte stream expected by StreamReader.
+pin_project! {
+    struct IncomingStream {
+        incoming: Incoming,
+    }
+}
+
+impl Stream for IncomingStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        loop {
+            match Pin::new(&mut *this.incoming).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if frame.is_data() {
+                        let data = frame.into_data().unwrap_or_default();
+                        if data.is_empty() {
+                            // HTTP/1.1 chunked encoding may send empty data frames as keepalive.
+                            continue;
+                        }
+                        return Poll::Ready(Some(Ok(data)));
+                    }
+                    if !frame.is_trailers() {
+                        warn!("[xhttp][stream] ignoring unknown frame type from incoming body");
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }

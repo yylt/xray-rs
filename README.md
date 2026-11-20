@@ -31,7 +31,11 @@ XHTTP 出站支持 `xhttpSettings.loadBalancer: least_connection`（默认），
 并发首次连接合并建连；DNS 在新请求时按需刷新，快照间隔 300 秒，无后台轮询。
 整个 upload 省略时，地址先取 TLS `serverName`，否则取 outbound 地址；端口沿用 outbound，不自动猜测 443。
 整个 download 省略时继承已解析的 upload。
-同一入口的 POST/GET 固定同一 IP 并共享连接。
+同一入口的 POST/GET 固定同一 IP，共用该 IP 的连接池。每次 GET/POST 根据对端
+`SETTINGS_MAX_CONCURRENT_STREAMS` 选择有容量的连接；已有连接全部满载时，向选定 IP
+新建连接，不在已知满载的连接上排队。无须配置本地并发上限，空闲连接暂不回收。
+首次连接等待协议初始化（含 SETTINGS），对端宣告零容量时返回错误，避免反复扩建连接。
+对端动态降低上限时，已接纳但尚未发出的请求仍可能由 HTTP/2 协议层暂缓；新请求使用更新后的上限。
 `xhttpSettings.http2InitialWindowSize` 配置 HTTP/2 单流初始流控窗口（字节，默认 4 MiB，
 有效范围 1..2147483647），客户端与服务端各自生效：客户端该值决定下载方向允许的在途数据量，
 服务端该值约束上传方向；连接级窗口固定取该值的 2 倍。低于或高于请按链路 BDP 调整，

@@ -44,6 +44,7 @@ socket2 = { version = "0.6", default-features = false }
 hyper-util = { version = "0.1", default-features = false, features = ["http1", "http2", "server-auto", "client-legacy", "tokio"] }
 http-body-util = { version = "0.1", default-features = false }
 http = { version = "1.4", default-features = false }
+h2 = { version = "0.4.20", default-features = false }
 hyper = { version = "1.12", default-features = false, features = ["server", "http1"] }
 tonic = { version = "0.14.6", default-features = false, features = ["gzip", "channel", "server", "codegen"] }
 tonic-prost = { version = "0.14", default-features = false }

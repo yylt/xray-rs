@@ -1,3 +1,4 @@
+mod client;
 mod packet;
 use crate::common::{Address, BoxStream, Protocol};
 use crate::route::DnsResolver;
@@ -6,9 +7,7 @@ use crate::transport::tls;
 
 use bytes::Bytes;
 use http::{header, Request, Response, StatusCode};
-use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming};
-use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
@@ -21,16 +20,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
 
-use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use log::{debug, error, warn};
+use log::{debug, error};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -120,9 +117,9 @@ pub struct Xhttp {
     packet_sessions: packet::PacketSessions,
 }
 
-type DownloadResponse = Pin<Box<dyn Future<Output = IoResult<Incoming>> + Send + Sync>>;
+type DownloadResponse = Pin<Box<dyn Future<Output = IoResult<client::ClientBody>> + Send + Sync>>;
 
-type ClientBalancer = super::balancer::Balancer<SendRequest<ChannelBody>>;
+type ClientBalancer = super::balancer::Balancer<Arc<client::ClientTarget>>;
 
 struct ClientPool {
     balancer: ClientBalancer,
@@ -313,63 +310,15 @@ impl Xhttp {
         &self.dns
     }
 
-    // Perform HTTP/2 handshake and spawn connection task (shared helper)
-    async fn http2_handshake<B>(&self, stream: TcpStream, name: &str) -> IoResult<SendRequest<B>>
-    where
-        B: Body + Unpin + Send + 'static,
-        B::Data: Send,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let request_sender = if let Some(tls) = &self.tls_client {
-            let tls_stream = tls.connect_http2(name, stream).await?;
-            let (request_sender, connection) = self
-                .h2_client_builder()
-                .handshake(TokioIo::new(tls_stream))
-                .await
-                .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e.to_string()))?;
-
-            let name = name.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("Error in {} HTTP/2 TLS connection: {:?}", name, e);
-                }
-            });
-            request_sender
-        } else {
-            let (request_sender, connection) = self
-                .h2_client_builder()
-                .handshake(TokioIo::new(stream))
-                .await
-                .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e.to_string()))?;
-
-            let name = name.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("Error in {} HTTP/2 connection: {:?}", name, e);
-                }
-            });
-            request_sender
-        };
-        Ok(request_sender)
-    }
-
-    fn h2_client_builder(&self) -> hyper::client::conn::http2::Builder<TokioExecutor> {
-        let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
-        builder
-            .initial_stream_window_size(self.h2_window)
-            .initial_connection_window_size(self.h2_window.saturating_mul(HTTP2_INITIAL_CONNECTION_WINDOW_MULTIPLE));
-        builder
-    }
-
     async fn get_client(
         &self,
         pool: &ClientPool,
         key: &super::balancer::GrpcTargetKey,
         config: &ServerConfig,
-    ) -> IoResult<SendRequest<ChannelBody>> {
-        if let Some(sender) = pool.balancer.cached_channel(key).await {
-            if !sender.is_closed() {
-                return Ok(sender);
+    ) -> IoResult<Arc<client::ClientTarget>> {
+        if let Some(target) = pool.balancer.cached_channel(key).await {
+            if !target.is_closed() {
+                return Ok(target);
             }
         }
         let lock = pool
@@ -378,23 +327,27 @@ impl Xhttp {
             .await
             .ok_or_else(|| Error::new(ErrorKind::NotConnected, "XHTTP target removed"))?;
         let _guard = lock.lock().await;
-        if let Some(sender) = pool.balancer.cached_channel(key).await {
-            if !sender.is_closed() {
-                return Ok(sender);
+        if let Some(target) = pool.balancer.cached_channel(key).await {
+            if !target.is_closed() {
+                return Ok(target);
             }
         }
-        pool.balancer.remove_cached_channel(key).await;
         let addr = match key {
-            super::balancer::GrpcTargetKey::Tcp(addr) => addr,
+            super::balancer::GrpcTargetKey::Tcp(addr) => *addr,
             #[cfg(unix)]
             super::balancer::GrpcTargetKey::Unix(_) => {
-                return Err(Error::new(ErrorKind::Unsupported, "XHTTP client requires TCP"))
+                return Err(Error::new(ErrorKind::Unsupported, "XHTTP client requires TCP"));
             }
         };
-        let stream = self.opt.apply_tcpstream(TcpStream::connect(addr).await?)?;
-        let sender = self.http2_handshake(stream, &config.address).await?;
+        let target = Arc::new(client::ClientTarget::new(
+            addr,
+            config.address.clone(),
+            self.opt.clone(),
+            self.tls_client.clone(),
+            self.h2_window,
+        ));
         pool.balancer
-            .cache_channel(key, sender)
+            .cache_channel(key, target)
             .await
             .ok_or_else(|| Error::new(ErrorKind::NotConnected, "XHTTP target removed"))
     }
@@ -449,6 +402,7 @@ impl Xhttp {
         let path = format!("{}/{}", self.settings.path, uuid);
         let config = self.settings.upload.as_ref().unwrap();
         let sender = self.get_client(&self.upload_pool, key, config).await?;
+        sender.connect().await?;
         let mut leases = Vec::new();
         let incoming = if self.settings.upload == self.settings.download {
             self.establish_get(&path, &self.upload_pool, key).await?
@@ -487,8 +441,7 @@ impl Xhttp {
         key: &super::balancer::GrpcTargetKey,
     ) -> IoResult<DownloadResponse> {
         let config = self.settings.download.as_ref().unwrap();
-        let mut get_client = self.get_client(pool, key, config).await?;
-        get_client.ready().await.map_err(Error::other)?;
+        let get_client = self.get_client(pool, key, config).await?;
         let download_address = self
             .settings
             .download
@@ -501,10 +454,10 @@ impl Xhttp {
             .method("GET")
             .uri(self.request_uri(self.settings.download.as_ref(), path)?)
             .header("User-Agent", "xray-rs/v0.1.0")
-            .body(Self::empty_body())
+            .body(Bytes::new())
             .unwrap();
 
-        let response = get_client.send_request(get_req);
+        let response = get_client.send(get_req).await?;
         Ok(Box::pin(async move {
             let response = tokio::time::timeout(Duration::from_secs(10), response)
                 .await
@@ -710,6 +663,48 @@ impl Xhttp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// XhttpStream: AsyncRead + AsyncWrite
+// ---------------------------------------------------------------------------
+
+pub struct XhttpStream {
+    packet: packet::PacketStream,
+    target_leases: Vec<super::balancer::TargetLease>,
+}
+
+impl XhttpStream {
+    fn new_packet(packet: packet::PacketStream) -> Self {
+        Self {
+            packet,
+            target_leases: Vec::new(),
+        }
+    }
+}
+
+impl AsyncRead for XhttpStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<IoResult<()>> {
+        Pin::new(&mut self.packet).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for XhttpStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
+        Pin::new(&mut self.packet).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Pin::new(&mut self.packet).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        Pin::new(&mut self.packet).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+#[path = "xhttp/capacity_tests.rs"]
+mod capacity_tests;
+
 #[cfg(test)]
 #[path = "xhttp/tests.rs"]
 mod regression_tests;
@@ -801,82 +796,5 @@ mod tests {
                 .request_uri(transport.settings.upload.as_ref(), "bad path")
                 .is_err());
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// XhttpStream: AsyncRead + AsyncWrite
-// ---------------------------------------------------------------------------
-
-use futures::stream::Stream;
-
-// Adapts a hyper response body to the byte stream expected by StreamReader.
-pin_project! {
-    struct IncomingStream {
-        incoming: Incoming,
-    }
-}
-
-impl Stream for IncomingStream {
-    type Item = std::io::Result<Bytes>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        loop {
-            match Pin::new(&mut *this.incoming).poll_frame(cx) {
-                Poll::Ready(Some(Ok(frame))) => {
-                    if frame.is_data() {
-                        let data = frame.into_data().unwrap_or_default();
-                        if data.is_empty() {
-                            // HTTP/1.1 chunked encoding may send empty data frames as keepalive.
-                            continue;
-                        }
-                        return Poll::Ready(Some(Ok(data)));
-                    }
-                    if !frame.is_trailers() {
-                        warn!("[xhttp][stream] ignoring unknown frame type from incoming body");
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))));
-                }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-pub struct XhttpStream {
-    packet: packet::PacketStream,
-    target_leases: Vec<super::balancer::TargetLease>,
-}
-
-impl XhttpStream {
-    fn new_packet(packet: packet::PacketStream) -> Self {
-        Self {
-            packet,
-            target_leases: Vec::new(),
-        }
-    }
-}
-
-impl AsyncRead for XhttpStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<IoResult<()>> {
-        Pin::new(&mut self.packet).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for XhttpStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
-        Pin::new(&mut self.packet).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        Pin::new(&mut self.packet).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        Pin::new(&mut self.packet).poll_shutdown(cx)
     }
 }

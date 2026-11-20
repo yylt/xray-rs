@@ -1,6 +1,8 @@
 //! Basic body/path packet-up: finite uploads and a long-lived download.
 use super::*;
 use bytes::BytesMut;
+use futures::StreamExt;
+use http_body_util::BodyExt;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex as StdMutex;
@@ -347,7 +349,7 @@ impl Drop for PacketStream {
 }
 
 pub(super) async fn connect(
-    mut sender: SendRequest<ChannelBody>,
+    sender: Arc<client::ClientTarget>,
     get_response: DownloadResponse,
     uri: http::Uri,
 ) -> IoResult<XhttpStream> {
@@ -366,31 +368,25 @@ pub(super) async fn connect(
                         .map_err(Error::other)?,
                 );
                 let packet_uri = http::Uri::from_parts(parts).map_err(Error::other)?;
-                let (body_tx, body_rx) = mpsc::channel(1);
                 let len = data.len();
-                body_tx.try_send(Ok(Frame::data(data))).map_err(Error::other)?;
-                drop(body_tx);
                 let request = Request::builder()
                     .method("POST")
                     .uri(packet_uri)
                     .header(header::CONTENT_LENGTH, len)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .body(ChannelBody { rx: body_rx })
+                    .body(data)
                     .map_err(Error::other)?;
                 let exchange = async {
-                    sender.ready().await.map_err(Error::other)?;
-                    let response = sender.send_request(request).await.map_err(Error::other)?;
+                    let response = sender.send(request).await?.await?;
                     if response.status() != StatusCode::OK {
                         return Err(Error::other(format!("packet upload failed: {}", response.status())));
                     }
                     let mut body = response.into_body();
                     let mut received = 0usize;
-                    while let Some(frame) = body.frame().await {
-                        if let Ok(data) = frame.map_err(Error::other)?.into_data() {
-                            received = received.saturating_add(data.len());
-                            if received > MAX_PACKET_SIZE {
-                                return Err(Error::other("packet ACK body too large"));
-                            }
+                    while let Some(data) = body.next().await {
+                        received = received.saturating_add(data?.len());
+                        if received > MAX_PACKET_SIZE {
+                            return Err(Error::other("packet ACK body too large"));
                         }
                     }
                     Ok::<(), Error>(())
@@ -415,7 +411,7 @@ pub(super) async fn connect(
     let download_task = tokio::spawn(async move {
         let work = async {
             let incoming = get_response.await?;
-            let mut reader = StreamReader::new(IncomingStream { incoming });
+            let mut reader = StreamReader::new(incoming);
             tokio::io::copy(&mut reader, &mut download).await?;
             Ok::<(), Error>(())
         };
