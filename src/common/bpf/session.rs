@@ -159,7 +159,7 @@ impl Session<'_> {
                 .map_err(map_error)?;
             for (key, stream) in self.keys.into_iter().zip(streams) {
                 targets
-                    .insert(key, stream.as_raw_fd(), BPF_NOEXIST)
+                    .insert(&key, stream.as_raw_fd(), BPF_NOEXIST)
                     .map_err(map_error)?;
             }
         }
@@ -167,10 +167,10 @@ impl Session<'_> {
             let mut peers = HashMap::<_, u64, u64>::try_from(ebpf.map_mut("peers").ok_or_else(|| map("peers"))?)
                 .map_err(map_error)?;
             peers
-                .insert(self.keys[0], self.keys[1], BPF_NOEXIST)
+                .insert(&self.keys[0], &self.keys[1], BPF_NOEXIST)
                 .map_err(map_error)?;
             peers
-                .insert(self.keys[1], self.keys[0], BPF_NOEXIST)
+                .insert(&self.keys[1], &self.keys[0], BPF_NOEXIST)
                 .map_err(map_error)?;
         }
         {
@@ -178,7 +178,7 @@ impl Session<'_> {
                 HashMap::<_, u64, [u64; 2]>::try_from(ebpf.map_mut("counters").ok_or_else(|| map("counters"))?)
                     .map_err(map_error)?;
             for key in self.keys {
-                counters.insert(key, [0, 0], BPF_NOEXIST).map_err(map_error)?;
+                counters.insert(&key, &[0, 0], BPF_NOEXIST).map_err(map_error)?;
             }
         }
         Ok(())
@@ -203,7 +203,7 @@ impl Session<'_> {
                 Err(error) => return Registration::Unarmed(error),
             };
             for (key, stream) in self.keys.into_iter().zip(streams) {
-                if let Err(error) = sources.insert(key, stream.as_raw_fd(), BPF_NOEXIST) {
+                if let Err(error) = sources.insert(&key, stream.as_raw_fd(), BPF_NOEXIST) {
                     let error = map_error(error);
                     return if armed {
                         Registration::PartiallyArmed(error)
@@ -625,7 +625,7 @@ mod tests {
             {
                 let mut ebpf = relay.ebpf.lock().unwrap();
                 let mut targets = SockHash::<_, u64>::try_from(ebpf.map_mut("targets").unwrap()).unwrap();
-                targets.insert(cookie(&local).unwrap(), local.as_raw_fd(), 0).unwrap();
+                targets.insert(&cookie(&local).unwrap(), local.as_raw_fd(), 0).unwrap();
             }
             let (counters, stats) = traffic_counters();
             let outcome = relay
@@ -675,7 +675,9 @@ mod tests {
             {
                 let mut ebpf = relay.ebpf.lock().unwrap();
                 let mut sockets = SockHash::<_, u64>::try_from(ebpf.map_mut("sockets").unwrap()).unwrap();
-                sockets.insert(cookie(&remote).unwrap(), remote.as_raw_fd(), 0).unwrap();
+                sockets
+                    .insert(&cookie(&remote).unwrap(), remote.as_raw_fd(), 0)
+                    .unwrap();
             }
             let error = relay.clone().forward(local, remote).await.unwrap_err();
             assert!(error.to_string().contains("BPF relay map"), "{error}");
@@ -702,15 +704,15 @@ mod tests {
         {
             let mut ebpf = relay.ebpf.lock().unwrap();
             let mut map = HashMap::<_, u64, [u64; 2]>::try_from(ebpf.map_mut("counters").unwrap()).unwrap();
-            map.insert(11, [7, 1], 0).unwrap();
-            map.insert(12, [3, 0], 0).unwrap();
+            map.insert(&11, &[7, 1], 0).unwrap();
+            map.insert(&12, &[3, 0], 0).unwrap();
         }
         assert!(session.admitted(11).is_err());
         assert_eq!((stats.uplink(), stats.downlink()), (7, 0));
         {
             let mut ebpf = relay.ebpf.lock().unwrap();
             let mut map = HashMap::<_, u64, [u64; 2]>::try_from(ebpf.map_mut("counters").unwrap()).unwrap();
-            map.insert(11, [9, 1], 0).unwrap();
+            map.insert(&11, &[9, 1], 0).unwrap();
         }
         drop(session);
         assert_eq!((stats.uplink(), stats.downlink()), (9, 3));

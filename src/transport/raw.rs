@@ -1,8 +1,8 @@
 use super::*;
 use log::warn;
-use tokio::net::{TcpStream, UdpSocket};
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 pub struct Raw {
     opt: sockopt::SocketOpt,
@@ -177,15 +177,9 @@ impl Raw {
 
     // Unix 监听辅助方法
     #[cfg(unix)]
-    async fn listen_unix(&self, path: &std::path::PathBuf) -> Result<BoxStream<(TrStream, Address), std::io::Error>> {
-        // 清理已存在的 socket 文件
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-
-        let listener = UnixListener::bind(path)?;
+    async fn listen_unix(&self, path: &std::path::Path) -> Result<BoxStream<(TrStream, Address), std::io::Error>> {
+        let (listener, path) = super::bind_unix_listener(path)?;
         let opt = self.opt.clone();
-        let path = path.clone();
 
         let stream = async_stream::stream! {
             loop {
