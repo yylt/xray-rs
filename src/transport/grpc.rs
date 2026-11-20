@@ -628,19 +628,13 @@ impl Grpc {
     #[cfg(unix)]
     async fn listen_unix(
         &self,
-        path: &std::path::PathBuf,
+        path: &std::path::Path,
     ) -> IoResult<crate::common::BoxStream<(super::TrStream, Address), std::io::Error>> {
-        use tokio::net::UnixListener;
-
         if self.tls_server.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput, "gRPC Unix listen does not support TLS"));
         }
 
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-
-        let listener = UnixListener::bind(path)?;
+        let (listener, path) = super::bind_unix_listener(path)?;
         log::info!("gRPC Unix listener bound successfully to {:?}", path);
 
         let sockopt = self.sockopt.clone();

@@ -22,8 +22,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-#[cfg(unix)]
-use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
@@ -622,15 +620,12 @@ impl Xhttp {
     #[cfg(unix)]
     async fn listen_unix(
         &self,
-        path: &std::path::PathBuf,
+        path: &std::path::Path,
     ) -> IoResult<BoxStream<(super::TrStream, Address), std::io::Error>> {
         if self.tls_server.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput, "xhttp Unix listen does not support TLS"));
         }
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        let listener = UnixListener::bind(path)?;
+        let (listener, path) = super::bind_unix_listener(path)?;
         let (stream_tx, stream_rx) = mpsc::channel(DEFAULT_CHANNEL_SERVER_CAPACITY);
         let packet_sessions = self.packet_sessions.clone();
         let stx = stream_tx.clone();

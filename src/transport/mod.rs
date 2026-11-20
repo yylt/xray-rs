@@ -28,6 +28,76 @@ pub(crate) fn unix_socket_supported() -> bool {
     cfg!(unix)
 }
 
+/// Bind a UDS listen path with an optional comma-separated octal mode.
+#[cfg(unix)]
+fn parse_unix_listener_path(path: &std::path::Path) -> io::Result<(std::path::PathBuf, u32)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    let Some(index) = bytes.iter().rposition(|byte| *byte == b',') else {
+        return Ok((path.to_path_buf(), 0o666));
+    };
+    let mode = std::str::from_utf8(&bytes[index + 1..])
+        .ok()
+        .filter(|mode| !mode.is_empty() && mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')))
+        .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+        .filter(|mode| *mode <= 0o777)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDS permissions must be octal between 0000 and 0777",
+            )
+        })?;
+    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..index]));
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDS listen path must not be empty"));
+    }
+    Ok((path, mode))
+}
+
+#[cfg(unix)]
+fn bind_unix_listener(path: &std::path::Path) -> io::Result<(tokio::net::UnixListener, std::path::PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (path, mode) = parse_unix_listener_path(path)?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+    Ok((listener, path))
+}
+
+#[cfg(all(test, unix))]
+mod unix_listener_tests {
+    use super::parse_unix_listener_path;
+    use std::path::Path;
+
+    #[test]
+    fn parses_default_and_explicit_modes() {
+        assert_eq!(
+            parse_unix_listener_path(Path::new("/tmp/proxy.sock")).unwrap(),
+            ("/tmp/proxy.sock".into(), 0o666)
+        );
+        assert_eq!(
+            parse_unix_listener_path(Path::new("/tmp/proxy.sock,0660")).unwrap(),
+            ("/tmp/proxy.sock".into(), 0o660)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_modes_and_empty_paths() {
+        for path in [
+            "/tmp/proxy.sock,",
+            "/tmp/proxy.sock,888",
+            "/tmp/proxy.sock,1000",
+            ",0660",
+        ] {
+            assert!(parse_unix_listener_path(Path::new(path)).is_err(), "{path}");
+        }
+    }
+}
+
 const DEFAULT_CHANNEL_CLIENT_CAPACITY: usize = 128;
 const DEFAULT_CHANNEL_SERVER_CAPACITY: usize = 256;
 
