@@ -102,8 +102,12 @@ impl OutboundSettings {
                     None,
                     dns.clone(),
                 )?;
-                let bpf_enabled =
-                    matches!(&self.settings, Some(proxy::OutboundSettings::Freedom(settings)) if settings.bpf);
+                let defaults = proxy::FreedomSettings::default();
+                let settings = match &self.settings {
+                    Some(proxy::OutboundSettings::Freedom(settings)) => settings,
+                    _ => &defaults,
+                };
+                let bpf_enabled = settings.bpf;
                 #[cfg(target_os = "linux")]
                 let bpf = if bpf_enabled {
                     Some(crate::common::bpf::BpfRelay::shared()?)
@@ -120,6 +124,8 @@ impl OutboundSettings {
                 ConnectionSink::Direct(DirectSink {
                     dns,
                     transport: tr,
+                    prefer: settings.prefer,
+                    connect_timeout: std::time::Duration::from_millis(settings.connect_timeout_ms.get()),
                     #[cfg(target_os = "linux")]
                     bpf,
                 })

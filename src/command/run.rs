@@ -354,7 +354,7 @@ async fn start_inbounds(
 
 /// 处理单个代理连接流
 async fn handle_proxy_stream(
-    proxy_stream: crate::proxy::ProxyStream,
+    mut proxy_stream: crate::proxy::ProxyStream,
     sinks: Arc<HashMap<String, Arc<ConnectionSink>>>,
     router: Arc<tokio::sync::RwLock<Router>>,
     stats: stats::SharedStats,
@@ -372,7 +372,8 @@ async fn handle_proxy_stream(
             result.primary_tag
         );
 
-        let dst = &proxy_stream.metadata.dst;
+        let dst = proxy_stream.metadata.dst.clone();
+        let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no usable outbound");
 
         let tags_to_try = std::iter::once(&result.primary_tag).chain(result.fallback_tags.iter());
 
@@ -381,33 +382,52 @@ async fn handle_proxy_stream(
                 match sink.as_ref() {
                     app::ConnectionSink::Proxy(proxy_sink) => {
                         match proxy_sink
-                            .try_connect(dst, proxy_stream.metadata.protocol.clone())
+                            .try_connect(&dst, proxy_stream.metadata.protocol.clone())
                             .await
                         {
                             Ok(connected) => {
+                                if let Err(error) = proxy_stream.confirm_connected().await {
+                                    log::warn!("CONNECT response to {} failed: {error}", proxy_stream.metadata.src);
+                                    return;
+                                }
                                 let counters = stats.read().await.counters(&proxy_stream.metadata.inbound_tag, tag);
-                                let _ = forwarder
+                                if let Err(error) = forwarder
                                     .forward_with_counters(proxy_stream.inner, connected, counters)
-                                    .await;
+                                    .await
+                                {
+                                    log::warn!("forward to {dst} via {tag} failed: {error}");
+                                }
                                 return;
                             }
-                            Err(_e) => {
+                            Err(error) => {
+                                log::warn!("connect to {dst} via {tag} failed: {error}");
+                                last_error = error;
                                 continue;
                             }
                         }
                     }
                     _ => {
                         let counters = stats.read().await.counters(&proxy_stream.metadata.inbound_tag, tag);
-                        let _ = sink
+                        if let Err(error) = sink
                             .handle_with_counters(proxy_stream, forwarder.as_ref(), counters)
-                            .await;
+                            .await
+                        {
+                            log::warn!("outbound {tag} to {dst} failed: {error}");
+                        }
                         return;
                     }
                 }
             }
         }
+        if let Err(error) = proxy_stream.reject_connection(&last_error).await {
+            log::debug!("failed to send CONNECT rejection: {error}");
+        }
     } else {
         log::error!("[Routing] No route found");
+        let error = io::Error::new(io::ErrorKind::NotFound, "no route found");
+        if let Err(error) = proxy_stream.reject_connection(&error).await {
+            log::debug!("failed to send CONNECT rejection: {error}");
+        }
     }
 }
 
@@ -447,6 +467,143 @@ mod tests {
     }
 
     use super::*;
+    use crate::{
+        common::{socks::Socks5Processor, Address, Protocol},
+        proxy::ProxyStream,
+        transport::TrStream,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        time::{timeout, Duration},
+    };
+
+    fn socks_sink(listener: &TcpListener) -> Arc<ConnectionSink> {
+        let address = listener.local_addr().unwrap();
+        let settings: app::OutboundSettings = serde_json::from_value(serde_json::json!({
+            "protocol": "socks",
+            "settings": {"address": address.ip().to_string(), "port": address.port()}
+        }))
+        .unwrap();
+        let sink = settings.build_sink(Arc::new(DnsResolver)).unwrap();
+        assert!(matches!(sink, ConnectionSink::Proxy(_)));
+        Arc::new(sink)
+    }
+
+    async fn socks_reply(listener: TcpListener, success: bool) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let processor = Socks5Processor::new(None);
+        processor.handshake(&mut stream).await.unwrap();
+        let (_, dst) = processor.get_request(&mut stream).await.unwrap();
+        let reply = if success {
+            crate::common::socks::Reply::Succeeded
+        } else {
+            crate::common::socks::Reply::ConnectionRefused
+        };
+        processor.send_reply(&mut stream, reply, &dst).await.unwrap();
+        if success {
+            let mut payload = [0; 4];
+            stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    }
+
+    async fn pending_connect_response(
+        router: Router,
+        sinks: HashMap<String, Arc<ConnectionSink>>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (inbound, peer) = listener.accept().await.unwrap();
+        let stream = ProxyStream::new(
+            Protocol::Tcp,
+            Address::Inet(peer),
+            Address::Inet("127.0.0.1:443".parse().unwrap()),
+            TrStream::Tcp(inbound),
+        )
+        .with_connect_response();
+        client.write_all(payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        let ((), read) = tokio::join!(
+            handle_proxy_stream(
+                stream,
+                Arc::new(sinks),
+                Arc::new(tokio::sync::RwLock::new(router)),
+                stats::create_shared_stats(),
+                Arc::new(StreamForwarder::new()),
+            ),
+            client.read_to_end(&mut response),
+        );
+        read.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn pending_connect_proxy_fallback_sends_one_success() {
+        timeout(Duration::from_secs(5), async {
+            let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let sinks = HashMap::from([
+                ("primary".into(), socks_sink(&primary)),
+                ("fallback".into(), socks_sink(&fallback)),
+            ]);
+            let mut router = Router::new();
+            router.set_default("primary").await;
+            router.set_fallback(vec!["fallback".into()]);
+            let (response, (), ()) = tokio::join!(
+                pending_connect_response(router, sinks, b"ping"),
+                socks_reply(primary, false),
+                socks_reply(fallback, true),
+            );
+            assert_eq!(response, b"HTTP/1.1 200 Connection Established\r\n\r\npong");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_connect_all_proxies_fail_sends_bad_gateway() {
+        timeout(Duration::from_secs(5), async {
+            let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let sinks = HashMap::from([
+                ("primary".into(), socks_sink(&primary)),
+                ("fallback".into(), socks_sink(&fallback)),
+            ]);
+            let mut router = Router::new();
+            router.set_default("primary").await;
+            router.set_fallback(vec!["fallback".into()]);
+            let (response, (), ()) = tokio::join!(
+                pending_connect_response(router, sinks, b""),
+                socks_reply(primary, false),
+                socks_reply(fallback, false),
+            );
+            assert_eq!(
+                response,
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_connect_without_route_sends_bad_gateway() {
+        let response = timeout(
+            Duration::from_secs(5),
+            pending_connect_response(Router::new(), HashMap::new(), b""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
 
     #[test]
     fn metadata_registered_before_api_and_keeps_configured_transport() {

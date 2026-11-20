@@ -238,7 +238,7 @@ async fn check_proxy_auth(data: &[u8], account: &Account, stream: &mut transport
 
 /// 处理 CONNECT 隧道请求
 async fn handle_connect(
-    mut stream: transport::TrStream,
+    stream: transport::TrStream,
     peer_addr: Address,
     path: &str,
     remainder: Option<Bytes>,
@@ -247,12 +247,10 @@ async fn handle_connect(
     let dest = parse::parse_host_port(path)?;
     log::debug!("[HTTP] CONNECT destination: {:?}", dest);
 
-    let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-    AsyncWriteExt::write_all(&mut stream, response).await?;
-    log::debug!("[HTTP] Sent 200 Connection Established");
-
     let stream = wrap_stream_with_prefix(stream, remainder);
-    Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, stream).with_bpf_eligibility(true))
+    Ok(ProxyStream::new(Protocol::Tcp, peer_addr, dest, stream)
+        .with_bpf_eligibility(true)
+        .with_connect_response())
 }
 
 fn wrap_stream_with_prefix(stream: transport::TrStream, prefix: Option<Bytes>) -> transport::TrStream {
@@ -329,28 +327,44 @@ mod tests {
         (client, server)
     }
 
+    async fn pending_connect(payload: &[u8]) -> (TcpStream, ProxyStream) {
+        let (client, server) = tcp_pair().await;
+        let mut request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n".to_vec();
+        request.extend_from_slice(payload);
+        // Supply the whole read explicitly so preread coverage does not depend on TCP packetization.
+        let stream = wrap_stream_with_prefix(transport::TrStream::Tcp(server), Some(Bytes::from(request)));
+        let proxy_stream =
+            Proxy::handle_connection(stream, Address::Inet("127.0.0.1:12345".parse().unwrap()), &None, false)
+                .await
+                .unwrap();
+        (client, proxy_stream)
+    }
+
     #[tokio::test]
     async fn connect_preserves_preread_tls_bytes() {
-        let (mut client, server) = tcp_pair().await;
-
-        let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
         let tls_hello = b"\x16\x03\x01\x00fake-client-hello";
+        let (mut client, mut proxy_stream) = pending_connect(tls_hello).await;
 
-        let writer = tokio::spawn(async move {
-            client.write_all(request).await.unwrap();
-            client.write_all(tls_hello).await.unwrap();
-        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.read(&mut [0; 1]),)
+                .await
+                .is_err(),
+            "CONNECT must not succeed before outbound confirmation"
+        );
 
-        let proxy_stream = Proxy::handle_connection(
-            transport::TrStream::Tcp(server),
-            Address::Inet("127.0.0.1:12345".parse().unwrap()),
-            &None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        writer.await.unwrap();
+        proxy_stream.confirm_connected().await.unwrap();
+        let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+        let mut received = vec![0; response.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, response);
+        proxy_stream.confirm_connected().await.unwrap();
+        proxy_stream
+            .reject_connection(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            .await
+            .unwrap();
 
         match proxy_stream.metadata.dst {
             Address::Domain(ref host, port) => {
@@ -365,6 +379,134 @@ mod tests {
         let mut buf = vec![0u8; tls_hello.len()];
         inner.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, tls_hello);
+        inner.write_all(b"tunnel data").await.unwrap();
+        inner.shutdown().await.unwrap();
+        let mut remaining = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut remaining))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            remaining, b"tunnel data",
+            "confirmation and rejection must not add another response"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_rejection_sends_one_error_response_and_closes() {
+        for (kind, expected) in [
+            (
+                std::io::ErrorKind::ConnectionRefused,
+                &b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"[..],
+            ),
+            (
+                std::io::ErrorKind::TimedOut,
+                &b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"[..],
+            ),
+        ] {
+            let (mut client, mut proxy_stream) = pending_connect(b"unforwarded payload").await;
+            let error = std::io::Error::from(kind);
+            proxy_stream.reject_connection(&error).await.unwrap();
+            proxy_stream.reject_connection(&error).await.unwrap();
+            proxy_stream.confirm_connected().await.unwrap();
+            let mut response = Vec::new();
+            // Keep the stream alive: EOF must come from rejection, not from dropping it.
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response, expected);
+        }
+    }
+
+    fn direct_sink() -> crate::app::ConnectionSink {
+        let dns = std::sync::Arc::new(crate::route::DnsResolver);
+        crate::app::ConnectionSink::Direct(crate::app::DirectSink {
+            transport: transport::Transport::new(&transport::StreamSettings::default(), None, dns.clone()).unwrap(),
+            dns,
+            prefer: AddressPreference::System,
+            connect_timeout: std::time::Duration::from_secs(5),
+            #[cfg(target_os = "linux")]
+            bpf: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn connect_direct_sink_confirms_and_forwards_preread_payload() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (mut client, mut stream) = pending_connect(b"client hello").await;
+            stream.metadata.dst = Address::Inet(target.local_addr().unwrap());
+            let forwarding = tokio::spawn(async move {
+                direct_sink()
+                    .handle(stream, &crate::common::forward::StreamForwarder::new())
+                    .await
+            });
+            let (mut remote, _) = target.accept().await.unwrap();
+            let mut hello = [0; 12];
+            remote.read_exact(&mut hello).await.unwrap();
+            assert_eq!(&hello, b"client hello");
+            remote.write_all(b"server hello").await.unwrap();
+            remote.shutdown().await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"HTTP/1.1 200 Connection Established\r\n\r\nserver hello");
+            forwarding.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_direct_sink_refusal_sends_502_without_200() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // Reserve a port without listening so no other test can claim it before connect.
+            let target = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            target
+                .bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into())
+                .unwrap();
+            let (mut client, mut stream) = pending_connect(b"client hello").await;
+            stream.metadata.dst = Address::Inet(target.local_addr().unwrap().as_socket().unwrap());
+            let error = direct_sink()
+                .handle(stream, &crate::common::forward::StreamForwarder::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_confirmation_write_failure_closes_outbound() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, server) = tokio::io::duplex(64);
+            drop(client); // A closed in-memory peer makes the 200 write fail deterministically.
+            let stream = ProxyStream::new(
+                Protocol::Tcp,
+                Address::Inet("127.0.0.1:12345".parse().unwrap()),
+                Address::Inet(target.local_addr().unwrap()),
+                transport::TrStream::Tun(Box::new(server)),
+            )
+            .with_connect_response();
+            let error = direct_sink()
+                .handle(stream, &crate::common::forward::StreamForwarder::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            let (mut remote, _) = target.accept().await.unwrap();
+            assert_eq!(remote.read(&mut [0; 1]).await.unwrap(), 0);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

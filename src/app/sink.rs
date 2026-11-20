@@ -4,11 +4,11 @@ use crate::{
         stats::TrafficCounters,
         Address, Protocol,
     },
-    proxy::{Outbounder, ProxyStream},
+    proxy::{AddressPreference, Outbounder, ProxyStream},
     route::DnsResolver,
     transport::{self, TrStream},
 };
-use std::sync::Arc;
+use std::{collections::HashSet, future::Future, net::IpAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 流量出口
@@ -40,7 +40,7 @@ impl ConnectionSink {
 
     pub async fn handle_with_counters(
         &self,
-        stream: ProxyStream,
+        mut stream: ProxyStream,
         forwarder: &StreamForwarder,
         counters: TrafficCounters,
     ) -> std::io::Result<()> {
@@ -48,15 +48,19 @@ impl ConnectionSink {
             ConnectionSink::Direct(sink) => sink.handle(stream, forwarder, counters).await,
             ConnectionSink::Proxy(sink) => sink.handle(stream, forwarder, counters).await,
             ConnectionSink::Block => {
-                drop(stream);
+                let error = std::io::Error::new(std::io::ErrorKind::NotConnected, "connection blocked");
+                if let Err(response_error) = stream.reject_connection(&error).await {
+                    log::debug!("failed to reject blocked inbound: {response_error}");
+                }
                 Ok(())
             }
             ConnectionSink::Daemon(_) => {
-                // Daemon sinks don't handle individual streams
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Daemon sinks cannot handle proxy streams",
-                ))
+                let error =
+                    std::io::Error::new(std::io::ErrorKind::Unsupported, "Daemon sinks cannot handle proxy streams");
+                if let Err(response_error) = stream.reject_connection(&error).await {
+                    log::debug!("failed to reject daemon inbound: {response_error}");
+                }
+                Err(error)
             }
         }
     }
@@ -70,6 +74,8 @@ impl ConnectionSink {
 pub struct DirectSink {
     pub dns: Arc<DnsResolver>,
     pub transport: transport::Transport,
+    pub prefer: AddressPreference,
+    pub connect_timeout: Duration,
     #[cfg(target_os = "linux")]
     pub bpf: Option<Arc<crate::common::bpf::BpfRelay>>,
 }
@@ -77,14 +83,25 @@ pub struct DirectSink {
 impl DirectSink {
     async fn handle(
         &self,
-        stream: ProxyStream,
+        mut stream: ProxyStream,
         forwarder: &StreamForwarder,
         counters: TrafficCounters,
     ) -> std::io::Result<()> {
-        let dst = self.resolve(&stream.metadata.dst).await?;
+        let remote = match self
+            .try_connect(&stream.metadata.dst, stream.metadata.protocol.clone())
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                if let Err(response_error) = stream.reject_connection(&error).await {
+                    log::debug!("failed to reject inbound connection: {response_error}");
+                }
+                return Err(error);
+            }
+        };
+        stream.confirm_connected().await?;
         match stream.metadata.protocol {
             Protocol::Tcp => {
-                let remote = self.transport.connect(&dst, Protocol::Tcp, None).await?;
                 #[cfg(target_os = "linux")]
                 if let Some(bpf) = &self.bpf {
                     if stream.metadata.bpf_eligible && stream.inner.is_plain_tcp() && remote.is_plain_tcp() {
@@ -117,7 +134,7 @@ impl DirectSink {
                         {
                             crate::common::bpf::Outcome::Kernel => Ok(()),
                             crate::common::bpf::Outcome::Userspace(local, remote) => {
-                                log::debug!("BPF fallback to userspace forwarding for TCP to {dst}");
+                                log::debug!("BPF fallback to userspace forwarding for TCP to {}", stream.metadata.dst);
                                 forwarder
                                     .forward_with_counters(TrStream::Tcp(local), TrStream::Tcp(remote), counters)
                                     .await?;
@@ -130,18 +147,21 @@ impl DirectSink {
                 forwarder.forward_with_counters(stream.inner, remote, counters).await?;
                 Ok(())
             }
-            Protocol::Udp => self.handle_udp(stream, dst, counters).await,
+            Protocol::Udp => self.handle_udp(stream, remote, counters).await,
         }
     }
 
-    async fn handle_udp(&self, stream: ProxyStream, dst: Address, counters: TrafficCounters) -> std::io::Result<()> {
+    async fn handle_udp(
+        &self,
+        stream: ProxyStream,
+        mut remote: TrStream,
+        counters: TrafficCounters,
+    ) -> std::io::Result<()> {
         let mut inbound = CountingStream {
             inner: stream.inner,
             counters: counters.clone(),
             uplink: false,
         };
-        let mut remote = self.transport.connect(&dst, Protocol::Udp, None).await?;
-
         let remote_socket = match &mut remote {
             transport::TrStream::Udp(socket) => socket,
             _ => {
@@ -180,18 +200,59 @@ impl DirectSink {
         Ok(())
     }
 
-    async fn resolve(&self, addr: &Address) -> std::io::Result<Address> {
-        match addr {
-            Address::Domain(domain, port) => {
-                let ips = self.dns.resolve(domain).await?;
-                let ip = ips.first().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, format!("no address for {}", domain))
-                })?;
-                Ok(Address::Inet(std::net::SocketAddr::new(*ip, *port)))
-            }
-            other => Ok(other.clone()),
-        }
+    /// Establish a remote without consuming or forwarding any inbound data.
+    pub async fn try_connect(&self, dst: &Address, protocol: Protocol) -> std::io::Result<TrStream> {
+        let candidates = match dst {
+            Address::Domain(domain, port) => ordered_ips(self.dns.resolve(domain).await?, self.prefer)
+                .into_iter()
+                .map(|ip| Address::Inet(std::net::SocketAddr::new(ip, *port)))
+                .collect(),
+            other => vec![other.clone()],
+        };
+        connect_candidates(candidates, self.connect_timeout, |addr| {
+            let protocol = protocol.clone();
+            async move { self.transport.connect(&addr, protocol, None).await }
+        })
+        .await
     }
+}
+
+fn ordered_ips(mut ips: Vec<IpAddr>, prefer: AddressPreference) -> Vec<IpAddr> {
+    let mut seen = HashSet::new();
+    ips.retain(|ip| seen.insert(*ip));
+    match prefer {
+        AddressPreference::System => {}
+        AddressPreference::Ipv4 => ips.sort_by_key(IpAddr::is_ipv6),
+        AddressPreference::Ipv6 => ips.sort_by_key(IpAddr::is_ipv4),
+    }
+    ips
+}
+
+async fn connect_candidates<T, F, Fut>(
+    candidates: Vec<Address>,
+    connect_timeout: Duration,
+    mut connect: F,
+) -> std::io::Result<T>
+where
+    F: FnMut(Address) -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    let mut last_error =
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no candidate address for freedom connection");
+    for addr in candidates {
+        let result = tokio::time::timeout(connect_timeout, connect(addr.clone())).await;
+        let error = match result {
+            Ok(Ok(remote)) => {
+                log::debug!("freedom connected to {addr}");
+                return Ok(remote);
+            }
+            Ok(Err(error)) => error,
+            Err(_) => std::io::Error::new(std::io::ErrorKind::TimedOut, "transport connection timed out"),
+        };
+        log::warn!("freedom connection to {addr} failed: {error}");
+        last_error = std::io::Error::new(error.kind(), format!("freedom connection to {addr} failed: {error}"));
+    }
+    Err(last_error)
 }
 
 pub struct ProxySink {
@@ -201,13 +262,23 @@ pub struct ProxySink {
 impl ProxySink {
     async fn handle(
         &self,
-        stream: ProxyStream,
+        mut stream: ProxyStream,
         forwarder: &StreamForwarder,
         counters: TrafficCounters,
     ) -> std::io::Result<()> {
-        let remote = self
+        let remote = match self
             .try_connect(&stream.metadata.dst, stream.metadata.protocol.clone())
-            .await?;
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                if let Err(response_error) = stream.reject_connection(&error).await {
+                    log::debug!("failed to reject inbound connection: {response_error}");
+                }
+                return Err(error);
+            }
+        };
+        stream.confirm_connected().await?;
         forwarder.forward_with_counters(stream.inner, remote, counters).await?;
         Ok(())
     }
@@ -247,12 +318,123 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use tokio::time::{timeout, Duration};
 
+    #[test]
+    fn freedom_address_order_is_stable_and_unique() {
+        let ips: Vec<IpAddr> = ["::2", "192.0.2.2", "::1", "192.0.2.1", "::2", "192.0.2.2"]
+            .into_iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        for (prefer, expected) in [
+            (AddressPreference::System, vec!["::2", "192.0.2.2", "::1", "192.0.2.1"]),
+            (AddressPreference::Ipv4, vec!["192.0.2.2", "192.0.2.1", "::2", "::1"]),
+            (AddressPreference::Ipv6, vec!["::2", "::1", "192.0.2.2", "192.0.2.1"]),
+        ] {
+            assert_eq!(
+                ordered_ips(ips.clone(), prefer),
+                expected
+                    .into_iter()
+                    .map(|ip| ip.parse::<IpAddr>().unwrap())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(ordered_ips(vec![], AddressPreference::Ipv4).is_empty());
+    }
+
+    fn candidates() -> Vec<Address> {
+        (1..=3)
+            .map(|last| Address::Inet(format!("192.0.2.{last}:80").parse().unwrap()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn freedom_retries_errors_and_stops_on_success() {
+        let mut attempts = Vec::new();
+        let result = connect_candidates(candidates(), Duration::from_secs(1), |addr| {
+            attempts.push(addr.to_string());
+            let attempt = attempts.len();
+            async move {
+                if attempt == 1 {
+                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 2);
+        assert_eq!(attempts, ["192.0.2.1:80", "192.0.2.2:80"]);
+    }
+
+    #[tokio::test]
+    async fn freedom_retries_timeout_and_reports_all_failures() {
+        let mut attempts = 0;
+        let result = connect_candidates(candidates(), Duration::from_millis(1), |_| {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt == 1 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(attempt)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 2);
+        assert_eq!(attempts, 2);
+        let mut attempts = 0;
+        let error = connect_candidates::<(), _, _>(candidates(), Duration::from_secs(1), |_| {
+            attempts += 1;
+            async { Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(error.to_string().contains("192.0.2.3:80"));
+        let error = connect_candidates::<(), _, _>(
+            vec![Address::Inet("127.0.0.1:80".parse().unwrap())],
+            Duration::from_millis(1),
+            |_| std::future::pending::<std::io::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let error = connect_candidates::<(), _, _>(vec![], Duration::from_secs(1), |_| async { unreachable!() })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn freedom_build_sink_carries_settings_and_defaults() {
+        for (yaml, prefer, ms) in [
+            ("protocol: freedom\n", AddressPreference::System, 5000),
+            (
+                "protocol: freedom\nsettings:\n  prefer: ipv6\n  connectTimeoutMs: 23\n",
+                AddressPreference::Ipv6,
+                23,
+            ),
+            ("{}", AddressPreference::System, 5000),
+        ] {
+            let outbound: crate::app::OutboundSettings = serde_yaml::from_str(yaml).unwrap();
+            let ConnectionSink::Direct(sink) = outbound.build_sink(Arc::new(DnsResolver)).unwrap() else {
+                panic!("expected freedom sink")
+            };
+            assert_eq!(sink.prefer, prefer);
+            assert_eq!(sink.connect_timeout, Duration::from_millis(ms));
+        }
+    }
+
     async fn direct_flow(protocol: Protocol) {
         timeout(Duration::from_secs(5), async {
             let dns = Arc::new(DnsResolver);
             let sink = DirectSink {
                 transport: transport::Transport::new(&transport::StreamSettings::default(), None, dns.clone()).unwrap(),
                 dns,
+                prefer: AddressPreference::System,
+                connect_timeout: Duration::from_secs(5),
                 #[cfg(target_os = "linux")]
                 bpf: None,
             };
@@ -341,7 +523,10 @@ mod bpf_tests {
     fn freedom(bpf: bool) -> crate::app::OutboundSettings {
         crate::app::OutboundSettings {
             tag: None,
-            settings: Some(ProxyOutboundSettings::Freedom(FreedomSettings { bpf })),
+            settings: Some(ProxyOutboundSettings::Freedom(FreedomSettings {
+                bpf,
+                ..FreedomSettings::default()
+            })),
             stream_settings: None,
         }
     }

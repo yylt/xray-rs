@@ -85,6 +85,24 @@ routing:
 
 DNS uses only the system resolver, with no application DNS cache or `dns` configuration. Remove the legacy field. System DNS/hosts and caching are managed by the OS.
 
+### freedom address preference and connection retry
+
+```yaml
+outbounds:
+  - tag: direct
+    protocol: freedom
+    settings:
+      prefer: ipv4              # system (default) | ipv4 | ipv6
+      connectTimeoutMs: 5000    # default 5000; positive integer
+      bpf: false
+```
+
+`prefer` orders the system DNS results without excluding the other address family. Order within each family is preserved and duplicate IPs are removed. A domain is resolved once; failed or timed-out connections advance to the next IP, once per address. The per-address timeout includes transport handshakes, not forwarding idle time. DNS retains the system resolver's timeout semantics; total connection time may grow with the number of candidates. Literal IPs also use the connection timeout.
+
+No reconnect or application-data replay occurs after connection establishment, including on TLS errors. UDP retries only local connect failures: successful UDP connect does not prove remote reachability or provide datagram-level failover.
+
+HTTP CONNECT sends `200 Connection Established` only after the outbound connection succeeds; connection failures return `502`, and explicit timeouts return `504`. It does not wait for client TLS inside the tunnel. For chained proxies, success is limited to the connection stage that the outbound protocol can confirm. Library users of `ConnectionSink::handle` get automatic responses; custom forwarding that extracts `ProxyStream.inner` / `into_inner()` must first call `confirm_connected()` after outbound success, or `reject_connection()` on failure.
+
 ### log config
 
 - `file`: path of the log file (append mode). When omitted, logs go to stderr.
