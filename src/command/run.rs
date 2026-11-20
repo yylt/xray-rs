@@ -67,12 +67,12 @@ impl Run {
         // `systemctl reload` → SIGHUP → 重开日志文件（logrotate 轮转后必需）
         rt.spawn(rslog::reload_on_sighup(guard));
 
-        rt.block_on(run_proxy(config))
+        rt.block_on(run_proxy(config, self.config.clone()))
     }
 }
 
 /// 构建并启动代理服务的主入口函数
-async fn run_proxy(config: Config) -> io::Result<()> {
+async fn run_proxy(config: Config, config_path: String) -> io::Result<()> {
     log::info!("Starting xray-rs proxy");
 
     let Config {
@@ -102,9 +102,32 @@ async fn run_proxy(config: Config) -> io::Result<()> {
     // Phase 4: 构建 router
     let router = build_router(routing, first_tag, dns.clone()).await?;
 
+    let initial_token = if inbounds.as_ref().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| matches!(item.settings.as_ref(), Some(proxy::InboundSettings::Api(_))))
+    }) {
+        inbounds
+            .as_ref()
+            .and_then(|items| {
+                items.iter().find_map(|item| match item.settings.as_ref() {
+                    Some(proxy::InboundSettings::Api(settings)) => settings.token.clone(),
+                    _ => None,
+                })
+            })
+            .filter(|token| !token.is_empty())
+    } else {
+        None
+    };
+    let (restart_tx, mut restart_rx) = tokio::sync::watch::channel(false);
+    // `restart_tx` 保持存活到进程结束：没有 api inbound 时 management 会被丢弃，
+    // 若通道提前关闭，下面的 changed() 会立刻返回 Err 导致启动后立即退出。
+    let management =
+        proxy::api::ManagementState::new(config_path.into(), initial_token, restart_tx.clone(), dns.clone());
+
     // Phase 5: 构建并启动 inbounds
     if let Some(inbounds) = inbounds {
-        start_inbounds(inbounds, sinks, router, stats, dns, &mut handles).await?;
+        start_inbounds(inbounds, sinks, router, stats, dns, management, &mut handles).await?;
     }
 
     // Dropping Run's runtime cancels listener/connection tasks; their last relay
@@ -114,6 +137,10 @@ async fn run_proxy(config: Config) -> io::Result<()> {
         signal = shutdown_signal() => {
             signal?;
             log::info!("Stopping proxy and unloading BPF relay");
+        }
+        changed = restart_rx.changed() => {
+            changed.map_err(io::Error::other)?;
+            log::info!("Management restart requested; exiting for supervisor restart");
         }
     }
     Ok(())
@@ -268,6 +295,7 @@ async fn start_inbounds(
     router: Arc<tokio::sync::RwLock<Router>>,
     stats: stats::SharedStats,
     dns: Arc<DnsResolver>,
+    management: proxy::api::ManagementState,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> io::Result<()> {
     log::info!("Starting {} inbounds", inbounds.len());
@@ -282,6 +310,7 @@ async fn start_inbounds(
                 Some(stats.clone()),
                 Some(router.clone()),
                 Some(sinks.clone()),
+                Some(management.clone()),
             )?
         } else {
             ib_set.build_source(dns.clone(), Some(sinks.clone()))?

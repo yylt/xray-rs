@@ -174,8 +174,7 @@ impl Socks5Processor {
         Ok((stream, cmd, addr))
     }
 
-    /// SOCKS5 握手阶段
-    /// Made public to support client-mode handshake for outbound UDP Associate
+    /// SOCKS5 服务端握手：读取客户端 greeting 并回复选择的方法
     pub async fn handshake<T>(&self, stream: &mut T) -> Result<()>
     where
         T: AsyncRead + AsyncWrite + Unpin,
@@ -207,6 +206,65 @@ impl Socks5Processor {
             self.authenticate(stream).await?;
         }
 
+        Ok(())
+    }
+
+    /// SOCKS5 客户端握手：发送 greeting 并校验服务端选择的方法
+    pub async fn client_handshake<T>(&self, stream: &mut T) -> Result<()>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let methods: &[u8] = match self.auth {
+            Some(_) => &[AuthMethod::UsernamePassword as u8],
+            None => &[AuthMethod::NoAuth as u8],
+        };
+        let mut greeting = Vec::with_capacity(2 + methods.len());
+        greeting.push(0x05);
+        greeting.push(methods.len() as u8);
+        greeting.extend_from_slice(methods);
+        stream.write_all(&greeting).await?;
+        stream.flush().await?;
+
+        let mut reply = [0u8; 2];
+        stream.read_exact(&mut reply).await?;
+        if reply[0] != 0x05 {
+            return Err(Socks5Error::InvalidVersion {
+                expected: 0x05,
+                got: reply[0],
+            });
+        }
+
+        match AuthMethod::try_from(reply[1])? {
+            AuthMethod::NoAuth => Ok(()),
+            AuthMethod::UsernamePassword => self.client_authenticate(stream).await,
+            AuthMethod::NoAcceptable => Err(Socks5Error::UnsupportedAuthMethod(reply[1])),
+        }
+    }
+
+    /// 客户端用户名密码认证（RFC 1929）
+    async fn client_authenticate<T>(&self, stream: &mut T) -> Result<()>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let account = self
+            .auth
+            .as_ref()
+            .ok_or_else(|| Socks5Error::ProtocolError("server requires username/password authentication".into()))?;
+
+        let mut request = Vec::with_capacity(3 + account.username.len() + account.password.len());
+        request.push(0x01);
+        request.push(account.username.len() as u8);
+        request.extend_from_slice(account.username.as_bytes());
+        request.push(account.password.len() as u8);
+        request.extend_from_slice(account.password.as_bytes());
+        stream.write_all(&request).await?;
+        stream.flush().await?;
+
+        let mut reply = [0u8; 2];
+        stream.read_exact(&mut reply).await?;
+        if reply[1] != 0x00 {
+            return Err(Socks5Error::AuthenticationFailed);
+        }
         Ok(())
     }
 
@@ -336,5 +394,25 @@ mod tests {
             Socks5Error::ProtocolError(msg) => assert!(msg.contains("unix domain not supported")),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    async fn handshake_pair(account: Option<crate::common::Account>) {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let client_processor = Socks5Processor::new(account.clone());
+        let server_processor = Socks5Processor::new(account);
+        let client_task = tokio::spawn(async move { client_processor.client_handshake(&mut client).await });
+        let server_task = tokio::spawn(async move { server_processor.handshake(&mut server).await });
+        client_task.await.unwrap().unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_handshake_interoperates_without_auth() {
+        handshake_pair(None).await;
+    }
+
+    #[tokio::test]
+    async fn client_handshake_interoperates_with_username_password() {
+        handshake_pair(Some(crate::common::Account::new("user", "pass"))).await;
     }
 }

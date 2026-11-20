@@ -14,8 +14,8 @@ outbounds:
   - tag: direct
     protocol: freedom
 
-# GET http://127.0.0.1:8080/                HTML traffic and RSS charts
-# GET http://127.0.0.1:8080/metrics         Prometheus metrics
-# GET http://127.0.0.1:8080/metrics/history?range=1h
+# GET http://127.0.0.1:8080/                     Management UI
+# GET http://127.0.0.1:8080/api/v1/metrics       Prometheus metrics
+# GET http://127.0.0.1:8080/api/v1/metrics/history?range=1h
 # History is sampled every 5s in memory; restarting clears it.
 # Inbound/outbound counters are separate views of the same forwarded payload.

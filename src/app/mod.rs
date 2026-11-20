@@ -31,7 +31,7 @@ impl InboundSettings {
         dns: Arc<DnsResolver>,
         sinks: Option<Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>>,
     ) -> std::io::Result<ConnectionSource> {
-        self.build_source_with_deps(dns, None, None, sinks)
+        self.build_source_with_deps(dns, None, None, sinks, None)
     }
 
     /// Build source with additional dependencies for special inbounds like API
@@ -41,6 +41,7 @@ impl InboundSettings {
         stats: Option<SharedStats>,
         router: Option<SharedRouter>,
         sinks: Option<Arc<std::collections::HashMap<String, Arc<ConnectionSink>>>>,
+        management: Option<proxy::api::ManagementState>,
     ) -> std::io::Result<ConnectionSource> {
         let tag = self.tag.clone().unwrap_or_else(|| "in".into());
         let listen_addr = Address::try_from((&self.listen, self.port))?;
@@ -54,6 +55,7 @@ impl InboundSettings {
                     stats,
                     router,
                     sinks,
+                    management,
                 )?;
                 Ok(ConnectionSource::Daemon(DaemonSource { inbounder, listen_addr }))
             }

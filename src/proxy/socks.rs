@@ -404,7 +404,7 @@ impl Proxy {
 
             let processor = Socks5Processor::new(account.clone());
             processor
-                .handshake(&mut stream)
+                .client_handshake(&mut stream)
                 .await
                 .map_err(|e| std::io::Error::other(format!("Handshake failed: {}", e)))?;
 
