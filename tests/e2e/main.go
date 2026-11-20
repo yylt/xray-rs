@@ -85,6 +85,7 @@ func main() {
 				})
 			}
 		}
+		runTest(results, "HTTP -> SOCKS5 chain: Rust client -> Core socks server", testHTTPSOCKS5Chain)
 	}
 
 	results.PrintSummary()

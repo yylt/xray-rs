@@ -3,26 +3,35 @@ use super::*;
 #[tokio::test]
 async fn metrics_routes_without_token_and_retention_validation() {
     assert_eq!(serde_json::from_str::<InSetting>("{}").unwrap().retention, "24h");
-    assert!(serde_json::from_str::<InSetting>(r#"{"token":"removed"}"#).is_err());
+    assert_eq!(
+        serde_json::from_str::<InSetting>(r#"{"token":"secret"}"#)
+            .unwrap()
+            .token
+            .as_deref(),
+        Some("secret")
+    );
     let stats = crate::common::stats::create_shared_stats();
     let router = Arc::new(tokio::sync::RwLock::new(crate::route::Router::new()));
     let sinks = Arc::new(std::collections::HashMap::new());
-    assert!(ApiInbound::new(
-        &InSetting { retention: "4d".into() },
-        stats.clone(),
-        router.clone(),
-        sinks.clone()
-    )
-    .is_err());
+    assert!(metrics::duration("4d").is_err());
     for (path, expected, content) in [
-        ("/", "200 OK", "<canvas"),
-        ("/metrics", "200 OK", "# TYPE xray_traffic_bytes_total counter"),
-        ("/metrics/history?range=1h", "200 OK", "retention_seconds"),
-        ("/metrics/history?range=3d", "400 Bad Request", "invalid range"),
-        ("/metrics/history?range=0h", "400 Bad Request", "invalid range"),
+        ("/", "200 OK", "Management"),
+        ("/api/v1/metrics", "200 OK", "# TYPE xray_traffic_bytes_total counter"),
+        ("/api/v1/metrics/history?range=1h", "200 OK", "retention_seconds"),
+        ("/api/v1/metrics/history?range=3d", "400 Bad Request", "invalid range"),
+        ("/api/v1/metrics/history?range=0h", "400 Bad Request", "invalid range"),
         ("/missing", "404 Not Found", "not found"),
     ] {
-        let api = ApiInbound::new(&InSetting::default(), stats.clone(), router.clone(), sinks.clone()).unwrap();
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let management = ManagementState::new("config.yaml".into(), None, tx, Arc::new(crate::route::DnsResolver));
+        let api = ApiInbound::new(
+            &InSetting::default(),
+            stats.clone(),
+            router.clone(),
+            sinks.clone(),
+            management.clone(),
+        )
+        .unwrap();
         let (mut client, server) = tokio::io::duplex(128 * 1024);
         let stats = stats.clone();
         let router = router.clone();
@@ -32,7 +41,14 @@ async fn metrics_routes_without_token_and_retention_validation() {
                 .serve_connection(
                     hyper_util::rt::TokioIo::new(server),
                     service_fn(move |req| {
-                        handle_request(req, api.history.clone(), stats.clone(), router.clone(), sinks.clone())
+                        handle_request(
+                            req,
+                            api.history.clone(),
+                            stats.clone(),
+                            router.clone(),
+                            sinks.clone(),
+                            management.clone(),
+                        )
                     }),
                 )
                 .await

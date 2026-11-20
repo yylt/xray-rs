@@ -221,7 +221,7 @@ impl Inbounder {
         sset: Option<&transport::StreamSettings>,
         dns: std::sync::Arc<crate::route::DnsResolver>,
     ) -> Result<Self> {
-        Self::new_with_deps(set, sset, dns, None, None, None)
+        Self::new_with_deps(set, sset, dns, None, None, None, None)
     }
 
     pub fn new_with_deps(
@@ -231,6 +231,7 @@ impl Inbounder {
         stats: Option<crate::common::stats::SharedStats>,
         router: Option<crate::route::router::SharedRouter>,
         sinks: Option<std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<ConnectionSink>>>>,
+        management: Option<api::ManagementState>,
     ) -> Result<Self> {
         let trset = match sset {
             None => &transport::StreamSettings::default(),
@@ -244,7 +245,9 @@ impl Inbounder {
                     let stats = stats.ok_or_else(|| std::io::Error::other("api inbound requires stats"))?;
                     let router = router.ok_or_else(|| std::io::Error::other("api inbound requires router"))?;
                     let sinks = sinks.ok_or_else(|| std::io::Error::other("api inbound requires sinks"))?;
-                    Inbounder::Api(api::ApiInbound::new(a, stats, router, sinks)?)
+                    let management =
+                        management.ok_or_else(|| std::io::Error::other("api inbound requires management state"))?;
+                    Inbounder::Api(api::ApiInbound::new(a, stats, router, sinks, management)?)
                 }
                 InboundSettings::Socks(s) => Inbounder::Socks(socks::Proxy::new_inbound(s, tr)?),
                 InboundSettings::Http(h) => Inbounder::Http(http::Proxy::new_inbound(h, tr)?),
