@@ -174,6 +174,24 @@ routing:
 
 DNS 仅使用系统解析器，不提供应用内 DNS 缓存或 `dns` 配置；旧配置须删除该字段。系统 DNS/hosts 及缓存由操作系统管理。
 
+### freedom 地址偏好与连接重试
+
+```yaml
+outbounds:
+  - tag: direct
+    protocol: freedom
+    settings:
+      prefer: ipv4              # system（默认）| ipv4 | ipv6
+      connectTimeoutMs: 5000    # 默认 5000，必须为正整数
+      bpf: false
+```
+
+`prefer` 仅调整系统 DNS 返回地址的尝试顺序，不排除另一地址族；同地址族保持原顺序，重复 IP 去重。域名只解析一次，连接失败或超时后依次尝试下一个 IP，每个地址一次。每地址超时包含传输握手，不是转发空闲超时；DNS 使用系统解析器的超时，总连接等待可能随候选地址数量增长。字面 IP 也受连接超时限制。
+
+建立连接后不因 TLS/应用错误重新连接或重放数据。UDP 只在本地 connect 失败时重试，connect 成功不保证远端可达，也不提供数据报级故障切换。
+
+HTTP CONNECT 在出站连接成功后才回复 `200 Connection Established`；连接失败返回 `502`，明确超时返回 `504`。不等待隧道内的客户端 TLS 握手。链式代理的成功保证以其出站协议能够确认的连接阶段为限。通过 `ConnectionSink::handle` 使用库时会自动完成应答；若自行连接并提取 `ProxyStream.inner` / `into_inner()` 转发，须先在出站成功后调用 `confirm_connected()`，失败则调用 `reject_connection()`。
+
 ### log 配置
 
 - `file`：日志文件路径（追加写）。缺省时日志输出到 stderr。

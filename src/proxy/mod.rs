@@ -98,10 +98,37 @@ impl<'de> Deserialize<'de> for InboundSettings {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressPreference {
+    #[default]
+    System,
+    Ipv4,
+    Ipv6,
+}
+
+fn default_connect_timeout_ms() -> std::num::NonZeroU64 {
+    std::num::NonZeroU64::new(5000).unwrap()
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct FreedomSettings {
     #[serde(default)]
     pub bpf: bool,
+    #[serde(default)]
+    pub prefer: AddressPreference,
+    #[serde(rename = "connectTimeoutMs", default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: std::num::NonZeroU64,
+}
+
+impl Default for FreedomSettings {
+    fn default() -> Self {
+        Self {
+            bpf: false,
+            prefer: AddressPreference::default(),
+            connect_timeout_ms: default_connect_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -169,6 +196,7 @@ pub struct StreamMetadata {
 pub struct ProxyStream {
     pub metadata: StreamMetadata,
     pub inner: transport::TrStream,
+    connect_response_pending: bool,
 }
 
 impl ProxyStream {
@@ -182,7 +210,39 @@ impl ProxyStream {
                 bpf_eligible: false,
             },
             inner,
+            connect_response_pending: false,
         }
+    }
+
+    pub(crate) fn with_connect_response(mut self) -> Self {
+        self.connect_response_pending = true;
+        self
+    }
+
+    /// Complete the HTTP tunnel handshake before exposing any preread payload.
+    pub async fn confirm_connected(&mut self) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        if std::mem::take(&mut self.connect_response_pending) {
+            self.inner
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+            self.inner.flush().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn reject_connection(&mut self, error: &std::io::Error) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        if std::mem::take(&mut self.connect_response_pending) {
+            let response: &[u8] = if error.kind() == std::io::ErrorKind::TimedOut {
+                b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            };
+            self.inner.write_all(response).await?;
+            self.inner.shutdown().await?;
+        }
+        Ok(())
     }
 
     pub fn with_bpf_eligibility(mut self, eligible: bool) -> Self {
@@ -419,9 +479,17 @@ mod tests {
     #[test]
     fn serialize_freedom_outbound_includes_bpf_setting() {
         for bpf in [false, true] {
-            let settings = OutboundSettings::Freedom(FreedomSettings { bpf });
+            let settings = OutboundSettings::Freedom(FreedomSettings {
+                bpf,
+                ..FreedomSettings::default()
+            });
             let json = serde_json::to_value(&settings).unwrap();
-            assert_eq!(json, serde_json::json!({"protocol": "freedom", "settings": {"bpf": bpf}}));
+            assert_eq!(
+                json,
+                serde_json::json!({"protocol": "freedom", "settings": {
+                    "bpf": bpf, "prefer": "system", "connectTimeoutMs": 5000
+                }})
+            );
             let OutboundSettings::Freedom(settings) = serde_json::from_value(json).unwrap() else {
                 panic!("expected freedom outbound settings");
             };
@@ -435,6 +503,47 @@ mod tests {
             let json = serde_json::json!({"protocol": "freedom", "settings": {"bpf": value}});
             assert!(serde_json::from_value::<OutboundSettings>(json).is_err());
         }
+    }
+
+    #[test]
+    fn freedom_preferences_and_timeout_validation() {
+        for (name, expected) in [
+            ("system", AddressPreference::System),
+            ("ipv4", AddressPreference::Ipv4),
+            ("ipv6", AddressPreference::Ipv6),
+        ] {
+            let json = serde_json::json!({"prefer": name, "connectTimeoutMs": 17});
+            let settings: FreedomSettings = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(settings.prefer, expected);
+            assert_eq!(settings.connect_timeout_ms.get(), 17);
+            let value = serde_json::to_value(settings).unwrap();
+            assert_eq!(value["prefer"], json["prefer"]);
+            assert_eq!(value["connectTimeoutMs"], 17);
+            let yaml = format!("prefer: {name}\nconnectTimeoutMs: 17\n");
+            let settings: FreedomSettings = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(settings.prefer, expected);
+            assert_eq!(settings.connect_timeout_ms.get(), 17);
+        }
+        for value in [
+            serde_json::json!("IPv4"),
+            serde_json::json!("auto"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            assert!(serde_json::from_value::<FreedomSettings>(serde_json::json!({"prefer": value})).is_err());
+        }
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("5000"),
+            serde_json::Value::Null,
+        ] {
+            assert!(serde_json::from_value::<FreedomSettings>(serde_json::json!({"connectTimeoutMs": value})).is_err());
+        }
+        let defaults: FreedomSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.prefer, AddressPreference::System);
+        assert_eq!(defaults.connect_timeout_ms.get(), 5000);
     }
 
     #[test]
