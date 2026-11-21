@@ -15,6 +15,10 @@ struct Server {
 
 impl Server {
     async fn start(capacity: usize) -> Self {
+        Self::start_with_limit(capacity, default_max_each_post_bytes()).await
+    }
+
+    async fn start_with_limit(capacity: usize, max_each_post_bytes: usize) -> Self {
         let (client, server) = tokio::io::duplex(256 * 1024);
         let sessions: packet::PacketSessions = Arc::default();
         let (tx, accepted) = mpsc::channel(capacity);
@@ -24,6 +28,7 @@ impl Server {
             tx,
             "/test".to_owned(),
             DEFAULT_HTTP2_INITIAL_STREAM_WINDOW,
+            max_each_post_bytes,
             Address::Inet("127.0.0.1:12345".parse().unwrap()),
         ));
         let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -93,7 +98,12 @@ async fn packet_requests_validate_length_sequence_and_identity() {
     );
     assert_eq!(
         server
-            .request("POST", &path, &vec![0; 64 * 1024 + 1], Some(64 * 1024 + 1))
+            .request(
+                "POST",
+                &path,
+                &vec![0; default_max_each_post_bytes() + 1],
+                Some(default_max_each_post_bytes() + 1)
+            )
             .await
             .status(),
         StatusCode::PAYLOAD_TOO_LARGE
@@ -128,6 +138,48 @@ async fn packet_requests_validate_length_sequence_and_identity() {
         server.request("POST", &path, b"duplicate", Some(9)).await.status(),
         StatusCode::CONFLICT
     );
+}
+
+#[tokio::test]
+async fn packet_post_limits_accept_boundary_deliver_full_body_and_reject_overflow() {
+    for limit in [128 * 1024, 1024 * 1024] {
+        let mut server = if limit == 128 * 1024 {
+            Server::start(8).await
+        } else {
+            Server::start_with_limit(8, limit).await
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let response = server.request("GET", &id, &[], None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (mut business, _) = tokio::time::timeout(Duration::from_secs(2), server.accepted.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let expected: Vec<u8> = (0..limit).map(|index| (index % 251) as u8).collect();
+        let mut received = vec![0; limit];
+        let path = format!("{id}/0");
+        // Read concurrently: both accepted sizes exceed the 64 KiB business duplex buffer.
+        let (ack, read) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                server.request("POST", &path, &expected, Some(limit)),
+                business.read_exact(&mut received)
+            )
+        })
+        .await
+        .expect("boundary POST did not deliver its complete body");
+        assert_eq!(ack.status(), StatusCode::OK);
+        read.unwrap();
+        assert_eq!(received, expected);
+        assert_eq!(
+            server
+                .request("POST", &format!("{id}/1"), &vec![0; limit + 1], Some(limit + 1))
+                .await
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        drop(response);
+        server.wait_removed(&id).await;
+    }
 }
 
 #[tokio::test]
@@ -327,6 +379,7 @@ impl Http1Server {
             self.tx.clone(),
             "/test".to_owned(),
             DEFAULT_HTTP2_INITIAL_STREAM_WINDOW,
+            default_max_each_post_bytes(),
             Address::Unix("/dev/shm/xhttp.socket".into()),
         )));
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))

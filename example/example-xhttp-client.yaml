@@ -18,6 +18,11 @@ outbounds:
       security: none
       xhttpSettings:
         path: /test
+        # POST body limit in bytes; must not exceed the server or CDN limit.
+        maxEachPostBytes: 131072
+        # Minimum interval between POST starts in milliseconds; 0 disables waiting.
+        minPostsIntervalMs: 5
+        # Use maxEachPostBytes: 65536 when connecting to an older server.
         # mode defaults to packet-up, the only supported mode.
         # http2InitialWindowSize: 4194304  # HTTP/2 stream window, 4 MiB by default.
         upload:
