@@ -42,7 +42,7 @@ impl Backends {
                                 async move {
                                     let suffix = req.uri().path().strip_prefix("/test/").unwrap().to_owned();
                                     Ok::<_, Infallible>(packet::handle(
-                                        req, sessions, tx, Address::Inet(peer), &suffix,
+                                        req, sessions, tx, Address::Inet(peer), &suffix, default_max_each_post_bytes(),
                                     ).await)
                                 }
                             });
@@ -121,6 +121,30 @@ async fn echo(stream: &mut super::super::TrStream, payload: &[u8]) {
     let mut received = vec![0; payload.len()];
     stream.read_exact(&mut received).await.unwrap();
     assert_eq!(received, payload);
+}
+
+#[tokio::test]
+async fn configured_post_size_transfers_large_business_writes() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let servers = Backends::start(8, Arc::default()).await;
+        let mut transport = transport(servers.port, None);
+        transport.settings.max_each_post_bytes = 96 * 1024;
+        transport.settings.min_posts_interval_ms = 0;
+        discover(&transport, &IPS[..1]).await;
+        let stream = transport.connect(&destination(), Protocol::Tcp).await.unwrap();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let data = (0..600_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let mut received = vec![0; data.len()];
+        let write = async {
+            writer.write_all(&data).await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let read = async { reader.read_exact(&mut received).await.unwrap() };
+        tokio::join!(write, read);
+        assert_eq!(received, data);
+    })
+    .await
+    .expect("large configured POST transfer stalled");
 }
 
 #[tokio::test]

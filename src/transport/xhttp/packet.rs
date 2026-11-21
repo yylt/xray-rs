@@ -10,7 +10,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::Notify;
 
 const CLIENT_PACKET_SIZE: usize = 64 * 1024;
-const MAX_PACKET_SIZE: usize = CLIENT_PACKET_SIZE;
 const MAX_SESSIONS: usize = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -119,6 +118,7 @@ pub(super) async fn handle(
     stx: mpsc::Sender<(super::super::TrStream, Address)>,
     peer: Address,
     suffix: &str,
+    max_post_bytes: usize,
 ) -> Response<ChannelBody> {
     let post = req.method() == http::Method::POST;
     if !post && req.method() != http::Method::GET {
@@ -176,7 +176,7 @@ pub(super) async fn handle(
         };
         let declared = match req.headers().get(header::CONTENT_LENGTH) {
             Some(value) => match value.to_str().ok().and_then(|v| v.parse::<usize>().ok()) {
-                Some(size) if size <= MAX_PACKET_SIZE => Some(size),
+                Some(size) if size <= max_post_bytes => Some(size),
                 Some(_) => return response(StatusCode::PAYLOAD_TOO_LARGE),
                 None => return response(StatusCode::BAD_REQUEST),
             },
@@ -188,7 +188,7 @@ pub(super) async fn handle(
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
                 if let Ok(bytes) = frame.into_data() {
-                    if data.len().saturating_add(bytes.len()) > MAX_PACKET_SIZE {
+                    if data.len().saturating_add(bytes.len()) > max_post_bytes {
                         return Err(StatusCode::PAYLOAD_TOO_LARGE);
                     }
                     data.extend_from_slice(&bytes);
@@ -319,6 +319,7 @@ struct Upload {
     tx: PollSender<Bytes>,
     accepted: u64,
     closed: bool,
+    max_post_bytes: usize,
 }
 
 /// Owns the bounded bridge and cancels HTTP work when the business stream drops.
@@ -348,10 +349,39 @@ impl Drop for PacketStream {
     }
 }
 
+// Only collect already-ready data; the interval is a rate limit, not a batching timer.
+async fn next_packet(
+    rx: &mut mpsc::Receiver<Bytes>,
+    pending: &mut Bytes,
+    next_post: Option<tokio::time::Instant>,
+    max_post_bytes: usize,
+) -> Option<Bytes> {
+    let first = if pending.is_empty() {
+        rx.recv().await?
+    } else {
+        std::mem::take(pending)
+    };
+    if let Some(deadline) = next_post.filter(|deadline| *deadline > tokio::time::Instant::now()) {
+        tokio::time::sleep_until(deadline).await;
+    }
+    let mut data = BytesMut::from(first.as_ref());
+    while data.len() < max_post_bytes {
+        let Ok(mut chunk) = rx.try_recv() else { break };
+        let len = chunk.len().min(max_post_bytes - data.len());
+        data.extend_from_slice(&chunk.split_to(len));
+        if !chunk.is_empty() {
+            *pending = chunk;
+        }
+    }
+    Some(data.freeze())
+}
+
 pub(super) async fn connect(
     sender: Arc<client::ClientTarget>,
     get_response: DownloadResponse,
     uri: http::Uri,
+    max_post_bytes: usize,
+    min_posts_interval: Duration,
 ) -> IoResult<XhttpStream> {
     let (io, mut download) = tokio::io::duplex(CLIENT_PACKET_SIZE);
     let (tx, mut rx) = mpsc::channel::<Bytes>(2);
@@ -360,7 +390,9 @@ pub(super) async fn connect(
     let upload_task = tokio::spawn(async move {
         let work = async {
             let mut seq = 0u64;
-            while let Some(data) = rx.recv().await {
+            let mut pending = Bytes::new();
+            let mut next_post = None;
+            while let Some(data) = next_packet(&mut rx, &mut pending, next_post, max_post_bytes).await {
                 let mut parts = uri.clone().into_parts();
                 parts.path_and_query = Some(
                     format!("{}/{}", uri.path().trim_end_matches('/'), seq)
@@ -376,28 +408,33 @@ pub(super) async fn connect(
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .body(data)
                     .map_err(Error::other)?;
-                let exchange = async {
-                    let response = sender.send(request).await?.await?;
-                    if response.status() != StatusCode::OK {
-                        return Err(Error::other(format!("packet upload failed: {}", response.status())));
-                    }
-                    let mut body = response.into_body();
-                    let mut received = 0usize;
-                    while let Some(data) = body.next().await {
-                        received = received.saturating_add(data?.len());
-                        if received > MAX_PACKET_SIZE {
-                            return Err(Error::other("packet ACK body too large"));
+                let exchange =
+                    async {
+                        let response = sender.send(request).await?;
+                        next_post = Some(tokio::time::Instant::now().checked_add(min_posts_interval).ok_or_else(
+                            || Error::new(ErrorKind::InvalidInput, "XHTTP minPostsIntervalMs exceeds clock range"),
+                        )?);
+                        let response = response.await?;
+                        if response.status() != StatusCode::OK {
+                            return Err(Error::other(format!("packet upload failed: {}", response.status())));
                         }
-                    }
-                    Ok::<(), Error>(())
-                };
+                        let mut body = response.into_body();
+                        let mut received = 0usize;
+                        while let Some(data) = body.next().await {
+                            received = received.saturating_add(data?.len());
+                            if received > CLIENT_PACKET_SIZE {
+                                return Err(Error::other("packet ACK body too large"));
+                            }
+                        }
+                        Ok::<(), Error>(())
+                    };
                 tokio::time::timeout(REQUEST_TIMEOUT, exchange)
                     .await
                     .map_err(|_| Error::new(ErrorKind::TimedOut, "packet ACK timed out"))??;
                 seq = seq
                     .checked_add(1)
                     .ok_or_else(|| Error::other("packet sequence exhausted"))?;
-                upload_progress.acknowledged.store(seq, Ordering::Release);
+                upload_progress.acknowledged.fetch_add(len as u64, Ordering::Release);
                 upload_progress.write_waker.wake();
             }
             Ok::<(), Error>(())
@@ -433,6 +470,7 @@ pub(super) async fn connect(
             tx: PollSender::new(tx),
             accepted: 0,
             closed: false,
+            max_post_bytes,
         }),
         progress,
         tasks: vec![upload_task, download_task],
@@ -469,11 +507,11 @@ impl AsyncWrite for PacketStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "packet upload stopped"))),
             Poll::Ready(Ok(())) => {
-                let len = data.len().min(CLIENT_PACKET_SIZE);
+                let len = data.len().min(upload.max_post_bytes);
                 if upload.tx.send_item(Bytes::copy_from_slice(&data[..len])).is_err() {
                     return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "packet upload stopped")));
                 }
-                upload.accepted += 1;
+                upload.accepted += len as u64;
                 Poll::Ready(Ok(len))
             }
         }
@@ -524,6 +562,7 @@ mod tests {
                     tx: PollSender::new(tx),
                     accepted: 0,
                     closed: false,
+                    max_post_bytes: CLIENT_PACKET_SIZE,
                 }),
                 progress: Arc::new(Progress::default()),
                 tasks: Vec::new(),
@@ -538,15 +577,20 @@ mod tests {
         let (mut stream, mut rx, mut peer) = client_bridge();
         stream.write_all(b"one").await.unwrap();
         stream.write_all(b"two").await.unwrap();
-        assert_eq!(rx.recv().await.unwrap(), "one");
-        assert_eq!(rx.recv().await.unwrap(), "two");
+        let mut pending = Bytes::new();
+        assert_eq!(
+            next_packet(&mut rx, &mut pending, None, CLIENT_PACKET_SIZE)
+                .await
+                .unwrap(),
+            "onetwo"
+        );
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
         assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
-        stream.progress.acknowledged.store(1, Ordering::Release);
+        stream.progress.acknowledged.store(3, Ordering::Release);
         assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
-        stream.progress.acknowledged.store(2, Ordering::Release);
+        stream.progress.acknowledged.store(6, Ordering::Release);
         stream.shutdown().await.unwrap();
         assert!(rx.recv().await.is_none());
         assert!(stream.write_all(b"three").await.is_err());
@@ -572,6 +616,54 @@ mod tests {
         assert!(stream.shutdown().await.is_err());
         let mut data = [0];
         assert!(stream.read(&mut data).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn packets_merge_and_split_ready_bytes_without_waiting_to_fill() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(Bytes::from_static(b"abc")).unwrap();
+        tx.try_send(Bytes::from_static(b"def")).unwrap();
+        tx.try_send(Bytes::from_static(b"ghij")).unwrap();
+        let mut pending = Bytes::new();
+        assert_eq!(next_packet(&mut rx, &mut pending, None, 5).await.unwrap(), "abcde");
+        assert_eq!(next_packet(&mut rx, &mut pending, None, 5).await.unwrap(), "fghij");
+        tx.try_send(Bytes::from_static(b"k")).unwrap();
+        assert_eq!(next_packet(&mut rx, &mut pending, None, 5).await.unwrap(), "k");
+        drop(tx);
+        assert!(next_packet(&mut rx, &mut pending, None, 5).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn packet_interval_delays_later_posts_and_collects_waiting_writes() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut pending = Bytes::new();
+        tx.try_send(Bytes::from_static(b"first")).unwrap();
+        let mut first = Box::pin(next_packet(&mut rx, &mut pending, None, 16));
+        // The first packet and a zero-interval packet must be ready on first poll.
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_ready());
+            Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        tx.try_send(Bytes::from_static(b"two")).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+        let mut next = Box::pin(next_packet(&mut rx, &mut pending, Some(deadline), 16));
+        std::future::poll_fn(|cx| {
+            assert!(next.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tx.try_send(Bytes::from_static(b"three")).unwrap();
+        assert_eq!(next.await.unwrap(), "twothree");
+        assert!(tokio::time::Instant::now() >= deadline);
+        tx.try_send(Bytes::from_static(b"zero")).unwrap();
+        let mut zero = Box::pin(next_packet(&mut rx, &mut pending, Some(tokio::time::Instant::now()), 16));
+        std::future::poll_fn(|cx| {
+            assert!(zero.as_mut().poll(cx).is_ready());
+            Poll::Ready(())
+        })
+        .await;
     }
 
     #[tokio::test]

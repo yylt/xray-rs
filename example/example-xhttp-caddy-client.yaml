@@ -21,6 +21,11 @@ outbounds:
         alpn: [h2]
       xhttpSettings:
         path: /test
+        # POST body limit in bytes; must not exceed the server or CDN limit.
+        maxEachPostBytes: 131072
+        # Minimum interval between POST starts in milliseconds; 0 disables waiting.
+        minPostsIntervalMs: 5
+        # Use maxEachPostBytes: 65536 when connecting to an older server.
         # packet-up is the only supported mode and the default.
         loadBalancer: least_connection
         # http2InitialWindowSize: 4194304  # HTTP/2 stream window, 4 MiB by default.

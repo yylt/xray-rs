@@ -55,11 +55,25 @@ pub struct XhttpSettings {
     #[serde(rename = "download")]
     pub download: Option<ServerConfig>,
 
+    #[serde(rename = "maxEachPostBytes", default = "default_max_each_post_bytes")]
+    pub max_each_post_bytes: usize,
+
+    #[serde(rename = "minPostsIntervalMs", default = "default_min_posts_interval_ms")]
+    pub min_posts_interval_ms: u64,
+
     #[serde(rename = "http2InitialWindowSize")]
     pub http2_initial_window_size: Option<u32>,
 
     #[serde(rename = "loadBalancer")]
     pub load_balancer: Option<String>,
+}
+
+fn default_max_each_post_bytes() -> usize {
+    128 * 1024
+}
+
+fn default_min_posts_interval_ms() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +242,12 @@ impl Xhttp {
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "xhttpSettings is required"))?;
         if settings.mode.as_deref().is_some_and(|mode| mode != "packet-up") {
             return Err(Error::new(ErrorKind::InvalidInput, "unsupported XHTTP mode"));
+        }
+        if settings.max_each_post_bytes == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "XHTTP maxEachPostBytes must be greater than 0",
+            ));
         }
         settings.path = format!("/{}", settings.path.trim_matches('/'));
         if settings.path == "/" {
@@ -428,8 +448,14 @@ impl Xhttp {
                 }
             }
         };
-        let mut stream =
-            packet::connect(sender, incoming, self.request_uri(self.settings.upload.as_ref(), &path)?).await?;
+        let mut stream = packet::connect(
+            sender,
+            incoming,
+            self.request_uri(self.settings.upload.as_ref(), &path)?,
+            self.settings.max_each_post_bytes,
+            Duration::from_millis(self.settings.min_posts_interval_ms),
+        )
+        .await?;
         stream.target_leases = leases;
         Ok(stream)
     }
@@ -512,6 +538,7 @@ impl Xhttp {
         let stx = stream_tx.clone();
         let base_path = self.settings.path.clone();
         let h2_window = self.h2_window;
+        let max_post_bytes = self.settings.max_each_post_bytes;
         let sockopt = self.opt.clone();
         let tls_server = self.tls_server.clone();
 
@@ -542,6 +569,7 @@ impl Xhttp {
                                         stx_clone,
                                         base_path_clone,
                                         h2_window,
+                                        max_post_bytes,
                                         Address::Inet(peer_addr),
                                     )
                                     .await;
@@ -558,6 +586,7 @@ impl Xhttp {
                                 stx_clone,
                                 base_path_clone,
                                 h2_window,
+                                max_post_bytes,
                                 Address::Inet(peer_addr),
                             )
                             .await;
@@ -584,6 +613,7 @@ impl Xhttp {
         let stx = stream_tx.clone();
         let base_path = self.settings.path.clone();
         let h2_window = self.h2_window;
+        let max_post_bytes = self.settings.max_each_post_bytes;
         let sockopt = self.opt.clone();
         let listener_path = path.clone();
 
@@ -605,8 +635,16 @@ impl Xhttp {
 
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
-                        Self::serve_connection(io, packet_sessions, stx_clone, base_path_clone, h2_window, peer_addr)
-                            .await;
+                        Self::serve_connection(
+                            io,
+                            packet_sessions,
+                            stx_clone,
+                            base_path_clone,
+                            h2_window,
+                            max_post_bytes,
+                            peer_addr,
+                        )
+                        .await;
                     });
                 }
             }
@@ -621,6 +659,7 @@ impl Xhttp {
         stx: mpsc::Sender<(super::TrStream, Address)>,
         base_path: String,
         h2_window: u32,
+        max_post_bytes: usize,
         peer_addr: Address,
     ) where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -646,7 +685,7 @@ impl Xhttp {
                     return Ok::<_, Infallible>(Self::stream_response(StatusCode::NOT_FOUND, Self::empty_body()));
                 }
                 let id = path[base_path.len() + 1..].to_string();
-                Ok::<_, Infallible>(packet::handle(req, packet_sessions, stx, peer_addr, &id).await)
+                Ok::<_, Infallible>(packet::handle(req, packet_sessions, stx, peer_addr, &id, max_post_bytes).await)
             }
         });
 
@@ -720,6 +759,78 @@ mod endpoint_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_limits_yaml_and_json_defaults_and_custom_values() {
+        for (json, yaml, max_bytes, interval_ms) in [
+            (
+                r#"{"network":"xhttp","xhttpSettings":{"path":"/test"}}"#,
+                "network: xhttp\nxhttpSettings:\n  path: /test\n",
+                131072,
+                5,
+            ),
+            (
+                r#"{"network":"xhttp","xhttpSettings":{"path":"/test","maxEachPostBytes":2097152,"minPostsIntervalMs":75}}"#,
+                "network: xhttp\nxhttpSettings:\n  path: /test\n  maxEachPostBytes: 2097152\n  minPostsIntervalMs: 75\n",
+                2097152,
+                75,
+            ),
+            (
+                r#"{"network":"xhttp","xhttpSettings":{"path":"/test","maxEachPostBytes":1,"minPostsIntervalMs":0}}"#,
+                "network: xhttp\nxhttpSettings:\n  path: /test\n  maxEachPostBytes: 1\n  minPostsIntervalMs: 0\n",
+                1,
+                0,
+            ),
+        ] {
+            for settings in [
+                serde_json::from_str::<StreamSettings>(json).unwrap(),
+                serde_yaml::from_str::<StreamSettings>(yaml).unwrap(),
+            ] {
+                let transport = Xhttp::new(&settings, None, Arc::new(DnsResolver)).unwrap();
+                assert_eq!(transport.settings.max_each_post_bytes, max_bytes);
+                assert_eq!(transport.settings.min_posts_interval_ms, interval_ms);
+                let serialized = serde_json::to_value(&transport.settings).unwrap();
+                assert_eq!(serialized["maxEachPostBytes"], max_bytes);
+                assert_eq!(serialized["minPostsIntervalMs"], interval_ms);
+            }
+        }
+    }
+
+    #[test]
+    fn post_limits_yaml_and_json_reject_invalid_inputs() {
+        for field in ["maxEachPostBytes", "minPostsIntervalMs"] {
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("30"),
+                serde_json::json!(true),
+                serde_json::Value::Null,
+            ] {
+                let mut value = serde_json::json!({
+                    "network": "xhttp", "xhttpSettings": {"path": "/test"}
+                });
+                value["xhttpSettings"][field] = invalid;
+                let json = serde_json::to_string(&value).unwrap();
+                let yaml = serde_yaml::to_string(&value).unwrap();
+                assert!(serde_json::from_str::<StreamSettings>(&json).is_err(), "{json}");
+                assert!(serde_yaml::from_str::<StreamSettings>(&yaml).is_err(), "{yaml}");
+            }
+        }
+        for settings in [
+            serde_json::from_str::<StreamSettings>(
+                r#"{"network":"xhttp","xhttpSettings":{"path":"/test","maxEachPostBytes":0}}"#,
+            )
+            .unwrap(),
+            serde_yaml::from_str::<StreamSettings>(
+                "network: xhttp\nxhttpSettings:\n  path: /test\n  maxEachPostBytes: 0\n",
+            )
+            .unwrap(),
+        ] {
+            let error = Xhttp::new(&settings, None, Arc::new(DnsResolver)).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("maxEachPostBytes"));
+        }
+    }
 
     #[test]
     fn http2_window_defaults_to_four_mib_and_rejects_out_of_range() {

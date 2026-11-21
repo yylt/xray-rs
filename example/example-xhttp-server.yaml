@@ -10,6 +10,10 @@ inbounds:
       security: none
       xhttpSettings:
         path: /test
+        # Maximum accepted POST body in bytes; clients must stay within this and CDN limits.
+        maxEachPostBytes: 131072
+        # Client-side minimum POST interval in milliseconds; not enforced by the server.
+        minPostsIntervalMs: 5
 outbounds:
   - tag: direct
     protocol: freedom

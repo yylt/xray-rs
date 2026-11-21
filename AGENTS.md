@@ -42,6 +42,10 @@ Do **not** hand-edit `src/generated/grpc_generated.rs`.
 - **`src/proxy/api.rs`**: management API inbound (requires router + stats + sinks deps).
 - **Generated gRPC**: re-exported as `xray_rs::grpc_transport`.
 
+## Configuration Reference
+
+- `example/all.example.yaml` 是全量配置参考。新增、删除或修改配置字段、默认值、取值范围或行为时，必须同步更新该文件中的示例及说明，保持与源码一致。
+
 ## Rules
 
 - **No annotation bypasses**: Do not suppress warnings/errors with `#[allow(...)]`, `#[cfg(...)]` hacks, or other annotation-based workarounds. Fix the root cause instead.

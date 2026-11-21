@@ -41,7 +41,7 @@ impl Backends {
                             count.fetch_add(1, Ordering::SeqCst);
                             children.spawn(Xhttp::serve_connection(
                                 TokioIo::new(socket), packet_sessions.clone(), tx.clone(),
-                                "/test".to_owned(), DEFAULT_HTTP2_INITIAL_STREAM_WINDOW, Address::Inet(peer),
+                                "/test".to_owned(), DEFAULT_HTTP2_INITIAL_STREAM_WINDOW, default_max_each_post_bytes(), Address::Inet(peer),
                             ));
                         }
                         Some((mut stream, _)) = rx.recv() => {
@@ -653,6 +653,7 @@ async fn configured_window_is_advertised_on_the_server_wire() {
             stx,
             "/test".to_owned(),
             transport.h2_window,
+            transport.settings.max_each_post_bytes,
             Address::Inet(SocketAddr::new(IPS[0], 1)),
         ));
         client.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await.unwrap();

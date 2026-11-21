@@ -149,9 +149,6 @@ impl ClientTarget {
     }
 
     pub(super) async fn send(&self, request: Request<Bytes>) -> IoResult<ResponseFuture> {
-        if request.body().len() > 64 * 1024 {
-            return Err(Error::new(ErrorKind::InvalidInput, "XHTTP request body exceeds 64 KiB"));
-        }
         let mut request = Some(request);
         if let Some(response) = self.try_send(&mut request)? {
             return Ok(response);
